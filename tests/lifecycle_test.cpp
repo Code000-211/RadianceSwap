@@ -756,6 +756,89 @@ TEST(double_stop_is_safe_and_idempotent) {
     finish_and_check_reaped(f);
 }
 
+/* ================================================================== model frontend lease */
+
+namespace {
+
+/* The fakes behind one frontend, with a count of how many were destroyed. */
+struct CountedFrontend {
+    FakeTokenizer    tok;
+    FakeChatTemplate tmpl;
+    FakeGrammar      gram;
+    std::atomic<int>* destroyed;
+    explicit CountedFrontend(std::atomic<int>* d) : destroyed(d) { tmpl.with_parser = true; }
+    ~CountedFrontend() { destroyed->fetch_add(1); }
+};
+
+std::shared_ptr<ModelFrontend> counted_frontend(std::atomic<int>* destroyed) {
+    auto fakes = std::make_shared<CountedFrontend>(destroyed);
+    auto fe = std::make_shared<ModelFrontend>();
+    fe->tok     = std::shared_ptr<ITokenizer>(fakes, &fakes->tok);
+    fe->chat    = std::shared_ptr<IChatTemplate>(fakes, &fakes->tmpl);
+    fe->grammar = std::shared_ptr<IGrammarCompiler>(fakes, &fakes->gram);
+    return fe;
+}
+
+const char* const kChatStream = R"({"messages":[{"role":"user","content":"hi"}],"stream":true})";
+
+}  /* namespace */
+
+/* A streaming request lives on while the runtime stops: the stream keeps its lease on the
+ * frontend, the final chunks are still decoded by it, and nothing is freed before the response is
+ * over. The frontend goes with the last owner. */
+TEST(a_streaming_request_outlives_a_runtime_stop_holding_its_frontend) {
+    std::atomic<int> destroyed{0};
+    {
+        std::shared_ptr<ModelFrontend> fe = counted_frontend(&destroyed);
+        Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.frontend = fe; } });
+        fe.reset();                                   /* the server is its owner now */
+        f.sched.manual = true;
+        const long idle = f.srv->frontend().use_count();
+
+        HttpResponse s = f.post("/v1/chat/completions", kChatStream);
+        REQUIRE(s.streaming());
+        CHECK(f.srv->frontend().use_count() > idle);  /* the stream holds a lease */
+        f.sched.push(0, "he");
+
+        /* The runtime stops: new requests get 503, the stream is untouched. */
+        f.srv->close_admission();
+        f.sched.close_admission();
+        CHECK_EQ(f.post("/v1/chat/completions", kChat).status, 503);
+
+        f.sched.push(0, "llo");
+        f.sched.finish(0, Finish::Stop);
+        const std::string body = drain(s);
+        CHECK(has(body, "\"content\":\"hello\""));
+        CHECK(has(body, "[DONE]"));
+        CHECK_EQ(destroyed.load(), 0);
+        s = HttpResponse();
+        CHECK_EQ(f.srv->frontend().use_count(), idle);   /* the lease is gone with the response */
+        CHECK_EQ(f.srv->in_flight(), (int64_t)0);
+        finish_and_check_reaped(f);
+    }
+    CHECK_EQ(destroyed.load(), 1);
+}
+
+/* A lease keeps the frontend usable after the server that made it is gone, and frees it when it
+ * is dropped. */
+TEST(a_frontend_lease_outlives_the_server_and_frees_the_frontend_when_dropped) {
+    std::atomic<int> destroyed{0};
+    FrontendLease lease;
+    {
+        std::shared_ptr<ModelFrontend> fe = counted_frontend(&destroyed);
+        Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.frontend = fe; } });
+        CHECK(f.post("/v1/completions", R"({"prompt":"hi"})").status == 200);
+        lease = f.srv->frontend();
+        fe.reset();
+        finish_and_check_reaped(f);                   /* the server is destroyed here */
+    }
+    CHECK_EQ(destroyed.load(), 0);
+    REQUIRE(lease && lease->tok);
+    CHECK_EQ(lease->tok->decode({ 'o', 'k' }), std::string("ok"));
+    lease.reset();
+    CHECK_EQ(destroyed.load(), 1);
+}
+
 /* Engine execution lifecycle: start_execution() -> stop_execution() -> start_execution()
  * is safe, idempotent, and re-initialises runtime resources cleanly without use-after-free. */
 TEST(engine_execution_lifecycle_start_stop_start_idempotent) {
