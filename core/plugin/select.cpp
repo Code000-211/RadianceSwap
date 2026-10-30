@@ -470,7 +470,12 @@ int Registry::init_instance(const void* owner, Resolved& r, int rank, int world_
     if (!k->init) { r.instance = nullptr; return RAD_OK; }
 
     void* inst = nullptr;
-    const int st = k->init(r.geom.params(), r.geom.n_params(), rank, world_size, &inst);
+    std::vector<RadParam> p;
+    p.reserve((size_t)r.geom.n_params() + 1);
+    for (int i = 0; i < r.geom.n_params(); ++i) p.push_back(r.geom.params()[i]);
+    /* shortcut: owner travels as a pseudo-param to keep the plugin ABI unchanged; move to a RadKernelInfo field at the next ABI bump. */
+    p.push_back(RAD_INT("owner", (int64_t)(uintptr_t)owner));
+    const int st = k->init(p.data(), (int)p.size(), rank, world_size, &inst);
     if (st < 0) {
         /* A negative init aborts startup rather than launching a kernel whose setup failed. */
         RAD_ERR("kernel '%s' (%s) failed to initialise for %s: %s", k->name, r.row->plugin.c_str(),

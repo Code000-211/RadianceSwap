@@ -336,6 +336,10 @@ endforeach()
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
+if(TARGET collective_order_gpu_test)
+  set_target_properties(collective_order_gpu_test PROPERTIES ENABLE_EXPORTS ON)
+  set_tests_properties(collective_order_gpu_test PROPERTIES LABELS "gpu" TIMEOUT 300)
+endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
 # includes every abi/ header as strict C11, so a header only C++ accepts fails the build.

@@ -3,6 +3,7 @@
  */
 #include <vector>
 #include "ctx.h"
+#include "collective_sequencer.h"
 #include "kvstream/bind.h"
 #include "kvstream/stage.h"
 #include "xp_state.h"
@@ -1286,7 +1287,12 @@ int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
-    if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    /* shortcut: tapes are bypassed while several engines are active, since the sequencer must see each collective at issue; costs latency, record collectives as tape barriers to lift it. */
+    if (!tape_on_ || staging_ || !rad_collective_sequencer().is_single_engine()) {
+        bump(pc_unkeyed_);
+        arch_step_(this, b);
+        return RAD_OK;
+    }
     const uint64_t key = pass_key(b);
     if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
