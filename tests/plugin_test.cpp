@@ -732,7 +732,7 @@ TEST(init_runs_once_per_resolved_instance) {
     CHECK_EQ(b.size(), (size_t)3);
     if (b.size() != 3) return;
 
-    for (Band& band : b) CHECK_OK(r.init_instance(band.dom[RAD_DOMAIN_DEVICE], 0, 1));
+    for (Band& band : b) CHECK_OK(r.init_instance(nullptr, band.dom[RAD_DOMAIN_DEVICE], 0, 1));
     CHECK_EQ(n_init() - init0, 3);
     CHECK_EQ(r.n_instances(), (size_t)3);
 
@@ -741,7 +741,7 @@ TEST(init_runs_once_per_resolved_instance) {
     CHECK_EQ(inst_m(b[2].dom[RAD_DOMAIN_DEVICE].instance), 8192);
 
     /* The host rows have no init hook: that is RAD_OK and a null instance, not a call. */
-    CHECK_OK(r.init_instance(b[0].dom[RAD_DOMAIN_HOST], 0, 1));
+    CHECK_OK(r.init_instance(nullptr, b[0].dom[RAD_DOMAIN_HOST], 0, 1));
     CHECK(b[0].dom[RAD_DOMAIN_HOST].instance == nullptr);
     CHECK_EQ(n_init() - init0, 3);
 
@@ -759,7 +759,7 @@ TEST(a_negative_init_is_a_value_not_a_crash) {
     CHECK_EQ(b.size(), (size_t)1);
     if (b.empty()) return;
     CHECK_EQ(picked(b[0].dom[RAD_DOMAIN_DEVICE].row), "t_eq_m32");
-    CHECK_EQ(r.init_instance(b[0].dom[RAD_DOMAIN_DEVICE], 0, 1), RAD_E_NOMEM);
+    CHECK_EQ(r.init_instance(nullptr, b[0].dom[RAD_DOMAIN_DEVICE], 0, 1), RAD_E_NOMEM);
     CHECK_EQ(r.n_instances(), (size_t)0);
 }
 

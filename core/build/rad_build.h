@@ -102,7 +102,8 @@ using WeightSourceFn = std::function<int(const std::string& name, const Program&
 class Builder : public RadBuilder {
 public:
     /* The Registry must outlive the Builder and its Program (see the file header). */
-    Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx);
+    Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx,
+            const void* owner = nullptr);
 
     /* Where rad_weight_encoding's answers come from. Unset (tests, synthetic tools), every source
      * is RAD_E_NOTFOUND and a weight is read as plain in its declared dtype. */
@@ -212,6 +213,7 @@ private:
     Program prog_;
     const Program* ref_ = nullptr;
     bool instances_ = true;
+    const void* owner_ = nullptr;
 
     std::vector<std::string> errors_;
     int  status_ = RAD_OK;

@@ -203,6 +203,7 @@ struct CtxDesc {
      * reference library's host rows. Null: the oracle checks a band only where the reference
      * library won its host row. */
     Registry*       registry    = nullptr;
+    const void*     owner       = nullptr;
 };
 
 /* ------------------------------------------------------------------ Ctx */
@@ -644,6 +645,7 @@ private:
 
     Program*        program_   = nullptr;
     Registry*       registry_  = nullptr;   /* CtxDesc::registry */
+    const void*     owner_     = nullptr;   /* CtxDesc::owner */
     std::vector<KVPoolBinding> kv_;   /* by rad_kvgroup; RAD_OPK_KV resolves through it */
     ResidencyTable* residency_ = nullptr;
     OpStager*       stager_ = nullptr;

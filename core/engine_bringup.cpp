@@ -1358,7 +1358,8 @@ int Engine::declare() {
                                                    return declare_sampler(ri, bb, lw);
                                                },
                                                nullptr, sources(), true,
-                                               cfg_.lora.enabled() ? &ld : nullptr);
+                                               cfg_.lora.enabled() ? &ld : nullptr,
+                                               this);
         });
     }
     /* A message is a step's bf16 residual rows, so the floor is a row count: a decode step has
@@ -1591,7 +1592,8 @@ void Engine::probe_arena_levels() {
                                                                                 true);
                                                      },
                                                      &r.program, sources(), true,
-                                                     cfg_.lora.enabled() ? &ld : nullptr);
+                                                     cfg_.lora.enabled() ? &ld : nullptr,
+                                                     this);
                     if (st < 0) why[k] = fmt("the sizing declare failed: %s", rad_strerror(st));
                     else if (plan_level(r.program, probe, want[l], &got[k], &why[k]) >= 0)
                         ok[k] = 1;
@@ -3794,6 +3796,7 @@ int Engine::start() {
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
+        d.owner       = this;
         RAD_TRY(r->ctx.init(d));
 
         /* The mover orders every transfer against the kernels reading its slot via an event on the

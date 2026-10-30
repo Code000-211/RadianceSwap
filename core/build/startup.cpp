@@ -390,7 +390,7 @@ std::vector<std::string> CheckpointSources::refused() const {
 int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const RadBuildCtx& ctx,
                       Program* out, const std::function<int(RadBuilder*, int64_t)>& also,
                       const Program* ref, const WeightSourceFn& sources, bool instances,
-                      const LoraDeclare* lora) {
+                      const LoraDeclare* lora, const void* owner) {
     if (!out) return RAD_E_INVAL;
 
     Registry& r = rad_tools_registry();
@@ -401,7 +401,7 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
         return RAD_E_NOTFOUND;
     }
 
-    Builder b(r, meta, ctx);
+    Builder b(r, meta, ctx, owner);
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
     b.set_instances(instances);

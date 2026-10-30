@@ -111,7 +111,9 @@ Engine::~Engine() {
     card_copies_.clear();
     for (TableShare& t : table_shares_) table_share_close(&t);
     table_shares_.clear();
-    /* The tools/plugin registry belongs to the process runtime, not an individual engine (ADR 0001). */
+    /* The tools/plugin registry belongs to the process runtime (ADR 0001), but this engine's
+     * kernel instances are finalised on engine teardown. */
+    rad_tools_registry().fini_instances(this);
 }
 
 /* ================================================================== 7. serve */

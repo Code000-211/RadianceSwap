@@ -289,10 +289,13 @@ public:
     /* ---------------------------------------------------------- instances (§2.1) */
     /* Calls init() once per resolved instance (one op, band and domain) with the frozen geometry,
      * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
-     * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
-    int  init_instance(Resolved& r, int rank, int world_size);
+     * and IPC handles here. A negative return aborts startup; the caller names the kernel.
+     * `owner` tracks the owning engine or program so fini_instances(owner) finalises them. */
+    int  init_instance(const void* owner, Resolved& r, int rank, int world_size);
+    void fini_instances(const void* owner);
     void fini_instances();
     size_t n_instances() const;
+    size_t n_instances(const void* owner) const;
 
     /* ---------------------------------------------------------- the selection table (§16) */
     /* Every distinct question the selector was asked, in first-asked order, with its answer and,
@@ -349,7 +352,12 @@ private:
     mutable std::mutex           mu_;
     std::vector<SelectionRecord> log_;
     std::unordered_map<std::string, size_t> log_at_;   /* SelectionRecord::key -> index in log_ */
-    std::vector<std::pair<const RadKernelInfo*, void*>> instances_;
+    struct InstanceRecord {
+        const void*          owner = nullptr;
+        const RadKernelInfo* info  = nullptr;
+        void*                inst  = nullptr;
+    };
+    std::vector<InstanceRecord> instances_;
 };
 
 /* The value a kernel's own constraints place on one key, e.g. the paged block size the resolved

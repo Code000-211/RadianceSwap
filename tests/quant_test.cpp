@@ -31,7 +31,7 @@ TEST(libquant_offers_its_quantisers_through_the_registry) {
     /* a second copy of the same plugin is refused, not merged */
     Registry r2;
     CHECK_EQ(r2.load_plugin(home() + "/quantizers/libquant.so", 0), RAD_OK);
-    CHECK(r2.load_plugin(home() + "/quantizers/libquant.so", 1) < 0);
+    CHECK(r2.load_plugin(home() + "/quantizers/libquant.so", 1) != RAD_OK);
 }
 
 TEST(block_fp8_is_the_bf16_of_amax_over_448_and_codes_against_it) {

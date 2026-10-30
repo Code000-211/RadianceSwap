@@ -159,6 +159,11 @@ void Registry::unstage_(Staged& s) {
     s.info = nullptr;
 }
 
+/* Positive return values from commit_: non-fatal skips where the plugin is not registered
+ * in this call and order is not advanced. */
+constexpr int kCommitDeclinedMachine = 1;
+constexpr int kCommitAlreadyLoaded   = 1;
+
 /* ------------------------------------------------------------------ registration */
 int Registry::commit_(Staged& s, int order) {
     for (const Plugin& p : plugins_) {
@@ -166,7 +171,7 @@ int Registry::commit_(Staged& s, int order) {
             std::error_code ec;
             if (p.path == s.path || std::filesystem::equivalent(p.path, s.path, ec)) {
                 unstage_(s);
-                return 1;   /* already loaded */
+                return kCommitAlreadyLoaded;
             }
             err_("two plugins claim the name '%s': %s and %s -- refusing the second",
                  s.name.c_str(), p.path.c_str(), s.path.c_str());
@@ -432,7 +437,7 @@ int Registry::commit_(Staged& s, int order) {
         if (st == RAD_E_UNSUPPORTED) {
             RAD_INFO("plugin '%s' declines this machine and is not loaded", p.name.c_str());
             unstage_(s);
-            return 1;
+            return kCommitDeclinedMachine;
         }
         if (st < 0) {
             err_("plugin '%s' refused to open: %s", p.name.c_str(), rad_strerror(st));
@@ -648,7 +653,8 @@ int Registry::load_dirs(const std::vector<std::string>& dirs,
             if (first_error == RAD_OK) first_error = st;
             continue;   /* refused, and the next plugin still gets its chance */
         }
-        if (st > 0) continue;   /* declined this machine */
+        /* st > 0: non-fatal skip (kCommitDeclinedMachine or kCommitAlreadyLoaded). */
+        if (st > 0) continue;
         ++order;
     }
 
