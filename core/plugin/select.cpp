@@ -473,6 +473,7 @@ int Registry::init_instance(const void* owner, Resolved& r, int rank, int world_
     std::vector<RadParam> p;
     p.reserve((size_t)r.geom.n_params() + 1);
     for (int i = 0; i < r.geom.n_params(); ++i) p.push_back(r.geom.params()[i]);
+    /* shortcut: owner travels as a pseudo-param to keep the plugin ABI unchanged; move to a RadKernelInfo field at the next ABI bump. */
     p.push_back(RAD_INT("owner", (int64_t)(uintptr_t)owner));
     const int st = k->init(p.data(), (int)p.size(), rank, world_size, &inst);
     if (st < 0) {

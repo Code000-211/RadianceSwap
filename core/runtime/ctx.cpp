@@ -1287,6 +1287,7 @@ int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
+    /* shortcut: tapes are bypassed while several engines are active, since the sequencer must see each collective at issue; costs latency, record collectives as tape barriers to lift it. */
     if (!tape_on_ || staging_ || !rad_collective_sequencer().is_single_engine()) {
         bump(pc_unkeyed_);
         arch_step_(this, b);

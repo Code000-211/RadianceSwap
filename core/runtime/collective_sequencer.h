@@ -83,6 +83,7 @@ private:
     const void* ticket_owner_locked(uint64_t t) const;
 };
 
+/* shortcut: one sequencer per process, i.e. one GPU group; key it by device set when several groups are served. */
 CollectiveSequencer& rad_collective_sequencer();
 
 }  /* namespace rad */
