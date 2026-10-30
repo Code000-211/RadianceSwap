@@ -63,6 +63,13 @@ private:
     std::vector<ModelRecord> models_;
 };
 
+/* The fixed VRAM share of a model started while its siblings are not (ticket #8). The budget
+ * resolver (mem/vram_budget.h) claims everything free above --gpu-headroom-mib, so a model's share
+ * is set by the headroom it is started with: the card's free memory now less the share, never
+ * below `base_mib` (the --gpu-headroom-mib the model would have had). The last model starts with
+ * its own headroom and takes what the others left. */
+int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_mib);
+
 /* Fills `out` from the manifest, each model's Config layered on `base` (the parsed command line).
  * RAD_E_INVAL, after logging what is wrong, for a malformed or inconsistent manifest. */
 int manifest_parse(const std::string& text, const Config& base, ModelRegistry* out);

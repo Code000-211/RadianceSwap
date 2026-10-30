@@ -248,7 +248,7 @@ void Server::note_ready(uint64_t begin_ns) {
     startup_s_ = (int64_t)((now - begin_ns) / 1000000000ull);
 }
 
-int Server::run() {
+TransportOptions Server::transport_options() const {
     TransportOptions t;
     t.host = opt_.host;
     t.port = opt_.port;
@@ -261,8 +261,10 @@ int Server::run() {
     t.write_timeout_s = opt_.write_timeout_s;
     t.keep_alive_timeout_s = opt_.keep_alive_timeout_s;
     t.max_body_bytes = opt_.max_body_bytes;
-    return transport_.serve(router_, t);
+    return t;
 }
+
+int Server::run() { return transport_.serve(router_, transport_options()); }
 
 void Server::check_template_defaults(std::string* kwargs_why, std::string* effort_why) const {
     kwargs_why->clear();
