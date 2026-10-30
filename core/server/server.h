@@ -14,6 +14,7 @@
  */
 #pragma once
 #include <functional>
+#include "frontend.h"
 #include "http.h"
 #include "iface.h"
 #include "liveview.h"
@@ -33,6 +34,9 @@ namespace server {
 
 struct Deps {
     IScheduler*       sched   = nullptr;   /* required */
+    /* The model's frontend, shared with the engine. When set it supersedes `tok`, `chat` and
+     * `grammar`; when null the Server wraps those pointers (not owned) in a frontend of its own. */
+    std::shared_ptr<ModelFrontend> frontend;
     ITokenizer*       tok     = nullptr;   /* required */
     IChatTemplate*    chat    = nullptr;   /* absent -> /v1/chat/completions is 501 */
     IGrammarCompiler* grammar = nullptr;   /* absent -> response_format is 501 */
@@ -183,6 +187,9 @@ public:
 
     /* Every endpoint. Tests drive this directly: same handlers, no socket. */
     const Router& router() const { return router_; }
+
+    /* The frontend a request keeps in use until its response is over (frontend.h). */
+    FrontendLease frontend() const { return frontend_; }
 
     int  run();            /* binds, serves, blocks. RAD_OK or negative. */
 
@@ -385,7 +392,8 @@ private:
 
     Deps           deps_;
     ServerOptions  opt_;
-    OaiLimits      lim_;
+    std::shared_ptr<ModelFrontend> frontend_;
+    OaiLimits&     lim_;       /* frontend_->limits */
     OaiDeps        odeps_;
     Router         router_;
     Metrics        metrics_;
