@@ -800,4 +800,66 @@ TEST(engine_execution_lifecycle_start_stop_start_idempotent) {
     CHECK(!engine.execution_running());
 }
 
+/* Host engine execution lifecycle with generation: start -> greedy token generation ->
+ * stop_execution(Drain) -> n_instances(&engine) == 0 -> start_execution -> identical generation. */
+TEST(host_engine_restart_lifecycle_generates_identical_tokens) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+
+    tiny::TempDir dir("engine_restart_gen");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::Config cfg;
+    cfg.model = dir.path;
+    cfg.radiance_home = home;
+    cfg.kernel_hierarchy = { "libavx" };
+
+    rad::Engine engine(cfg);
+    CHECK_EQ(engine.start(), RAD_OK);
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+
+    auto generate_tokens = [&](uint64_t req_id, int max_tok) {
+        rad::server::Sink sink;
+        auto r = std::make_unique<rad::Request>();
+        r->id = req_id;
+        r->prompt = { 1, 2, 3 };
+        r->max_tokens = max_tok;
+        r->ignore_eos = true;
+        r->sp.temp = 0.0f;
+        r->sink = &sink;
+        int rc = engine.scheduler().add(std::move(r));
+        CHECK_EQ(rc, RAD_OK);
+
+        while (!sink.done()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        std::vector<int32_t> out;
+        rad::server::SinkToken tokens[16];
+        size_t n = sink.read(tokens, 16);
+        for (size_t i = 0; i < n; ++i) out.push_back(tokens[i].token);
+        engine.scheduler().reap(req_id);
+        return out;
+    };
+
+    /* 1. Greedy-Generierung weniger Tokens */
+    std::vector<int32_t> tokens1 = generate_tokens(1, 4);
+    CHECK_EQ(tokens1.size(), (size_t)4);
+
+    /* 2. stop_execution(Drain): instances are finalised */
+    CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+    CHECK_EQ(rad::rad_tools_registry().n_instances(&engine), (size_t)0);
+
+    /* 3. start_execution(): runtime re-initialises instances and Ctx */
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+
+    /* 4. Gleiche Generierung liefert identische Tokens */
+    std::vector<int32_t> tokens2 = generate_tokens(2, 4);
+    CHECK_EQ(tokens2.size(), (size_t)4);
+    CHECK(tokens1 == tokens2);
+
+    CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+}
+
 RAD_TEST_MAIN()

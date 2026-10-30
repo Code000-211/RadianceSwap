@@ -1516,11 +1516,6 @@ int Engine::declare() {
     return RAD_OK;
 }
 
-/* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
- * the stager's ring: what a kernel writes past the rows it was given lands there rather than in
- * an expert's weights. */
-static constexpr int64_t kArenaGuard = 1ll << 20;
-
 /* The activation arena's smaller levels, sized by the plugin itself.
  *
  * Activations are declared for the largest step, but a decode step uses a few dozen of a prefill
@@ -3639,6 +3634,81 @@ int Engine::configure_kv() {
     return RAD_OK;
 }
 
+int Engine::init_contexts() {
+    for (auto& r : ranks_) {
+        LogRank lr(r->index);
+        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
+        CtxDesc d{};
+        d.program     = &r->program;
+        d.rank        = r->index;
+        d.world_size  = cfg_.tp;
+        d.device      = r->device;
+        /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
+        d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
+        d.arch_step   = arch_step_;
+        d.profile_ops = cfg_.profile_ops;
+        bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
+        d.registry    = &rad_tools_registry();
+        d.owner       = this;
+        RAD_TRY(r->ctx.init(d));
+
+        /* The mover orders every transfer against the kernels reading its slot via an event on the
+         * compute stream (Mover::record_gate), which exists only after Ctx::init. Bound even for a
+         * static plan, which may still stage file-tier weights on demand. */
+        RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
+
+        /* The prefill stager, where the budget made room. Only a step larger than every smaller
+         * arena level finds the ring unlent, so that is the smallest pass it arms for. */
+        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
+            /* The smallest pass is one past every level that lends the ring. The span's shared
+             * level does not: it keeps its own place for it, right above its buffers and the
+             * guard, wherever that is below the region at the top (stager.h). */
+            int64_t top_level = 0;
+            r->arena_low_off = -1;
+            for (const ArenaLevel& lv : r->arena_levels) {
+                if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
+                const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
+                                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+            }
+            char* const base = (char*)r->ctx.arena_base();
+            RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
+                                   base + r->program.arena_stage_off,
+                                   r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
+                                   r->program.arena_stage_bytes, top_level + 1));
+            if (r->stager.enabled() && r->index == 0)
+                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
+                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
+                         "the card up to %d layers ahead of the layers that read them",
+                         humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
+                         r->stager.n_layers(), (int)PrefillStager::lead());
+        }
+        /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
+         * such a unit has no other address). Routing-aware reads take this
+         * rank's routing reports: the trigger runs after the layer's router on the same stream. */
+        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
+                                    return ((Ctx*)ud)->route_counts_device(layer, n);
+                                },
+                                &r->ctx));
+        if (r->fstager.enabled() && r->index == 0)
+            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
+                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
+                     "first expert op, so every step is paced by the drive",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+        if (r->stager.enabled() && r->fstager.enabled()) {
+            r->stagers.set(&r->stager, &r->fstager);
+            r->ctx.set_stager(&r->stagers);
+        } else if (r->stager.enabled()) {
+            r->ctx.set_stager(&r->stager);
+        } else if (r->fstager.enabled()) {
+            r->ctx.set_stager(&r->fstager);
+        }
+
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== start */
 int Engine::start() {
     startup_begin_ns_ = rad_mono_ns();
@@ -3781,78 +3851,8 @@ int Engine::start() {
     RAD_TRY(plan());
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());
+    RAD_TRY(init_contexts());
 
-    for (auto& r : ranks_) {
-        LogRank lr(r->index);
-        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
-        CtxDesc d{};
-        d.program     = &r->program;
-        d.rank        = r->index;
-        d.world_size  = cfg_.tp;
-        d.device      = r->device;
-        /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
-        d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
-        d.arch_step   = arch_step_;
-        d.profile_ops = cfg_.profile_ops;
-        bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
-        d.registry    = &rad_tools_registry();
-        d.owner       = this;
-        RAD_TRY(r->ctx.init(d));
-
-        /* The mover orders every transfer against the kernels reading its slot via an event on the
-         * compute stream (Mover::record_gate), which exists only after Ctx::init. Bound even for a
-         * static plan, which may still stage file-tier weights on demand. */
-        RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
-
-        /* The prefill stager, where the budget made room. Only a step larger than every smaller
-         * arena level finds the region unlent, so that is the smallest pass it arms for. */
-        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
-            /* The smallest pass is one past every level that lends the ring. The span's shared
-             * level does not: it keeps its own place for it, right above its buffers and the
-             * guard, wherever that is below the region at the top (stager.h). */
-            int64_t top_level = 0;
-            r->arena_low_off = -1;
-            for (const ArenaLevel& lv : r->arena_levels) {
-                if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
-                const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
-                                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_low_off = std::min(off, r->program.arena_stage_off);
-            }
-            char* const base = (char*)r->ctx.arena_base();
-            RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
-                                   base + r->program.arena_stage_off,
-                                   r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
-                                   r->program.arena_stage_bytes, top_level + 1));
-            if (r->stager.enabled() && r->index == 0)
-                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
-                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
-                         "the card up to %d layers ahead of the layers that read them",
-                         humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
-                         r->stager.n_layers(), (int)PrefillStager::lead());
-        }
-        /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
-         * such a unit has no other address). Routing-aware reads take this
-         * rank's routing reports: the trigger runs after the layer's router on the same stream. */
-        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
-                                [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
-                                    return ((Ctx*)ud)->route_counts_device(layer, n);
-                                },
-                                &r->ctx));
-        if (r->fstager.enabled() && r->index == 0)
-            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
-                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
-        if (r->stager.enabled() && r->fstager.enabled()) {
-            r->stagers.set(&r->stager, &r->fstager);
-            r->ctx.set_stager(&r->stagers);
-        } else if (r->stager.enabled()) {
-            r->ctx.set_stager(&r->stager);
-        } else if (r->fstager.enabled()) {
-            r->ctx.set_stager(&r->fstager);
-        }
-
-    }
     /* Runtime LoRA: the startup adapters, copied into their slots now that every rank's pools
      * have an address and before any step can read them. */
     RAD_TRY(lora_start());

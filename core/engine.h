@@ -59,6 +59,11 @@ class XsTally;
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
+enum class StopMode {
+    Drain,
+    Immediate,
+};
+
 class Engine {
 public:
     explicit Engine(Config cfg);
@@ -79,18 +84,19 @@ public:
      * Returns negative on error. Idempotent if already started. */
     int start_execution();
 
-    /* Stop execution cleanly and reversibly: closes admission, lets in-flight requests finish,
-     * stops threads at a safe boundary, then drains mover transfers, shuts down Ctx, and
-     * finalises kernel instances via fini_instances(this).
+    /* Stop execution cleanly and reversibly.
+     * In Drain mode: closes admission, lets in-flight requests finish, then stops threads,
+     * drains mover transfers, shuts down Ctx, and finalises kernel instances.
+     * In Immediate mode: stops threads and barrier immediately without waiting for in-flight
+     * requests, then tears down Ctx and finalises kernel instances.
      * Idempotent: safe to call repeatedly. */
-    int stop_execution();
+    int stop_execution(StopMode mode = StopMode::Drain);
 
     /* Whether the execution / runtime threads and scheduler are currently running. */
     bool execution_running() const { return execution_running_.load(std::memory_order_acquire); }
 
-    int start_runtime() { return start_execution(); }
-    int stop_runtime() { return stop_execution(); }
-    bool runtime_running() const { return execution_running(); }
+    /* The scheduler instance. */
+    Scheduler& scheduler() { return sched_; }
 
     /* --debug-graph and friends: print everything declare and plan learned, without serving. A
      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
@@ -190,6 +196,7 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
+    int init_contexts();
     /* Runtime LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
      * into slots after every rank's Ctx is bound, and a request's `model` names one. */
     int lora_targets();

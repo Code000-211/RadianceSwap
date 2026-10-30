@@ -16,7 +16,6 @@
 #include "format/radfile.h"
 #include "gen_config.h"
 #include "kvstream/stage.h"
-#include "runtime/kvbind.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -45,10 +44,6 @@
 
 namespace rad {
 
-namespace {
-constexpr int64_t kArenaGuard = 1ll << 20;
-}  /* namespace */
-
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
     : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
@@ -66,7 +61,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    stop_execution();
+    stop_execution(StopMode::Immediate);
 
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
@@ -1810,51 +1805,7 @@ int Engine::start_execution() {
                 }
             }
         }
-        for (auto& r : ranks_) {
-            RAD_TRY(rad_dev_set(r->device));
-            CtxDesc d{};
-            d.program     = &r->program;
-            d.rank        = r->index;
-            d.world_size  = cfg_.tp;
-            d.device      = r->device;
-            d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
-            d.arch_step   = arch_step_;
-            d.profile_ops = cfg_.profile_ops;
-            bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
-            d.registry    = &rad_tools_registry();
-            d.owner       = this;
-            RAD_TRY(r->ctx.init(d));
-            RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
-
-            if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
-                int64_t top_level = 0;
-                r->arena_low_off = -1;
-                for (const ArenaLevel& lv : r->arena_levels) {
-                    if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
-                    const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
-                                        RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                    r->arena_low_off = std::min(off, r->program.arena_stage_off);
-                }
-                char* const base = (char*)r->ctx.arena_base();
-                RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
-                                       base + r->program.arena_stage_off,
-                                       r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
-                                       r->program.arena_stage_bytes, top_level + 1));
-            }
-            RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
-                                    [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
-                                        return ((Ctx*)ud)->route_counts_device(layer, n);
-                                    },
-                                    &r->ctx));
-            if (r->stager.enabled() && r->fstager.enabled()) {
-                r->stagers.set(&r->stager, &r->fstager);
-                r->ctx.set_stager(&r->stagers);
-            } else if (r->stager.enabled()) {
-                r->ctx.set_stager(&r->stager);
-            } else if (r->fstager.enabled()) {
-                r->ctx.set_stager(&r->fstager);
-            }
-        }
+        RAD_TRY(init_contexts());
     }
 
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
@@ -2119,21 +2070,25 @@ int Engine::start_execution() {
     return RAD_OK;
 }
 
-int Engine::stop_execution() {
+int Engine::stop_execution(StopMode mode) {
     if (!execution_running_.load(std::memory_order_acquire)) return RAD_OK;
 
     sched_.close_admission("the runtime is stopping", RAD_E_STATE);
     if (active_server_) active_server_->close_admission();
 
-    if (gen_) {
-        while (gen_->queued() > 0 || gen_->running() > 0) {
-            if (loop_status_.load(std::memory_order_acquire) < 0) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-    } else {
-        while (sched_.in_flight() > 0) {
-            if (loop_status_.load(std::memory_order_acquire) < 0) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (mode == StopMode::Drain) {
+        if (gen_) {
+            while (gen_->queued() > 0 || gen_->running() > 0) {
+                if (loop_status_.load(std::memory_order_acquire) < 0) break;
+                /* shortcut: pollt alle 2 ms, bei Bedarf auf Condition-Variable umstellen */
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        } else {
+            while (sched_.in_flight() > 0) {
+                if (loop_status_.load(std::memory_order_acquire) < 0) break;
+                /* shortcut: pollt alle 2 ms, bei Bedarf auf Condition-Variable umstellen */
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
         }
     }
 
@@ -2168,7 +2123,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     int s = cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 
-    stop_execution();
+    stop_execution(StopMode::Immediate);
 
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);

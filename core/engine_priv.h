@@ -105,6 +105,11 @@ struct TierPump {
     int                  slow_budget = 0;   /* capacity drops one plan may make */
 };
 
+/* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
+ * the stager's ring: what a kernel writes past the rows it was given lands there rather than in
+ * an expert's weights. */
+static constexpr int64_t kArenaGuard = 1ll << 20;
+
 /* The buffer probe (engine_probe.cpp): the buffers RADIANCE_DUMP_BUF names, at -vv only. The step
  * loop dumps after a trunk step, and each drafter after its own passes, since a drafter's buffers
  * still hold the previous step's values when the step loop dumps. */
