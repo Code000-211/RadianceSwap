@@ -48,6 +48,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
+namespace server { class Server; }
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
@@ -73,6 +74,23 @@ public:
      * server listens, or the KL mode starts scoring, so the stretch from start() to there
      * reports where it waits like start() itself. */
     int serve(std::unique_ptr<StallWatch> watch);
+
+    /* Start execution (step loop, rank threads, scheduler).
+     * Returns negative on error. Idempotent if already started. */
+    int start_execution();
+
+    /* Stop execution cleanly and reversibly: closes admission, lets in-flight requests finish,
+     * stops threads at a safe boundary, then drains mover transfers, shuts down Ctx, and
+     * finalises kernel instances via fini_instances(this).
+     * Idempotent: safe to call repeatedly. */
+    int stop_execution();
+
+    /* Whether the execution / runtime threads and scheduler are currently running. */
+    bool execution_running() const { return execution_running_.load(std::memory_order_acquire); }
+
+    int start_runtime() { return start_execution(); }
+    int stop_runtime() { return stop_execution(); }
+    bool runtime_running() const { return execution_running(); }
 
     /* --debug-graph and friends: print everything declare and plan learned, without serving. A
      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
@@ -129,6 +147,9 @@ private:
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
     std::vector<std::thread>           rank_threads_;
+    std::thread                        stepper_thread_;
+    std::atomic<bool>                  execution_running_{false};
+    server::Server*                    active_server_ = nullptr;
 
     Config cfg_;
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every

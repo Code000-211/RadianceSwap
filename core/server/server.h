@@ -208,6 +208,11 @@ public:
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
     void stop();
+    void close_admission();
+    void open_admission();
+    bool admission_open() const;
+    void set_runtime_active(bool active) { if (active) open_admission(); else close_admission(); }
+    bool runtime_active() const { return admission_open(); }
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 
     int64_t  in_flight() const { return in_flight_.load(std::memory_order_relaxed); }
@@ -391,6 +396,7 @@ private:
     std::atomic<int64_t> realtime_sessions_{0};
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
+    std::atomic<bool>    admission_open_{true};
     int64_t              started_at_ = 0;
     /* Seconds from the top of Engine::start() to the moment the server began listening; 0 until
      * note_ready(). */

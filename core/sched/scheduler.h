@@ -245,6 +245,13 @@ public:
      * same way. `status` is the cause, and what each of those requests reports. */
     void     shutdown(const char* reason, int status = RAD_E_STATE);
 
+    /* Reversible admission closure: new requests are refused, but running/waiting requests
+     * continue to step and commit until finished. */
+    void     close_admission(const char* reason = "admission is closed", int status = RAD_E_STATE);
+    void     open_admission();
+    bool     admission_closed() const;
+    int64_t  in_flight() const;
+
     /* The waiting queue's request ids in service order, for the live view and for tests (a
      * preempted request re-enters at the front). Returns how many were written. */
     int      queue_snapshot(uint64_t* out, int max) const;
@@ -645,6 +652,11 @@ private:
     bool     closed_ = false;
     const char* closed_reason_ = "";
     int      closed_status_ = RAD_E_STATE;
+
+    /* Reversible admission closure. */
+    bool        admission_closed_ = false;
+    const char* admission_closed_reason_ = "";
+    int         admission_closed_status_ = RAD_OK;
 
     /* The longest sequence (prompt plus output) this deployment can address. The batch builder's
      * block tables and the rotary tables are sized for it, so no position at or past it may be

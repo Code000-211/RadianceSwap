@@ -233,7 +233,7 @@ void check_answer(const std::string& what, const HttpResponse& r) {
     const int s = r.status;
     /* 426: a plain GET of a WebSocket route (/v1/realtime) is told to upgrade. */
     const bool known = s == 200 || s == 400 || s == 403 || s == 404 || s == 405 || s == 413 ||
-                       s == 422 || s == 426 || s == 429 || s == 501;
+                       s == 422 || s == 426 || s == 429 || s == 501 || s == 503;
     CHECK(known);
     if (!known) fprintf(stderr, "    %s -> %d %s\n", what.c_str(), s, r.body.substr(0, 200).c_str());
     if (r.streaming() || r.content_type.rfind("application/json", 0) != 0) return;
@@ -610,6 +610,194 @@ TEST(registry_lifecycle_and_process_ownership) {
     CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp3));
     CHECK(!rad::rad_tools_registry().plugins().empty());
     CHECK_EQ(lp3.arch_plugin, lp1.arch_plugin);
+}
+
+/* ================================================================== runtime lifecycle */
+
+/* Start -> Stop -> Start of the same runtime without restarting the listener:
+ * 1. Runtime starts, requests succeed (200).
+ * 2. Runtime stops, admission is closed, new requests receive 503.
+ * 3. Runtime starts again, admission is re-opened, requests succeed (200). */
+TEST(runtime_start_stop_start_without_restarting_listener) {
+    Fixture f;
+
+    /* 1. Initially active: request succeeds. */
+    HttpResponse r1 = f.post("/v1/chat/completions", kChat);
+    CHECK_EQ(r1.status, 200);
+
+    /* 2. Stop runtime: admission closed, requests receive 503. */
+    f.srv->close_admission();
+    f.sched.close_admission();
+    CHECK(!f.srv->admission_open());
+    CHECK(f.sched.admission_closed());
+
+    HttpResponse r2 = f.post("/v1/chat/completions", kChat);
+    CHECK_EQ(r2.status, 503);
+
+    /* 3. Re-start runtime: admission re-opened, requests succeed again. */
+    f.srv->open_admission();
+    f.sched.open_admission();
+    CHECK(f.srv->admission_open());
+    CHECK(!f.sched.admission_closed());
+
+    HttpResponse r3 = f.post("/v1/chat/completions", kChat);
+    CHECK_EQ(r3.status, 200);
+
+    CHECK_EQ(f.srv->in_flight(), (int64_t)0);
+    finish_and_check_reaped(f);
+}
+
+/* While the runtime is stopped, generation requests across all endpoints receive a clear 503
+ * error in OpenAI (or Anthropic) format without leaking admission places or submitting to the scheduler. */
+TEST(request_when_runtime_stopped_returns_clear_error) {
+    FakeEmbedder emb;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.embed = &emb; } });
+    f.srv->close_admission();
+    f.sched.close_admission();
+
+    /* OpenAI chat */
+    HttpResponse r_chat = f.post("/v1/chat/completions", kChat);
+    CHECK_EQ(r_chat.status, 503);
+    json j_chat = json::parse(r_chat.body, nullptr, false);
+    CHECK(!j_chat.is_discarded());
+    CHECK(j_chat.contains("error"));
+    CHECK_EQ(j_chat["error"].value("type", ""), "server_error");
+    CHECK_EQ(j_chat["error"].value("code", ""), "service_unavailable");
+    CHECK(has(j_chat["error"].value("message", ""), "stopped"));
+
+    /* OpenAI completions */
+    HttpResponse r_cmpl = f.post("/v1/completions", R"({"prompt":"hi"})");
+    CHECK_EQ(r_cmpl.status, 503);
+    json j_cmpl = json::parse(r_cmpl.body, nullptr, false);
+    CHECK(!j_cmpl.is_discarded());
+    CHECK_EQ(j_cmpl["error"].value("code", ""), "service_unavailable");
+
+    /* Anthropic messages */
+    HttpResponse r_msg = f.post("/v1/messages", R"({"model":"m","max_tokens":8,
+                                                   "messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(r_msg.status, 503);
+    json j_msg = json::parse(r_msg.body, nullptr, false);
+    CHECK(!j_msg.is_discarded());
+    CHECK_EQ(j_msg.value("type", ""), "error");
+    CHECK_EQ(j_msg["error"].value("type", ""), "api_error");
+
+    /* Embeddings (with embedder wired) */
+    HttpResponse r_emb = f.post("/v1/embeddings", R"({"input":"hi"})");
+    CHECK_EQ(r_emb.status, 503);
+    json j_emb = json::parse(r_emb.body, nullptr, false);
+    CHECK(!j_emb.is_discarded());
+    CHECK_EQ(j_emb["error"].value("code", ""), "service_unavailable");
+
+    /* Nothing was submitted to scheduler and no in-flight requests remain. */
+    CHECK(f.sched.submitted.empty());
+    CHECK_EQ(f.srv->in_flight(), (int64_t)0);
+    finish_and_check_reaped(f);
+}
+
+/* An in-flight request is allowed to finish upon runtime stop and is reaped exactly once.
+ * New requests arriving while the runtime is stopping are refused with 503. */
+TEST(in_flight_request_completes_and_is_reaped_once_on_runtime_stop) {
+    Fixture f;
+    f.sched.manual = true;
+
+    /* Start a request in manual mode so it stays in-flight until explicitly completed. */
+    std::thread t([&] {
+        HttpResponse res = f.post("/v1/chat/completions", kChat);
+        CHECK_EQ(res.status, 200);
+    });
+
+    REQUIRE(eventually([&] { return !f.sched.seen.empty(); }));
+    CHECK_EQ(f.srv->in_flight(), (int64_t)1);
+
+    /* Runtime initiates stop: close admission. */
+    f.srv->close_admission();
+    f.sched.close_admission();
+
+    /* New request while stopped is rejected immediately with 503. */
+    HttpResponse r_rejected = f.post("/v1/chat/completions", kChat);
+    CHECK_EQ(r_rejected.status, 503);
+
+    /* The in-flight request finishes its generation cleanly. */
+    f.sched.push(0, "completed");
+    f.sched.finish(0, Finish::Stop);
+    t.join();
+
+    CHECK_EQ(f.srv->in_flight(), (int64_t)0);
+    /* Exactly 1 request was submitted, and finish_and_check_reaped verifies it was reaped exactly once. */
+    CHECK_EQ(f.sched.submitted.size(), (size_t)1);
+    finish_and_check_reaped(f);
+}
+
+/* Stopping twice is safe and idempotent. */
+TEST(double_stop_is_safe_and_idempotent) {
+    Fixture f;
+
+    /* First stop */
+    f.srv->close_admission();
+    f.sched.close_admission();
+    CHECK(!f.srv->admission_open());
+    CHECK(f.sched.admission_closed());
+
+    /* Second stop: safe, idempotent */
+    f.srv->close_admission();
+    f.sched.close_admission();
+    CHECK(!f.srv->admission_open());
+    CHECK(f.sched.admission_closed());
+
+    /* Requests still cleanly rejected */
+    CHECK_EQ(f.post("/v1/chat/completions", kChat).status, 503);
+
+    /* Re-opening admission works normally afterwards */
+    f.srv->open_admission();
+    f.sched.open_admission();
+    CHECK(f.srv->admission_open());
+    CHECK_EQ(f.post("/v1/chat/completions", kChat).status, 200);
+
+    finish_and_check_reaped(f);
+}
+
+/* Engine execution lifecycle: start_execution() -> stop_execution() -> start_execution()
+ * is safe, idempotent, and re-initialises runtime resources cleanly without use-after-free. */
+TEST(engine_execution_lifecycle_start_stop_start_idempotent) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+
+    tiny::TempDir dir("engine_exec");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::Config cfg;
+    cfg.model = dir.path;
+    cfg.radiance_home = home;
+    cfg.kernel_hierarchy = { "libavx" };
+
+    rad::Engine engine(cfg);
+    CHECK_EQ(engine.start(), RAD_OK);
+    CHECK(!engine.execution_running());
+
+    /* 1. Start execution */
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+    CHECK(engine.execution_running());
+
+    /* Repeated start is idempotent */
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+    CHECK(engine.execution_running());
+
+    /* 2. Stop execution */
+    CHECK_EQ(engine.stop_execution(), RAD_OK);
+    CHECK(!engine.execution_running());
+
+    /* Repeated stop is idempotent */
+    CHECK_EQ(engine.stop_execution(), RAD_OK);
+    CHECK(!engine.execution_running());
+
+    /* 3. Re-start execution (re-initialises instances and Ctx cleanly) */
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+    CHECK(engine.execution_running());
+
+    /* Final clean stop */
+    CHECK_EQ(engine.stop_execution(), RAD_OK);
+    CHECK(!engine.execution_running());
 }
 
 RAD_TEST_MAIN()

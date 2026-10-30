@@ -211,6 +211,19 @@ public:
     void cancel(uint64_t id) override { s_->cancel(id); }
     void reap(uint64_t id) override { s_->reap(id); }
 
+    void close_admission(const char* reason = "admission is closed", int status = RAD_E_STATE) override {
+        if (s_) s_->close_admission(reason, status);
+    }
+    void open_admission() override {
+        if (s_) s_->open_admission();
+    }
+    bool admission_closed() const override {
+        return s_ ? s_->admission_closed() : false;
+    }
+    int64_t in_flight() const override {
+        return s_ ? s_->in_flight() : 0;
+    }
+
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
     int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,

@@ -806,9 +806,37 @@ struct FakeScheduler : IScheduler {
     bool refuse = false;
     int refuse_status = RAD_E_INVAL;
     const char* refuse_why = "the scheduler refused the request";
+
+    bool admission_closed_flag = false;
+    const char* admission_closed_reason = "the runtime is stopped";
+    int admission_closed_status = RAD_E_STATE;
+
+    void close_admission(const char* reason = "the runtime is stopped", int status = RAD_E_STATE) override {
+        std::lock_guard<std::mutex> lk(mu);
+        admission_closed_flag = true;
+        admission_closed_reason = reason ? reason : "the runtime is stopped";
+        admission_closed_status = status;
+    }
+    void open_admission() override {
+        std::lock_guard<std::mutex> lk(mu);
+        admission_closed_flag = false;
+    }
+    bool admission_closed() const override {
+        std::lock_guard<std::mutex> lk(mu);
+        return admission_closed_flag;
+    }
+    int64_t in_flight() const override {
+        std::lock_guard<std::mutex> lk(mu);
+        int64_t count = 0;
+        for (const auto& kv : sinks) {
+            if (kv.second && !kv.second->done()) ++count;
+        }
+        return count;
+    }
+
     server::SchedMetrics m;
 
-    std::mutex mu;
+    mutable std::mutex mu;
     std::vector<uint64_t> submitted;
     std::vector<Request> seen;           /* every submitted request, in order */
     SamplingParams last_sp;              /* what the last submitted request was to sample with */
@@ -835,8 +863,10 @@ struct FakeScheduler : IScheduler {
     }
 
     uint64_t submit(Request&& r) override {
-        if (refuse) {
-            sink_fail(r.sink, refuse_status, refuse_why);
+        if (refuse || admission_closed_flag) {
+            int st = refuse ? refuse_status : admission_closed_status;
+            const char* why = refuse ? refuse_why : admission_closed_reason;
+            sink_fail(r.sink, st, why);
             return 0;
         }
         uint64_t id = next_id.fetch_add(1);

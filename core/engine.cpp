@@ -16,6 +16,7 @@
 #include "format/radfile.h"
 #include "gen_config.h"
 #include "kvstream/stage.h"
+#include "runtime/kvbind.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -44,6 +45,10 @@
 
 namespace rad {
 
+namespace {
+constexpr int64_t kArenaGuard = 1ll << 20;
+}  /* namespace */
+
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
     : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
@@ -61,6 +66,8 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    stop_execution();
+
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -1781,12 +1788,75 @@ void Engine::clear_fresh_states() {
     ranks_[0]->kv.clear_state_clears();
 }
 
-int Engine::serve(std::unique_ptr<StallWatch> watch) {
-    startup_watch_ = std::move(watch);
-    if (ranks_.empty() || !ranks_[0]->ctx.program()) {
-        RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
+int Engine::start_execution() {
+    if (execution_running_.load(std::memory_order_acquire)) return RAD_OK;
+    if (ranks_.empty()) {
+        RAD_ERR("start_execution: start() has not run, or stopped at --debug-graph");
         return RAD_E_STATE;
     }
+
+    /* If Ctx was shut down by a previous stop_execution(), re-initialise instances and Ctx */
+    if (!ranks_[0]->ctx.program()) {
+        for (auto& r : ranks_) {
+            for (auto& op : r->program.ops) {
+                for (auto& band : op.bands) {
+                    for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                        Resolved& res = band.dom[d];
+                        if (res && res.row && res.row->info && res.row->info->init) {
+                            const int s = rad_tools_registry().init_instance(this, res, r->index, cfg_.tp);
+                            if (s < 0) return s;
+                        }
+                    }
+                }
+            }
+        }
+        for (auto& r : ranks_) {
+            RAD_TRY(rad_dev_set(r->device));
+            CtxDesc d{};
+            d.program     = &r->program;
+            d.rank        = r->index;
+            d.world_size  = cfg_.tp;
+            d.device      = r->device;
+            d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
+            d.arch_step   = arch_step_;
+            d.profile_ops = cfg_.profile_ops;
+            bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
+            d.registry    = &rad_tools_registry();
+            d.owner       = this;
+            RAD_TRY(r->ctx.init(d));
+            RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
+
+            if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
+                int64_t top_level = 0;
+                r->arena_low_off = -1;
+                for (const ArenaLevel& lv : r->arena_levels) {
+                    if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
+                    const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
+                                        RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                    r->arena_low_off = std::min(off, r->program.arena_stage_off);
+                }
+                char* const base = (char*)r->ctx.arena_base();
+                RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
+                                       base + r->program.arena_stage_off,
+                                       r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
+                                       r->program.arena_stage_bytes, top_level + 1));
+            }
+            RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                    [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
+                                        return ((Ctx*)ud)->route_counts_device(layer, n);
+                                    },
+                                    &r->ctx));
+            if (r->stager.enabled() && r->fstager.enabled()) {
+                r->stagers.set(&r->stager, &r->fstager);
+                r->ctx.set_stager(&r->stagers);
+            } else if (r->stager.enabled()) {
+                r->ctx.set_stager(&r->stager);
+            } else if (r->fstager.enabled()) {
+                r->ctx.set_stager(&r->fstager);
+            }
+        }
+    }
+
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();
@@ -1839,13 +1909,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                 return RAD_E_STATE;
             }
         }
-        pooled_host_ = static_cast<float*>(
-            rad_dev_alloc(cfg_.max_seqs * pooled_dim_ * (int64_t)sizeof(float),
-                          RAD_MEM_HOST_PINNED));
         if (!pooled_host_) {
-            RAD_ERR("no pinned host memory for a step's pooled rows (%lld x %lld f32)",
-                    (long long)cfg_.max_seqs, (long long)pooled_dim_);
-            return RAD_E_NOMEM;
+            pooled_host_ = static_cast<float*>(
+                rad_dev_alloc(cfg_.max_seqs * pooled_dim_ * (int64_t)sizeof(float),
+                              RAD_MEM_HOST_PINNED));
+            if (!pooled_host_) {
+                RAD_ERR("no pinned host memory for a step's pooled rows (%lld x %lld f32)",
+                        (long long)cfg_.max_seqs, (long long)pooled_dim_);
+                return RAD_E_NOMEM;
+            }
         }
         /* No prefix cache: an encoder keeps no KV, and with bidirectional attention a shared
          * prefix does not compute to the same rows. */
@@ -2033,11 +2105,61 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
     loop_status_.store(RAD_OK, std::memory_order_release);
+    done_.clear();
     done_.reserve((size_t)cfg_.max_seqs);
+
+    sched_.open_admission();
+    if (active_server_) active_server_->open_admission();
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+    stepper_thread_ = std::thread([this] { if (gen_) gen_loop(); else step_loop(); });
+
+    execution_running_.store(true, std::memory_order_release);
+    return RAD_OK;
+}
+
+int Engine::stop_execution() {
+    if (!execution_running_.load(std::memory_order_acquire)) return RAD_OK;
+
+    sched_.close_admission("the runtime is stopping", RAD_E_STATE);
+    if (active_server_) active_server_->close_admission();
+
+    if (gen_) {
+        while (gen_->queued() > 0 || gen_->running() > 0) {
+            if (loop_status_.load(std::memory_order_acquire) < 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    } else {
+        while (sched_.in_flight() > 0) {
+            if (loop_status_.load(std::memory_order_acquire) < 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    stopping_.store(true, std::memory_order_release);
+    if (barrier_) barrier_->abort();
+    if (stepper_thread_.joinable()) stepper_thread_.join();
+    for (auto& t : rank_threads_) if (t.joinable()) t.join();
+    rank_threads_.clear();
+    xstats_close();
+
+    for (auto& r : ranks_)
+        if (r) if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
+    for (auto& r : ranks_) if (r) r->ctx.shutdown();
+    rad_tools_registry().fini_instances(this);
+
+    execution_running_.store(false, std::memory_order_release);
+    return RAD_OK;
+}
+
+int Engine::serve(std::unique_ptr<StallWatch> watch) {
+    startup_watch_ = std::move(watch);
+    const int st = start_execution();
+    if (st < 0) {
+        startup_watch_.reset();
+        return st;
+    }
 
     if (cfg_.kld()) {
         print_startup_report(RAD_OK);
@@ -2046,14 +2168,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     int s = cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 
-    /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
-     * and an unfinished request still writes there (server.h). */
-    stopping_.store(true, std::memory_order_release);
-    barrier_->abort();
-    if (stepper.joinable()) stepper.join();
-    for (auto& t : rank_threads_) if (t.joinable()) t.join();
-    rank_threads_.clear();
-    xstats_close();
+    stop_execution();
+
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -3286,7 +3402,9 @@ int Engine::run_server() {
     /* Startup ends here; a quiet server from now on is an idle one. */
     startup_watch_.reset();
     srv.note_ready(startup_begin_ns_);
+    active_server_ = &srv;
     const int rc = srv.run();
+    active_server_ = nullptr;
     /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
      * run() has already torn the transport down. Joining costs up to one sleep interval. */
     watching.store(false, std::memory_order_relaxed);

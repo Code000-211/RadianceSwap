@@ -349,9 +349,25 @@ void Server::stop() {
 
 /* ------------------------------------------------------------------ admission */
 
+void Server::close_admission() {
+    admission_open_.store(false, std::memory_order_release);
+}
+
+void Server::open_admission() {
+    admission_open_.store(true, std::memory_order_release);
+}
+
+bool Server::admission_open() const {
+    return admission_open_.load(std::memory_order_acquire);
+}
+
 std::optional<HttpResponse> Server::admit(int64_t n, const std::string& peer, ApiShape shape,
                                           const char* field) {
     sweep_abandoned();
+    if (!admission_open_.load(std::memory_order_acquire) ||
+        (deps_.sched && deps_.sched->admission_closed()))
+        return error_response(err_unavailable("the model runtime is stopped"), peer, shape);
+
     if (n > queue_depth_)
         return error_response(err_bad(field, "this request needs " + std::to_string(n) +
                                                  " admission places, and this server admits at "
