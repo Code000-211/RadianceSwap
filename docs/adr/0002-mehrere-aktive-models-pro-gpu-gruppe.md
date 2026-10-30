@@ -10,7 +10,7 @@ Abweichend von Issue #10, das ein aktives Model pro GPU-Gruppe vorsieht, dürfen
 - Knappe Expert-Slots vergibt ein gruppenweiter Planner nach Gruppen-Heat (gewichtet nach Bytes), mit einem Mindestanteil pro Model.
 - Aktivierung beim ersten Request, Deaktivierung nach Idle-Timeout oder unter VRAM-Druck (zuerst das am längsten idle Model). Die Zahl aktiver Models ist nur durch das Budget begrenzt.
 
-- RAM-Streaming statischer Gewichte ist nur eine Übergangslösung, kein Dauerzustand (Messung: \`docs/swap/measure-static-streaming.md\`). PCIe liefert ≈ 28 GB/s gegenüber 600–870 GB/s aus dem VRAM, Decode bricht bei voll gestreamter Statik um 90–97 % ein. Gestreamte Gewichte müssen deshalb sofort in den VRAM nachgezogen werden. Prefill streamt nur über den Stager-Ring, nie per direktem Zero-Copy.
+- RAM-Streaming statischer Gewichte ist nur eine Übergangslösung, kein Dauerzustand (Messung: `docs/swap/measure-static-streaming.md`). PCIe liefert ≈ 28 GB/s gegenüber 600–870 GB/s aus dem VRAM, Decode bricht bei voll gestreamter Statik um 90–97 % ein. Gestreamte Gewichte müssen deshalb sofort in den VRAM nachgezogen werden. Prefill streamt nur über den Stager-Ring, nie per direktem Zero-Copy.
 
 ## Considered Options
 
