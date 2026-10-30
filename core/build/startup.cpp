@@ -19,10 +19,10 @@ namespace rad {
 /* One Registry for the life of the process: Resolved, Band and KernelRow point into plugin
  * static tables, and the Program outlives the call that built it.
  *
- * Never destroyed. A function-local static would be destroyed after the plugins' own static
+ * Never destroyed as a static. A function-local static would be destroyed after the plugins' own static
  * destructors, and its close would call each instance's fini into destroyed plugin state (e.g.
- * libr4d's router erasing from its destroyed global map: a double free). A caller that needs the
- * finis closes the registry while plugins are alive, as Engine's shutdown does. */
+ * libr4d's router erasing from its destroyed global map: a double free). The process owner closes the
+ * registry before process exit while plugins are alive (ADR 0001). */
 Registry& rad_tools_registry() {
     static Registry* r = new Registry();
     return *r;

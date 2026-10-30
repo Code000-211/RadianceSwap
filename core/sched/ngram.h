@@ -17,6 +17,7 @@
  * tokens whatever it proposes (core/sample/accept.h), so the index changes speed, never text.
  */
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

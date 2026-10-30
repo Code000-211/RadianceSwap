@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
+#include <filesystem>
 
 namespace rad {
 
@@ -162,6 +163,11 @@ void Registry::unstage_(Staged& s) {
 int Registry::commit_(Staged& s, int order) {
     for (const Plugin& p : plugins_) {
         if (p.name == s.name) {
+            std::error_code ec;
+            if (p.path == s.path || std::filesystem::equivalent(p.path, s.path, ec)) {
+                unstage_(s);
+                return 1;   /* already loaded */
+            }
             err_("two plugins claim the name '%s': %s and %s -- refusing the second",
                  s.name.c_str(), p.path.c_str(), s.path.c_str());
             unstage_(s);

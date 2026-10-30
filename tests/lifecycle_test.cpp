@@ -8,8 +8,12 @@
  * every route malformed input, since the next route added inherits none of the per-route checks.
  */
 #include "server_fakes.h"
+#include "engine.h"
+#include "tiny_model.h"
+#include "build/startup.h"
 
 #include <cstring>
+#include <filesystem>
 
 namespace {
 
@@ -473,6 +477,88 @@ TEST(metrics_count_every_request_once_under_its_outcome) {
     CHECK_EQ(l.value("server_load", (int64_t)-1), (int64_t)0);
     CHECK_EQ(l.value("queue_cap", (int64_t)-1), (int64_t)2);
     finish_and_check_reaped(f);
+}
+
+/* ================================================================== engine and registry lifecycle */
+
+/* Two Engine instances run sequentially in the same process: the first engine's destruction does
+ * not close or tear down the process-lifetime rad_tools_registry (ADR 0001), so the second engine
+ * starts cleanly without use-after-free or duplicate plugin registration errors. */
+TEST(two_engine_lifecycles_run_sequentially_without_use_after_free) {
+    const char* env_home = std::getenv("RADIANCE_HOME");
+    std::string home;
+    if (env_home && *env_home && std::filesystem::exists(std::string(env_home) + "/kernels")) {
+        home = env_home;
+    } else if (std::filesystem::exists("build/radiance_home/kernels")) {
+        home = "build/radiance_home";
+    } else if (std::filesystem::exists("radiance_home/kernels")) {
+        home = "radiance_home";
+    }
+    REQUIRE(!home.empty());
+
+    tiny::TempDir dir("engine_seq");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::Config cfg1;
+    cfg1.model = dir.path;
+    cfg1.radiance_home = home;
+    cfg1.kernel_hierarchy = { "libavx" };
+
+    {
+        rad::Engine engine1(cfg1);
+        int s = engine1.start();
+        CHECK_EQ(s, RAD_OK);
+        CHECK(!rad::rad_tools_registry().plugins().empty());
+    }
+
+    /* Process-lifetime registry must still hold loaded plugins after engine1 teardown. */
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+
+    rad::Config cfg2;
+    cfg2.model = dir.path;
+    cfg2.radiance_home = home;
+    cfg2.kernel_hierarchy = { "libavx" };
+
+    {
+        rad::Engine engine2(cfg2);
+        int s = engine2.start();
+        CHECK_EQ(s, RAD_OK);
+        CHECK(!rad::rad_tools_registry().plugins().empty());
+    }
+
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+}
+
+TEST(registry_lifecycle_and_process_ownership) {
+    const char* env_home = std::getenv("RADIANCE_HOME");
+    std::string home;
+    if (env_home && *env_home && std::filesystem::exists(std::string(env_home) + "/kernels")) {
+        home = env_home;
+    } else if (std::filesystem::exists("build/radiance_home/kernels")) {
+        home = "build/radiance_home";
+    } else if (std::filesystem::exists("radiance_home/kernels")) {
+        home = "radiance_home";
+    }
+    REQUIRE(!home.empty());
+
+    rad::LoadedPlugins lp1, lp2;
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp1));
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+
+    /* A second call against the process registry reuses loaded plugins without duplicate errors. */
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp2));
+    CHECK_EQ(lp1.arch_plugin, lp2.arch_plugin);
+
+    /* Registry can be closed explicitly by process runtime owner, resetting plugins. */
+    rad::rad_tools_registry().close();
+    CHECK(rad::rad_tools_registry().plugins().empty());
+
+    /* Re-opening after close reloads cleanly without use-after-free or error. */
+    rad::LoadedPlugins lp3;
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp3));
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+    CHECK_EQ(lp3.arch_plugin, lp1.arch_plugin);
 }
 
 RAD_TEST_MAIN()
