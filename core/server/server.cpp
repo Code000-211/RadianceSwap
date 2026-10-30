@@ -1928,7 +1928,9 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     std::vector<std::string> adapters;
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
-    if (!id.empty() && id != opt_.model_id && !is_adapter) {
+    const auto other = std::find_if(opt_.other_models.begin(), opt_.other_models.end(),
+                                    [&](const ModelCard& m) { return m.id == id; });
+    if (!id.empty() && id != opt_.model_id && !is_adapter && other == opt_.other_models.end()) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -1944,6 +1946,11 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
+    for (ModelCard m : opt_.other_models) {
+        m.created = started_at_;
+        if (!id.empty() && m.id == id) return HttpResponse::json_body(200, model_body(m));
+        cards.push_back(std::move(m));
+    }
     for (const std::string& a : adapters) {
         ModelCard ac = c;
         ac.id = a;

@@ -4,6 +4,7 @@
 #include "engine.h"
 #include "build/startup.h"
 #include "hf_model.h"
+#include "manifest.h"
 #include "util/stallwatch.h"
 
 int main(int argc, char** argv) {
@@ -19,9 +20,19 @@ int main(int argc, char** argv) {
     if (s == 1) { rad::config_usage(argv[0]); return 0; }
     if (s < 0)  { rad::config_usage(argv[0]); return 2; }
 
+    /* Process-lifetime owner of the model records (ADR 0001); only the default model is started
+     * for now, and every model is listed by /v1/models. */
+    rad::ModelRegistry registry;
+    if (!cfg.manifest.empty()) {
+        if (rad::manifest_load(cfg.manifest, cfg, &registry) < 0) return 2;
+        cfg = registry.default_model().config;
+    }
+
     if (!rad::resolve_hf_model(cfg)) return 1;   /* a repo id: fetched, and --model points at it */
 
+    const bool manifest_mode = !registry.models().empty();
     rad::Engine engine(std::move(cfg));
+    if (manifest_mode) engine.set_registry(&registry);
 
     /* A startup that stops logging reports where it waits (util/stallwatch.h). Two minutes
      * comfortably covers the slowest normal step, such as a container read from a slow disk. The
@@ -34,6 +45,8 @@ int main(int argc, char** argv) {
         engine.print_startup_report(s);
         return 1;
     }
+
+    if (manifest_mode) registry.set_state(registry.default_model().id, rad::ModelState::Active);
 
     if (engine.config().debug_graph) return engine.dump();
     s = engine.serve(std::move(watch));

@@ -47,6 +47,7 @@
 namespace rad {
 
 class Kld;
+class ModelRegistry;   /* manifest.h */
 class StallWatch;
 namespace server { class Server; }
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
@@ -105,6 +106,10 @@ public:
     const Program& program() const;
     const Config&  config()  const { return cfg_; }
 
+    /* Manifest mode: the process's registry (manifest.h), whose other models /v1/models lists.
+     * Only the model this Engine was built from is started. */
+    void set_registry(const ModelRegistry* r) { registry_ = r; }
+
     /* The startup report (core/diag/diag.h): every option with its value and source, the
      * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
      * listening; main prints it with the error start() or serve() failed with, so a server that
@@ -158,6 +163,7 @@ private:
     server::Server*                    active_server_ = nullptr;
 
     Config cfg_;
+    const ModelRegistry* registry_ = nullptr;
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in

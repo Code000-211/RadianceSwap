@@ -434,7 +434,8 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 /* A legal value for every option that takes one, with any option it cannot be given without. */
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
-        { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
+        { "--model", { "/m/y.rad" } }, { "--manifest", { "/m/models.json" } },
+        { "--download-dir", { "/d" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
@@ -518,7 +519,9 @@ TEST(every_listed_option_parses_and_is_reported_as_given) {
     for (const auto& [name, arg] : opts) {
         if (name == "--help" || name == "--draft-model") continue;
         CHECK(std::find(names.begin(), names.end(), name) != names.end());
+        /* --manifest replaces --model, and refuses it beside it (manifest_test.cpp). */
         std::vector<std::string> args{ "--model", "/m/x.rad", name };
+        if (name == "--manifest") args.erase(args.begin(), args.begin() + 2);
         if (!arg.empty()) {
             auto it = legal_values().find(name);
             if (it == legal_values().end()) {
