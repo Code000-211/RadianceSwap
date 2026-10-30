@@ -2,10 +2,18 @@
  * into an exit code.
  */
 #include "engine.h"
+#include "build/startup.h"
 #include "hf_model.h"
 #include "util/stallwatch.h"
 
 int main(int argc, char** argv) {
+    /* Process-lifetime owner of the tools and plugin registry (ADR 0001). */
+    struct ProcessOwner {
+        ~ProcessOwner() {
+            rad::rad_tools_registry().close();
+        }
+    } process_owner;
+
     rad::Config cfg;
     int s = rad::config_parse(argc, argv, &cfg);
     if (s == 1) { rad::config_usage(argv[0]); return 0; }

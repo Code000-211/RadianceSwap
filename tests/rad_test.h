@@ -415,6 +415,21 @@ inline std::string home() {
     return h ? h : "radiance_home";
 }
 
+/* Resolve the radiance home directory containing shipped plugins/kernels. */
+inline std::string find_radiance_home() {
+    const char* env_home = std::getenv("RADIANCE_HOME");
+    if (env_home && *env_home && std::filesystem::exists(std::string(env_home) + "/kernels")) {
+        return env_home;
+    }
+    if (std::filesystem::exists("build/radiance_home/kernels")) {
+        return "build/radiance_home";
+    }
+    if (std::filesystem::exists("radiance_home/kernels")) {
+        return "radiance_home";
+    }
+    return {};
+}
+
 /* A command line for config_parse, which takes `char**`: the strings are owned here, so they are
  * writable and outlive the call. argv[0] is "radiance", which the parser skips. */
 struct Argv {

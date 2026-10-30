@@ -793,7 +793,7 @@ const IssuePlan* Ctx::oracle_reference(rad_op h, int band) {
         if (s < 0) return nullptr;
         r.scratch_bytes = s;
     }
-    if (registry_->init_instance(r, rank_, world_size_) < 0) return nullptr;
+    if (registry_->init_instance(owner_, r, rank_, world_size_) < 0) return nullptr;
 
     o.ref_res.push_back(std::move(r));
     const Resolved& kept = o.ref_res.back();

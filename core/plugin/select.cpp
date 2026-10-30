@@ -464,7 +464,7 @@ std::string Registry::selection_table() const {
 
 /* ------------------------------------------------------------------ instances */
 /* See registry.h: init_instance. */
-int Registry::init_instance(Resolved& r, int rank, int world_size) {
+int Registry::init_instance(const void* owner, Resolved& r, int rank, int world_size) {
     if (!r.row || !r.row->info) return RAD_E_INVAL;
     const RadKernelInfo* k = r.row->info;
     if (!k->init) { r.instance = nullptr; return RAD_OK; }
@@ -480,23 +480,50 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     r.instance = inst;
     /* Registered even when the instance is null: fini pairs 1:1 with every successful init. */
     std::lock_guard<std::mutex> lk(mu_);
-    instances_.emplace_back(k, inst);
+    instances_.push_back({ owner, k, inst });
     return RAD_OK;
 }
 
+void Registry::fini_instances(const void* owner) {
+    std::vector<InstanceRecord> take;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<InstanceRecord> keep;
+        keep.reserve(instances_.size());
+        for (const auto& item : instances_) {
+            if (item.owner == owner) {
+                take.push_back(item);
+            } else {
+                keep.push_back(item);
+            }
+        }
+        instances_ = std::move(keep);
+    }
+    for (auto it = take.rbegin(); it != take.rend(); ++it)
+        if (it->info && it->info->fini) it->info->fini(it->inst);
+}
+
 void Registry::fini_instances() {
-    std::vector<std::pair<const RadKernelInfo*, void*>> take;
+    std::vector<InstanceRecord> take;
     {
         std::lock_guard<std::mutex> lk(mu_);
         take.swap(instances_);
     }
     for (auto it = take.rbegin(); it != take.rend(); ++it)
-        if (it->first->fini) it->first->fini(it->second);
+        if (it->info && it->info->fini) it->info->fini(it->inst);
 }
 
 size_t Registry::n_instances() const {
     std::lock_guard<std::mutex> lk(mu_);
     return instances_.size();
+}
+
+size_t Registry::n_instances(const void* owner) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t count = 0;
+    for (const auto& item : instances_)
+        if (item.owner == owner) ++count;
+    return count;
 }
 
 }  /* namespace rad */

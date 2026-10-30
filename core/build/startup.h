@@ -128,7 +128,8 @@ int rad_tools_declare(const LoadedPlugins& plugins, const RadModelMeta& meta,
                       const RadBuildCtx& ctx, Program* out,
                       const std::function<int(RadBuilder*, int64_t logits_width)>& also = {},
                       const Program* ref = nullptr, const WeightSourceFn& sources = {},
-                      bool instances = true, const struct LoraDeclare* lora = nullptr);
+                      bool instances = true, const struct LoraDeclare* lora = nullptr,
+                      const void* owner = nullptr);
 
 /* A container's entries as the source of every declaration's encoding. `f` must outlive the
  * declare. */

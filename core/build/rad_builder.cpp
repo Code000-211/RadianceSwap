@@ -104,8 +104,9 @@ static int64_t decl_numel(uint32_t rank, const int64_t* shape) {
 }
 
 /* ================================================================== construction */
-Builder::Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx)
-    : reg_(reg) {
+Builder::Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx,
+                 const void* owner)
+    : reg_(reg), owner_(owner) {
     prog_.meta = meta;
     prog_.ctx  = ctx;
     scope_ = ctx.scope ? ctx.scope : "";
@@ -600,7 +601,7 @@ void Builder::finish_instances() {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                const int s = reg_.init_instance(owner_, r, prog_.ctx.rank, prog_.ctx.world_size);
                 if (s >= 0) continue;
 
                 err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",

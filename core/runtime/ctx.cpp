@@ -29,6 +29,7 @@ int Ctx::init(const CtxDesc& d) {
     record_passes_ = d.record_passes;
     residency_ = d.residency;
     registry_ = d.registry;
+    owner_     = d.owner;
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;

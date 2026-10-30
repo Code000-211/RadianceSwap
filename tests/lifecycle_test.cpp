@@ -8,8 +8,12 @@
  * every route malformed input, since the next route added inherits none of the per-route checks.
  */
 #include "server_fakes.h"
+#include "engine.h"
+#include "tiny_model.h"
+#include "build/startup.h"
 
 #include <cstring>
+#include <filesystem>
 
 namespace {
 
@@ -473,6 +477,139 @@ TEST(metrics_count_every_request_once_under_its_outcome) {
     CHECK_EQ(l.value("server_load", (int64_t)-1), (int64_t)0);
     CHECK_EQ(l.value("queue_cap", (int64_t)-1), (int64_t)2);
     finish_and_check_reaped(f);
+}
+
+/* ================================================================== engine and registry lifecycle */
+
+namespace {
+int s_fake_init_count = 0;
+int s_fake_fini_count = 0;
+
+int fake_kernel_init(const RadParam*, int, int, int, void** out) {
+    ++s_fake_init_count;
+    static int dummy = 1;
+    *out = &dummy;
+    return RAD_OK;
+}
+
+void fake_kernel_fini(void*) {
+    ++s_fake_fini_count;
+}
+}  /* namespace */
+
+TEST(kernel_instances_tracked_and_finalized_per_owner) {
+    s_fake_init_count = 0;
+    s_fake_fini_count = 0;
+
+    RadKernelInfo fake_info{};
+    fake_info.name = "fake_kernel";
+    fake_info.init = fake_kernel_init;
+    fake_info.fini = fake_kernel_fini;
+
+    rad::KernelRow fake_row{};
+    fake_row.info = &fake_info;
+    fake_row.plugin = "fake_plugin";
+
+    rad::Resolved r1{};
+    r1.row = &fake_row;
+    rad::Resolved r2{};
+    r2.row = &fake_row;
+    rad::Resolved r3{};
+    r3.row = &fake_row;
+
+    rad::Registry reg;
+    const void* owner1 = reinterpret_cast<const void*>(0x1111);
+    const void* owner2 = reinterpret_cast<const void*>(0x2222);
+
+    CHECK_OK(reg.init_instance(owner1, r1, 0, 1));
+    CHECK_OK(reg.init_instance(owner2, r2, 0, 1));
+    CHECK_OK(reg.init_instance(owner2, r3, 0, 1));
+
+    CHECK_EQ(s_fake_init_count, 3);
+    CHECK_EQ(s_fake_fini_count, 0);
+    CHECK_EQ(reg.n_instances(), (size_t)3);
+    CHECK_EQ(reg.n_instances(owner1), (size_t)1);
+    CHECK_EQ(reg.n_instances(owner2), (size_t)2);
+
+    /* fini_instances(owner1) finalises only owner1 instances; owner2 instances live on. */
+    reg.fini_instances(owner1);
+    CHECK_EQ(s_fake_fini_count, 1);
+    CHECK_EQ(reg.n_instances(), (size_t)2);
+    CHECK_EQ(reg.n_instances(owner1), (size_t)0);
+    CHECK_EQ(reg.n_instances(owner2), (size_t)2);
+
+    /* Repeated fini_instances(owner1) is a no-op. */
+    reg.fini_instances(owner1);
+    CHECK_EQ(s_fake_fini_count, 1);
+
+    /* close() finalises remaining instances exactly once. */
+    reg.close();
+    CHECK_EQ(s_fake_fini_count, 3);
+    CHECK_EQ(reg.n_instances(), (size_t)0);
+}
+
+/* Two Engine instances run sequentially in the same process: the first engine's destruction does
+ * not close or tear down the process-lifetime rad_tools_registry (ADR 0001), so the second engine
+ * starts cleanly without use-after-free or duplicate plugin registration errors. */
+TEST(two_engine_lifecycles_run_sequentially_without_use_after_free) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+
+    tiny::TempDir dir("engine_seq");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::Config cfg1;
+    cfg1.model = dir.path;
+    cfg1.radiance_home = home;
+    cfg1.kernel_hierarchy = { "libavx" };
+
+    {
+        rad::Engine engine1(cfg1);
+        int s = engine1.start();
+        CHECK_EQ(s, RAD_OK);
+        CHECK(!rad::rad_tools_registry().plugins().empty());
+    }
+
+    /* Process-lifetime registry must still hold loaded plugins after engine1 teardown. */
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+
+    rad::Config cfg2;
+    cfg2.model = dir.path;
+    cfg2.radiance_home = home;
+    cfg2.kernel_hierarchy = { "libavx" };
+
+    {
+        rad::Engine engine2(cfg2);
+        int s = engine2.start();
+        CHECK_EQ(s, RAD_OK);
+        CHECK(!rad::rad_tools_registry().plugins().empty());
+    }
+
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+}
+
+TEST(registry_lifecycle_and_process_ownership) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+
+    rad::LoadedPlugins lp1, lp2;
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp1));
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+
+    /* A second call against the process registry reuses loaded plugins without duplicate errors. */
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp2));
+    CHECK_EQ(lp1.arch_plugin, lp2.arch_plugin);
+
+    /* Registry can be closed explicitly by process runtime owner, resetting plugins. */
+    rad::rad_tools_registry().close();
+    CHECK(rad::rad_tools_registry().plugins().empty());
+
+    /* Re-opening after close reloads cleanly without use-after-free or error. */
+    rad::LoadedPlugins lp3;
+    CHECK_OK(rad::rad_tools_load_plugins(home, { "libavx" }, "qwen35", "", &lp3));
+    CHECK(!rad::rad_tools_registry().plugins().empty());
+    CHECK_EQ(lp3.arch_plugin, lp1.arch_plugin);
 }
 
 RAD_TEST_MAIN()
