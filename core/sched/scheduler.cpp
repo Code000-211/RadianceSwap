@@ -256,6 +256,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     n_deferred_ = 0;
     closed_ = false;
     closed_status_ = RAD_E_STATE;
+    admission_closed_ = false;
+    admission_closed_reason_ = "";
+    admission_closed_status_ = RAD_OK;
 
     /* Everything the step path touches is reserved here, so a step never calls the allocator. */
     plan_.e.reserve((size_t)cfg.max_seqs);
@@ -341,12 +344,14 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
             if (t < 0 || t >= prog_->meta.n_vocab) return RAD_E_INVAL;
         r->may_speculate = false;
     }
-    /* The engine has stopped. Fail the sink, which is what the caller listens to, so it is not
-     * left waiting on a step that never comes. */
-    if (closed_) {
-        RAD_WARN("request %llu refused: %s", (unsigned long long)r->id, closed_reason_);
-        server::sink_fail(r->sink, closed_status_, closed_reason_);
-        return RAD_E_STATE;
+    /* The engine has stopped or admission is closed. Fail the sink, which is what the caller
+     * listens to, so it is not left waiting on a step that never comes. */
+    if (closed_ || admission_closed_) {
+        const char* why = closed_ ? closed_reason_ : admission_closed_reason_;
+        const int st = closed_ ? closed_status_ : admission_closed_status_;
+        RAD_WARN("request %llu refused: %s", (unsigned long long)r->id, why);
+        server::sink_fail(r->sink, st, why);
+        return st;
     }
 
     int32_t slot;
@@ -811,6 +816,30 @@ void Scheduler::shutdown(const char* reason, int status) {
     block_.clear();
     serial_.clear();
     sweep_deferred();
+}
+
+void Scheduler::close_admission(const char* reason, int status) {
+    std::lock_guard<std::mutex> lk(mu_);
+    admission_closed_ = true;
+    admission_closed_reason_ = reason ? reason : "admission is closed";
+    admission_closed_status_ = status < 0 ? status : RAD_E_STATE;
+}
+
+void Scheduler::open_admission() {
+    std::lock_guard<std::mutex> lk(mu_);
+    admission_closed_ = false;
+    admission_closed_reason_ = "";
+    admission_closed_status_ = RAD_OK;
+}
+
+bool Scheduler::admission_closed() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return admission_closed_ || closed_;
+}
+
+int64_t Scheduler::in_flight() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return (int64_t)(running_.size() + waiting_.size());
 }
 
 int Scheduler::reap(uint64_t id) {

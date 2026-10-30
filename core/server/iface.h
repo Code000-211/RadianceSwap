@@ -235,6 +235,14 @@ public:
      * Default no-op, for a scheduler that frees at completion. */
     virtual void reap(uint64_t /*id*/) {}
 
+    /* Reversible admission closure: stops accepting new requests while keeping in-flight
+     * requests running to completion. */
+    virtual void close_admission(const char* /*reason*/ = "admission is closed",
+                                int /*status*/ = RAD_E_STATE) {}
+    virtual void open_admission() {}
+    virtual bool admission_closed() const { return false; }
+    virtual int64_t in_flight() const { return 0; }
+
     /* Whether this request's sampling parameters can be served at all. An unresolved sampler op
      * is not a declare failure (a deployment that never sends `typical_p` needs no typical
      * kernel; core/sample/sampler.h), only a request that asks for it is refused. The step loop

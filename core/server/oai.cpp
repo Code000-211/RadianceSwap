@@ -203,6 +203,15 @@ ApiError err_overloaded(const std::string& why) {
     return e;
 }
 
+ApiError err_unavailable(const std::string& why) {
+    ApiError e;
+    e.status = 503;
+    e.type = "server_error";
+    e.code = "service_unavailable";
+    e.message = why;
+    return e;
+}
+
 std::vector<std::string> dry_breakers(const std::vector<std::string>& deployment, bool set) {
     if (set || !deployment.empty()) return deployment;
     return { "\n", ":", "\"", "*" };

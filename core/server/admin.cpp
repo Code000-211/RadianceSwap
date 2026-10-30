@@ -543,7 +543,7 @@ HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
 HttpResponse Server::handle_health(const HttpRequest& req) { return handle_ping(req); }
 
 HttpResponse Server::handle_ping(const HttpRequest&) {
-    const bool stopping = stopping_.load();
+    const bool stopping = stopping_.load() || !admission_open_.load();
     return HttpResponse::json_body(
         stopping ? 503 : 200,
         json_dump(health_body(opt_.model_id, stopping,
