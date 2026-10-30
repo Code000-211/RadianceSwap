@@ -2708,6 +2708,36 @@ TEST(an_adapter_in_use_drains_on_unload_and_frees_itself_when_its_last_request_e
     CHECK(!listed("ad"));
 }
 
+TEST(a_manifest_lists_every_configured_model) {
+    /* The served (default) model first, then the others; each by id too, and unknown ids stay 404. */
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) {
+        for (const char* id : { "second", "third" }) {
+            ModelCard m;
+            m.id = id;
+            m.root = std::string("/models/") + id + ".rad";
+            o.other_models.push_back(m);
+        }
+    } });
+    HttpResponse list = f.get("/v1/models");
+    CHECK_EQ(list.status, 200);
+    const json data = json::parse(list.body)["data"];
+    REQUIRE_EQ(data.size(), (size_t)3);
+    CHECK_EQ(data[0]["id"].get<std::string>(), std::string("test-model"));
+    CHECK_EQ(data[1]["id"].get<std::string>(), std::string("second"));
+    CHECK_EQ(data[2]["id"].get<std::string>(), std::string("third"));
+    CHECK_EQ(data[2].value("root", std::string()), std::string("/models/third.rad"));
+    HttpResponse one = f.get("/v1/models/second");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("second"));
+    CHECK_EQ(f.get("/v1/models/test-model").status, 200);
+    CHECK_EQ(f.get("/v1/models/fourth").status, 404);
+}
+
+TEST(without_a_manifest_models_lists_only_the_served_model) {
+    Fixture f;
+    CHECK_EQ(json::parse(f.get("/v1/models").body)["data"].size(), (size_t)1);
+}
+
 TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
     Fixture f(true, 262144, "/models/m.rad");

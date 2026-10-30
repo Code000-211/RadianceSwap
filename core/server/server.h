@@ -91,6 +91,9 @@ struct ServerOptions {
     /* What --model named, reported as the model entry's `root` as vLLM reports its loaded path
      * (the served name says nothing about the file behind it). Empty omits the field. */
     std::string model_path;
+    /* Manifest mode: the other configured models, listed by /v1/models beside the served one
+     * (id and root only; only model_id is started and answered). Empty without a manifest. */
+    std::vector<ModelCard> other_models;
     std::string host = "0.0.0.0";
     int         port = 8000;
     int         n_threads = 0;

@@ -45,6 +45,9 @@ static const std::string g_draft_window_help =
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
                                         "Hugging Face repo id (owner/name), fetched before startup" },
+    { "--manifest",           "FILE",   "serve the models a JSON manifest lists (GPU group, cache, models with\n"
+                                        "their own engine options) instead of one --model; /v1/models lists\n"
+                                        "them all and the default one is started. Excludes --model and LoRA" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
@@ -358,7 +361,7 @@ static const Flag g_flags[] = {
 };
 
 void config_usage(const char* argv0) {
-    fprintf(stderr, "usage: %s --model FILE [options]\n\n", argv0);
+    fprintf(stderr, "usage: %s (--model FILE | --manifest FILE) [options]\n\n", argv0);
     /* Align help continuation lines under the first, whatever indentation the string carries. */
     for (const Flag& f : g_flags) {
         char left[64];
@@ -511,6 +514,7 @@ int config_parse(int argc, char** argv, Config* c) {
         if (S("-v"))                           log_set_level(Log::Debug);
         else if (S("-vv"))                     log_set_level(Log::Trace);
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
+        else if (S("--manifest"))              { if (!(v = need(i))) return RAD_E_INVAL; c->manifest = v; }
         else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
@@ -1071,9 +1075,25 @@ int config_parse(int argc, char** argv, Config* c) {
      * rank the installed one behind the reference implementation. An empty hierarchy loads every
      * library found, ordered with the reference last (core/plugin/loader.cpp). A list loads only
      * the named libraries, in its order. */
-    if (c->model.empty()) {
-        RAD_ERR("--model is required");
+    if (c->model.empty() && c->manifest.empty()) {
+        RAD_ERR("--model is required (or --manifest, for several models)");
         return RAD_E_INVAL;
+    }
+    if (!c->manifest.empty()) {
+        if (!c->model.empty()) {
+            RAD_ERR("--manifest lists the models, so --model is not given beside it");
+            return RAD_E_INVAL;
+        }
+        /* LoRA names an adapter of one base; with several models it would route ambiguously. */
+        for (const auto& [flag, source] : c->given)
+            if (flag.rfind("--lora", 0) == 0 || flag.rfind("--max-lora", 0) == 0) {
+                RAD_ERR("%s is not served with --manifest: an adapter belongs to one base model", flag.c_str());
+                return RAD_E_INVAL;
+            }
+        if (c->kld()) {
+            RAD_ERR("KL mode scores one model: give --model, not --manifest");
+            return RAD_E_INVAL;
+        }
     }
 
     /* Prompt lookup alone: the window is its K, stated once. */
@@ -1229,6 +1249,7 @@ struct ShowRow { const char* flag; Show show; };
  * at startup" (-1, 0, empty) are shown by meaning; the engine's decisions replace them. */
 const ShowRow kShow[] = {
     { "--model",              [](const Config& c) { return c.model; } },
+    { "--manifest",           [](const Config& c) { return or_none(c.manifest, "none"); } },
     { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
     { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
     { "--kernels",            [](const Config& c) {

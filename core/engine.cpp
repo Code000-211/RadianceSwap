@@ -7,6 +7,7 @@
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
 #include "kld.h"
+#include "manifest.h"
 #include "mm/processor.h"
 #include "mm/media.h"
 
@@ -2669,6 +2670,14 @@ int Engine::run_server() {
         decide("--max-n", std::to_string(o.max_n), "the larger of 8 and --max-num-seqs");
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.model_path = cfg_.model;
+    if (registry_)
+        for (const ModelRecord& m : registry_->models()) {
+            if (m.is_default) continue;
+            server::ModelCard card;
+            card.id = m.id;
+            card.root = m.path;
+            o.other_models.push_back(std::move(card));
+        }
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
