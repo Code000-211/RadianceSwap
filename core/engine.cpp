@@ -2411,9 +2411,13 @@ int Engine::run_server() {
      * hold the session table the sessions view reads. */
     server::SchedulerBridge sched_bridge(&sched_, ranks_.empty() ? nullptr : &ranks_[0]->sampler,
                                         ranks_.empty() ? nullptr : &ranks_[0]->tiers);
-    server::TokenizerBridge tok_bridge(vocab_);
-    server::ChatTemplateBridge chat_bridge;
-    server::GrammarBridge grammar_bridge(vocab_view_.get());
+    /* The model's frontend outlives this function's stack: the server and every request lease
+     * share it (core/server/frontend.h), and stopping the runtime does not touch it. */
+    const auto frontend = std::make_shared<server::ModelFrontend>();
+    const auto tok_bridge = std::make_shared<server::TokenizerBridge>(vocab_);
+    const auto chat_bridge = std::make_shared<server::ChatTemplateBridge>();
+    frontend->tok = tok_bridge;
+    frontend->grammar = std::make_shared<server::GrammarBridge>(vocab_view_);
 
     /* One snapshot function feeds both the live view (spec §16) and the web dashboard, so they
      * cannot disagree. It runs on the drawing thread and must not slow the engine: it reads the
@@ -2581,8 +2585,7 @@ int Engine::run_server() {
 
     server::Deps d{};
     d.sched = &sched_bridge;
-    d.tok   = &tok_bridge;
-    d.grammar = &grammar_bridge;
+    d.frontend = frontend;
     d.live  = snap;
     /* The control vector, when one was found. The admin endpoint flips the
      * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
@@ -2635,13 +2638,13 @@ int Engine::run_server() {
     const RadChatFormat* declared_format = rad_tools_chat_format(plugins_, meta_);
     /* An image model's template is its conditioning network's; nothing is served as chat. */
     const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
-                          chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
-                          chat_bridge.ready();
+                          chat_bridge->init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
+                          chat_bridge->ready();
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
-        if (have_tpl) embed_info.tpl = &chat_bridge;
+        if (have_tpl) embed_info.tpl = chat_bridge.get();
     } else if (have_tpl) {
-        d.chat = &chat_bridge;
+        frontend->chat = chat_bridge;
     } else if (!gen_) {
         RAD_WARN("no chat template in this container; /v1/chat/completions will answer 501 and "
                  "/v1/completions is the endpoint to use");
@@ -2866,8 +2869,8 @@ int Engine::run_server() {
         mm_proc = std::make_unique<mm::Processor>();
         const int pi = mm_proc->init(
             vc,
-            [&tok_bridge](const std::string& t) {
-                return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
+            [tok_bridge](const std::string& t) {
+                return tok_bridge->encode(t, /*add_special=*/false, /*parse_special=*/false);
             },
             [this](const std::string& t) { return vocab_->find(t); });
         if (pi < 0) {
@@ -2942,7 +2945,7 @@ int Engine::run_server() {
         const RadAudioFormat* afmt = rad_tools_audio_format(plugins_, meta_);
         auto one_token = [&](const char* spell, int32_t* id) -> int {
             if (*id >= 0 || !spell || !*spell) return RAD_OK;
-            const std::vector<int32_t> t = tok_bridge.encode(spell, /*add_special=*/false,
+            const std::vector<int32_t> t = tok_bridge->encode(spell, /*add_special=*/false,
                                                              /*parse_special=*/true);
             if (t.size() != 1) {
                 RAD_ERR("the architecture plugin spells a clip's marker '%s', which this "
@@ -3255,7 +3258,7 @@ int Engine::run_server() {
     /* A default the template refuses would 400 every chat request that relies on it. Bad
      * --chat-template-kwargs stop startup; --reasoning-effort only warns, since clients that send
      * their own effort are unaffected. */
-    if (d.chat && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
+    if (frontend->chat && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
         std::string kw_why, eff_why;
         srv.check_template_defaults(&kw_why, &eff_why);
         if (!kw_why.empty()) {
@@ -3270,7 +3273,7 @@ int Engine::run_server() {
     }
     /* Log the efforts the template accepts (a client sending another gets this set in its 400,
      * and /server_info shows it). A map target the template refuses stops startup. */
-    if (d.chat) {
+    if (frontend->chat) {
         const std::vector<std::string> efforts = srv.probe_reasoning_efforts();
         std::string mapped;
         for (const auto& [from, to] : cfg_.reasoning_effort_map)
@@ -3319,7 +3322,7 @@ int Engine::run_server() {
                  d.images && d.images->info().max_refs > 0 ? " and /v1/images/edits" : "", keyed);
     else
         RAD_INFO("serving on http://%s:%d  (/v1/completions%s%s)", o.host.c_str(), o.port,
-                 d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
+                 frontend->chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
                  keyed);
 
     /* The live view (spec §16, off by default): the console's throughput heartbeat

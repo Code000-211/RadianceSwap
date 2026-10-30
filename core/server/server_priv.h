@@ -17,6 +17,9 @@ namespace server {
 /* ------------------------------------------------------------------ per-choice state */
 
 struct Server::Generation {
+    /* Declared first, so destroyed last: the decoder and reply stream below need its tokenizer
+     * and template. */
+    FrontendLease                 lease;
     std::shared_ptr<Sink>         sink;
     /* The runtime LoRA adapter this choice runs with, held so it cannot be unloaded under it. */
     std::shared_ptr<void>         lora_hold;

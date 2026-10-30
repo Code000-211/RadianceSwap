@@ -713,6 +713,8 @@ private:
 class GrammarBridge final : public IGrammarCompiler {
 public:
     explicit GrammarBridge(const VocabView* v) : v_(v) {}
+    /* Keeps the view alive for as long as the compiler is. */
+    explicit GrammarBridge(std::shared_ptr<const VocabView> v) : keep_(std::move(v)), v_(keep_.get()) {}
 
     int from_json_schema(const json& schema, std::string& out, std::string& err) const override {
         return grammar_from_json_schema(schema.dump(), "root", &out, &err);
@@ -728,6 +730,7 @@ public:
     }
 
 private:
+    std::shared_ptr<const VocabView> keep_;
     const VocabView* v_;
 };
 

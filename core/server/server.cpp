@@ -21,6 +21,8 @@ namespace server {
 
 Server::Server(const Deps& d, const ServerOptions& o)
     : deps_(d), opt_(o),
+      frontend_(d.frontend ? d.frontend : std::make_shared<ModelFrontend>()),
+      lim_(frontend_->limits),
       metrics_(o.model_id, o.max_ctx > 0 ? o.max_ctx : 32768) {
     lim_.model_id = opt_.model_id;
     lim_.version = opt_.version;
@@ -41,6 +43,17 @@ Server::Server(const Deps& d, const ServerOptions& o)
     lim_.default_template_kwargs = opt_.default_template_kwargs;
     lim_.reasoning_effort_map = opt_.reasoning_effort_map;
     lim_.reasoning_format = opt_.reasoning_format;
+
+    /* Raw pointers handed in directly are wrapped, not owned: the caller outlives the Server. */
+    if (!d.frontend) {
+        const std::shared_ptr<void> none;
+        frontend_->tok     = std::shared_ptr<ITokenizer>(none, d.tok);
+        frontend_->chat    = std::shared_ptr<IChatTemplate>(none, d.chat);
+        frontend_->grammar = std::shared_ptr<IGrammarCompiler>(none, d.grammar);
+    }
+    deps_.tok     = frontend_->tok.get();
+    deps_.chat    = frontend_->chat.get();
+    deps_.grammar = frontend_->grammar.get();
 
     odeps_.tok = deps_.tok;
     odeps_.chat = deps_.chat;
@@ -518,12 +531,13 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
     for (size_t p = 0; p < r.prompts.size(); ++p) {
         for (int k = 0; k < r.n; ++k, ++idx) {
             Generation g;
+            g.lease = frontend_;
             g.index = idx;
             g.prompt_index = (int)p;
             g.sink = std::make_shared<Sink>();
             if (r.want_logprobs) g.sink->enable_logprobs(r.n_logprobs);
             g.think.start(r.sp.reasoning);
-            g.detok = deps_.tok->detokenizer(r.stop, r.preserved_tokens);
+            g.detok = g.lease->tok->detokenizer(r.stop, r.preserved_tokens);
             if (!g.detok) {
                 *err = err_not_implemented("the tokenizer did not supply an incremental decoder");
                 return RAD_E_UNSUPPORTED;
