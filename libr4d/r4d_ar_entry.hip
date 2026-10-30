@@ -28,7 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 
@@ -76,21 +78,36 @@ struct Rendezvous {
 };
 
 Rendezvous g_rv;
+std::mutex                                                 g_rv_mu;
+std::unordered_map<long long, std::shared_ptr<Rendezvous>> g_rv_map;
+
+static std::shared_ptr<Rendezvous> get_rv(long long owner) {
+    if (owner == 0) {
+        static auto rv0 = std::shared_ptr<Rendezvous>(&g_rv, [](Rendezvous*) {});
+        return rv0;
+    }
+    std::lock_guard<std::mutex> lk(g_rv_mu);
+    auto it = g_rv_map.find(owner);
+    if (it != g_rv_map.end()) return it->second;
+    auto rv = std::make_shared<Rendezvous>();
+    g_rv_map[owner] = rv;
+    return rv;
+}
 
 /* Sense-reversing barrier on a monotone epoch, so a rank that wakes and re-enters for the next
  * instance cannot be counted twice. The timeout is not recovery; it turns a startup deadlock into
  * a named error instead of a silent hang. */
-int rv_barrier(int world) {
-    std::unique_lock<std::mutex> lk(g_rv.m);
-    const int e = g_rv.epoch;
-    if (++g_rv.arrived == world) {
-        g_rv.arrived = 0;
-        g_rv.epoch++;
-        g_rv.cv.notify_all();
+int rv_barrier(Rendezvous* rv, int world) {
+    std::unique_lock<std::mutex> lk(rv->m);
+    const int e = rv->epoch;
+    if (++rv->arrived == world) {
+        rv->arrived = 0;
+        rv->epoch++;
+        rv->cv.notify_all();
         return RAD_OK;
     }
-    const bool ok = g_rv.cv.wait_for(lk, std::chrono::seconds(60),
-                                     [&] { return g_rv.epoch != e; });
+    const bool ok = rv->cv.wait_for(lk, std::chrono::seconds(60),
+                                     [&] { return rv->epoch != e; });
     return ok ? RAD_OK : RAD_E_STATE;
 }
 
@@ -181,19 +198,19 @@ long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
 /* The eight-rank two-shot's settings, fixed before anything is sized: each rank publishes its own
  * card's link, and after one barrier every rank derives the same weights from the same eight
  * entries. */
-int ar8_settle(ArInst* in, int rank, int world) {
+int ar8_settle(ArInst* in, Rendezvous* rv, int rank, int world) {
     static std::once_flag said_links, said_unknown, said_set;
     const R4DAr8Settings set = ar8_settings();
     R4DArLink own;
     if (set.weights == R4D_AR8_WEIGHTS_AUTO && !ar8_own_link(&own)) own = R4DArLink();
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.ar8_link[rank] = own;
+        std::lock_guard<std::mutex> lk(rv->m);
+        rv->ar8_link[rank] = own;
     }
-    const int rc = rv_barrier(world);
+    const int rc = rv_barrier(rv, world);
     if (rc != RAD_OK) return rc;
 
-    const R4DArLink* all = g_rv.ar8_link;
+    const R4DArLink* all = rv->ar8_link;
     in->pieces = set.pieces;
     in->weights_min = set.weights_min;
     in->pieces_min = set.pieces_min;
@@ -257,10 +274,12 @@ long kSeqWords(long nbw) { return 2L * nbw + 32; }
  *
  * Cost: at a 4096-token chunk on a 5120-wide residual, 40 MiB a slot and 80 MiB for the pair. One
  * set serves every op with the same (rank, world, dtype, bound); see the cache below. */
-int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, int host) {
+int build(ArInst* in, long long owner, int rank, int world, long long max_numel, int dtype_code, int host) {
     if (world < 2 || world > R4D_MAX_RANKS) return RAD_E_SHAPE;
     if (rank < 0 || rank >= world) return RAD_E_INVAL;
     if (max_numel <= 0) return RAD_E_INVAL;
+
+    auto rv = get_rv(owner);
 
     in->rank = rank;
     in->world = world;
@@ -271,7 +290,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->slot_bytes = align16((long)max_numel * in->esize);
     in->slot16 = in->slot_bytes / 16;
     if (world == 8) {
-        const int rc8 = ar8_settle(in, rank, world);
+        const int rc8 = ar8_settle(in, rv.get(), rank, world);
         if (rc8 != RAD_OK) return rc8;
     }
     if (in->shard_weighted) {
@@ -382,13 +401,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.scratch[rank] = sc;
-        g_rv.flags[rank]   = fl;
-        g_rv.seq[rank]     = sq;
-        g_rv.dev[rank]     = dev;
+        std::lock_guard<std::mutex> lk(rv->m);
+        rv->scratch[rank] = sc;
+        rv->flags[rank]   = fl;
+        rv->seq[rank]     = sq;
+        rv->dev[rank]     = dev;
     }
-    int rc = rv_barrier(world);
+    int rc = rv_barrier(rv.get(), world);
     if (rc != RAD_OK) return rc;
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
@@ -399,17 +418,17 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     int j = 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
-        if (!g_rv.scratch[r] || !g_rv.flags[r]) return RAD_E_STATE;
-        in->peer_scratch[j] = g_rv.scratch[r];
-        in->peer_flags[j]   = g_rv.flags[r];
+        if (!rv->scratch[r] || !rv->flags[r]) return RAD_E_STATE;
+        in->peer_scratch[j] = rv->scratch[r];
+        in->peer_flags[j]   = rv->flags[r];
         ++j;
-        if (!host && g_rv.dev[r] != dev)
-            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host && rv->dev[r] != dev)
+            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)rv->dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
      * message would be pushed into a mapping the receiver has not opened. */
-    return rv_barrier(world);
+    return rv_barrier(rv.get(), world);
 }
 
 /* ------------------------------------------------------------------ one world, shared
@@ -429,12 +448,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
  * The rendezvous stays symmetric because every rank declares the same graph in the same order:
  * the Nth all-reduce misses the cache on every rank or on none. */
 struct CacheKey {
+    long long owner;
     int       rank, world, dtype;
     long long numel;
     int       host;
     bool operator==(const CacheKey& o) const {
-        return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel &&
-               host == o.host;
+        return owner == o.owner && rank == o.rank && world == o.world && dtype == o.dtype &&
+               numel == o.numel && host == o.host;
     }
 };
 
@@ -458,7 +478,7 @@ int acquire(const CacheKey& k, ArInst** out) {
      * rank has one declare thread, so no two builders race for one key. */
     ArInst* in = new (std::nothrow) ArInst();
     if (!in) return RAD_E_NOMEM;
-    int rc = build(in, k.rank, k.world, k.numel, k.dtype, k.host);
+    int rc = build(in, k.owner, k.rank, k.world, k.numel, k.dtype, k.host);
     if (rc != RAD_OK) { delete in; return rc; }
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
@@ -470,14 +490,28 @@ int acquire(const CacheKey& k, ArInst** out) {
 
 void release(ArInst* in) {
     if (!in) return;
+    long long owner_to_clean = 0;
+    bool remove_rv = false;
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
         for (size_t i = 0; i < g_cache.size(); ++i) {
             if (g_cache[i].in != in) continue;
             if (--g_cache[i].refs > 0) return;
+            owner_to_clean = g_cache[i].key.owner;
             g_cache.erase(g_cache.begin() + (long)i);
+            remove_rv = true;
+            for (const auto& s : g_cache) {
+                if (s.key.owner == owner_to_clean) {
+                    remove_rv = false;
+                    break;
+                }
+            }
             break;
         }
+    }
+    if (remove_rv && owner_to_clean != 0) {
+        std::lock_guard<std::mutex> lk(g_rv_mu);
+        g_rv_map.erase(owner_to_clean);
     }
     /* Free only this rank's own allocations; peer pointers belong to the peer. */
     if (in->host) {
@@ -513,8 +547,10 @@ static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, vo
     const long long numel = pgeti_hi(p, n_p, "numel", 0);
     if (numel <= 0) return RAD_E_INVAL;
 
+    const long long owner = pgeti_hi(p, n_p, "owner", 0);
+
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, numel, host }, &in);
+    int rc = acquire(CacheKey{ owner, rank, world, dt, numel, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -540,8 +576,10 @@ static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int ho
     const long long K = pgeti_hi(p, n_p, "n", 0);
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
 
+    const long long owner = pgeti_hi(p, n_p, "owner", 0);
+
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host }, &in);
+    int rc = acquire(CacheKey{ owner, rank, world, 0 /* bf16 */, M * K, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;

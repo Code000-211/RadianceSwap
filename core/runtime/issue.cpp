@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "ctx.h"
+#include "collective_sequencer.h"
 #include "device/device.h"
 #include "kvstream/bind.h"
 #include "wtab.h"
@@ -970,12 +971,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     /* In a staged pass a collective holds the card's link; the stager's copy lists yield meanwhile
      * (see rad_link_hold). Taken after every wait this op's operands put on the stream, so nothing
      * between hold and release can wait on a weight stuck behind a yielding list. */
+    const bool is_device_coll = p.collective && dom == RAD_DOMAIN_DEVICE && world_size_ > 1;
+    uint64_t coll_ticket = 0;
+    if (is_device_coll) {
+        coll_ticket = rad_collective_sequencer().before_collective(owner_, rank_, world_size_, cur_stream());
+    }
+
     const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
     const RadArgs* la = &ip.args;
     RadArgs gate_args;
     if (hold) {
         const int hs = rad_link_hold(cur_stream(), 1);
-        if (hs < 0) return abort_step(h, b, dom, ip, n, hs);
+        if (hs < 0) {
+            if (is_device_coll) {
+                rad_collective_sequencer().after_collective(owner_, rank_, world_size_, cur_stream(), coll_ticket);
+            }
+            return abort_step(h, b, dom, ip, n, hs);
+        }
         if (ip.gate_p) {
             gate_args = ip.args;
             gate_args.p = ip.gate_p;
@@ -1067,6 +1079,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
         const int hr = rad_link_hold(cur_stream(), la != &ip.args && s == RAD_LINK_ENDED ? 2 : 0);
         if (hr < 0 && s >= 0) s = hr;
+    }
+    if (is_device_coll) {
+        rad_collective_sequencer().after_collective(owner_, rank_, world_size_, cur_stream(), coll_ticket);
     }
     if (host_paused) tape_pause(false);
 

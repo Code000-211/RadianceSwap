@@ -24,6 +24,7 @@
 #include "server/liveview.h"
 #include "text/tokenizer.h"
 #include "util/stallwatch.h"
+#include "runtime/collective_sequencer.h"
 
 #include <atomic>
 #include <chrono>
@@ -115,6 +116,7 @@ Engine::~Engine() {
     table_shares_.clear();
     /* The tools/plugin registry belongs to the process runtime (ADR 0001), but this engine's
      * kernel instances are finalised on engine teardown. */
+    rad_collective_sequencer().unregister_engine(this);
     rad_tools_registry().fini_instances(this);
 }
 
@@ -540,6 +542,7 @@ void Engine::phase_mark(int p) {
  *     error instead of queueing requests nothing will drain (spec §17). */
 int Engine::fail_loop(int st) {
     stopping_.store(true, std::memory_order_release);
+    rad_collective_sequencer().unregister_engine(this);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
     loop_status_.store(st < 0 ? st : RAD_E_STATE, std::memory_order_release);
@@ -2066,6 +2069,7 @@ int Engine::start_execution() {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     stepper_thread_ = std::thread([this] { if (gen_) gen_loop(); else step_loop(); });
 
+    rad_collective_sequencer().register_engine(this, cfg_.tp);
     execution_running_.store(true, std::memory_order_release);
     return RAD_OK;
 }
@@ -2093,6 +2097,7 @@ int Engine::stop_execution(StopMode mode) {
     }
 
     stopping_.store(true, std::memory_order_release);
+    rad_collective_sequencer().unregister_engine(this);
     if (barrier_) barrier_->abort();
     if (stepper_thread_.joinable()) stepper_thread_.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
