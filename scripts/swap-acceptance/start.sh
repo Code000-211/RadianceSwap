@@ -1,10 +1,10 @@
 #!/bin/bash
-# start.sh LOG TIMEOUT args...  -> prints PID of the timeout wrapper (ours); waits for /health on 18080 up to 600 s
+# start.sh LOG TIMEOUT args...  (RAD_BIN overrides the binary, e.g. a baseline build)  -> prints PID of the timeout wrapper (ours); waits for /health on 18080 up to 600 s
 log=$1; to=$2; shift 2
 if pgrep -x radiance >/dev/null; then echo "REFUSE: a radiance is already running"; pgrep -af "bin/radiance --port"; exit 2; fi
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 export RADIANCE_HOME=$PWD/build/radiance_home
-timeout $to build/bin/radiance --port 18080 "$@" > $log 2>&1 &
+timeout $to ${RAD_BIN:-build/bin/radiance} --port 18080 "$@" > $log 2>&1 &
 pid=$!
 echo $pid > ${T21:-/tmp/swap-acceptance}/pid
 for i in $(seq 1 300); do

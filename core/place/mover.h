@@ -104,6 +104,7 @@ public:
         return n;
     }
     int64_t capacity() const { return n_; }
+    bool held_at(int64_t s) const { return s >= 0 && s < n_ && held_[(size_t)s]; }
     int64_t stride() const { return stride_; }
     int64_t n_free() const { return n_usable_; }
     /* n_free() restricted to slots below `hi`: the budgeted range of a slab whose free list also
@@ -328,6 +329,15 @@ struct MoverConfig {
      * there are movable residents and --host-pool-mib has room for after every pooled unit and the
      * file tier's reserves. Off: no spare slots, and set_resident_cap changes nothing. */
     bool shrinkable = false;
+    /* An elastic slab grows only while the card keeps `grow_floor` bytes free after the pages are
+     * backed (rank's device `device`): the runtime allocates scratch and code objects on first use,
+     * and a card taken to the last byte corrupts the kernel that needed them. */
+    int     device = 0;
+    int64_t grow_floor = 0;
+    /* Size of the pieces an elastic slab is mapped and unmapped in (ClassPools::chunk_slots), about
+     * this many bytes each. A piece gets address space no mapping has used before, and a piece
+     * given back is never mapped again. */
+    int64_t slab_chunk_bytes = (int64_t)128 << 20;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -641,16 +651,59 @@ public:
      *   - A raised cap regrows the segment, and fill() promotes the hottest pooled units into
      *     the slots that came back.
      *
-     * The slots are released logically only: the slab is one reservation in the weights pool
-     * (a bump allocator over a plain device allocation, mem/pools.h), so no byte goes back to the
-     * card and another engine's pool cannot use it. A cap above what the plan placed regrows no
-     * further than the slots that exist. */
+     * Whether the bytes go back to the card depends on the weights pool. On a plain pool the slots
+     * are released logically only (the slab is one reservation in a bump allocator over one
+     * device allocation, mem/pools.h). On an elastic pool (Pools::configure with address space
+     * past the budget: manifest mode with several models, docs/swap/elastic-slab.md) the slab
+     * is backed by pages the mover commits and decommits:
+     *
+     *   - Once nothing holds a slot above the shrunk segment, the pages behind those slots are
+     *     decommitted (Pool::decommit), a burst a call. The card has the bytes free as soon as
+     *     the call returns; backed_slots() and slab_held_bytes() report it.
+     *   - A cap above what the plan placed regrows the segment past its original size, into
+     *     address space reserved at init (n_grow slots a class): the mover commits the pages in
+     *     bursts, raises the segment's target only over backed slots, and fill() promotes into
+     *     them. A refused commit (the card has no room) stops the growth where it stands and
+     *     backs off for a second.
+     *   - No table is edited here beyond the ordinary moves; they publish at the next step's table
+     *     sync, and a slot is decommitted only after the retire/quarantine that freed it. */
     /* `units` < 0 lifts the cap. A class with no movable resident, or no spare pool slot, is kept
      * at the size it can reach. Cheap: bookkeeping only, applied by the next balance(). */
     int     set_resident_cap(size_t klass, int64_t units);
-    /* Slab slots of the class's budgeted segment currently given back. */
+    /* Slab slots of the class's budgeted segment currently given back (below the plan's size). */
     int64_t released_slots(size_t klass) const {
-        return klass < pools_.size() ? pools_[klass].n_fixed - pools_[klass].slab.target(0) : 0;
+        return klass < pools_.size()
+            ? std::max<int64_t>(pools_[klass].n_base - pools_[klass].slab.target(0), 0) : 0;
+    }
+    /* Whether the slab sits on elastic pages (the weights pool was made with address space to
+     * grow into). Without, backed_slots() is the plan's size for good. */
+    bool    slab_elastic() const {
+        for (const ClassPools& cp : pools_) if (cp.chunk_slots > 0) return true;
+        return false;
+    }
+    /* Slots of the class's budgeted range with pages behind them, working slots included. */
+    int64_t backed_slots(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].backed : 0;
+    }
+    /* Slots in one mapped piece of the class's elastic slab (0: the slab is not elastic). Pages go
+     * back to the card a piece at a time. */
+    int64_t chunk_slots(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].chunk_slots : 0;
+    }
+    /* The class's movable expert capacity, in bytes: what the group planner counts (units heat may
+     * move), without the working slots and the residents that cannot move. `slab_offer_bytes` is
+     * that capacity as the plan placed it and `slab_held_bytes` what has pages behind it now; the
+     * second falls below the first on a shrink, once the pages went back to the card, and rises
+     * above it on a regrow past the plan. */
+    int64_t slab_offer_bytes(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].n_movable0 * pools_[klass].stride : 0;
+    }
+    int64_t slab_held_bytes(size_t klass) const {
+        if (klass >= pools_.size()) return 0;
+        const ClassPools& cp = pools_[klass];
+        if (cp.n_movable0 == 0) return 0;
+        return std::max<int64_t>(cp.backed - cp.n_work - (cp.n_resident0 - cp.n_movable0), 0) *
+               cp.stride;
     }
     /* Whether a cap has moved the segment and not yet settled (balance() has work). */
     bool    resizing() const {
@@ -794,7 +847,25 @@ private:
         void*    pool_base = nullptr;
         void*    pool_dev = nullptr;   /* the pinned pool as the device addresses it */
         int64_t  stride = 0;
-        int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
+        int64_t  n_fixed = 0;          /* slots in the budgeted range, growth slots included; the flex ones start here */
+        /* The plan's slots (resident, shadow, staging): backed at init. The `n_fixed - n_base` after
+         * them exist as address space only and are backed when a cap grows the segment into them
+         * (elastic weights pool, `chunk_slots` > 0). */
+        int64_t  n_base = 0;
+        /* Elastic slab: the slots are cut into pieces of `chunk_slots`, each mapped at address space of
+         * its own taken from the weights pool's arena (Pool::va_arena) and unmapped as a whole. A
+         * piece's address is never mapped twice (the device layer cannot do that; see Pool::va_arena),
+         * so a slot's address changes when its piece comes back, and slot_ptr() resolves it. `mapped`
+         * is how many of the piece's leading slots have pages behind them. 0: one contiguous
+         * reservation. */
+        int64_t  chunk_slots = 0;
+        int64_t  chunk_span = 0;       /* address space of a piece, in bytes */
+        struct Chunk { int64_t off = -1; int64_t mapped = 0; };   /* off: from the pool's base */
+        std::vector<Chunk> chunks;
+        char*    arena = nullptr;      /* the weights pool's base */
+        int64_t  backed = 0;           /* slots [0, backed) have pages behind them (elastic only) */
+        int64_t  want_target = 0;      /* the segment size the cap asks for; slab.target(0) follows it */
+        uint64_t grow_after_ns = 0;    /* a refused commit backs growth off until then */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */
         int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
                                         * of them and balance() drops lent units to rebuild them
@@ -817,6 +888,8 @@ private:
         bool     strand_check = true;
 
         char* slot_ptr(int64_t slot) const {
+            if (chunk_slots > 0 && slot < n_fixed)
+                return arena + chunks[(size_t)(slot / chunk_slots)].off + (slot % chunk_slots) * stride;
             return slot < n_fixed ? (char*)slab_base + slot * stride
                                   : flex_ptr[(size_t)(slot - n_fixed)];
         }
@@ -911,7 +984,8 @@ private:
     int  retire(HeatEngine* heat);
     int  record_gate();
     void republish(int32_t unit);
-    void* reserve(const char* what, int64_t bytes, int kind);
+    void* reserve(const char* what, int64_t bytes, int kind, bool back = true);
+    static void pick_chunk(int64_t want_bytes, int64_t stride, int64_t* slots, int64_t* span);
     int  free_move_record() const;
     int  start_stage(int32_t unit, int64_t slab_slot);
     void release_slot(int32_t unit);
@@ -936,6 +1010,14 @@ private:
     int  fill(size_t klass, int64_t room, HeatEngine* heat, int64_t lo = -1);
     /* Carries out the class's resident cap; true when it moved something. */
     bool resize(size_t klass, HeatEngine* heat);
+    /* The pages behind the elastic slab, a burst a call (resize()). */
+    bool grow_backing(ClassPools& cp);
+    bool shrink_backing(ClassPools& cp);
+    /* Maps slots [backed, upto) of an elastic class, piece by piece; the status of the first piece
+     * that would not map (backed stops there). */
+    int  map_slots(ClassPools& cp, int64_t upto);
+    /* The topmost piece with pages that no slot needed (below the target or held) lives in, or -1. */
+    int64_t releasable_chunk(const ClassPools& cp) const;
     void count_flex();
 };
 

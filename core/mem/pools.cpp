@@ -1,6 +1,7 @@
 /* pools.cpp -- see pools.h. */
 #include "mem/pools.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -63,7 +64,7 @@ void Pool::release() {
         alloc_->free(base_, kind_);
     }
     base_ = nullptr;
-    bytes_ = used_ = 0;
+    bytes_ = used_ = arena_cursor_ = arena_end_ = 0;
 }
 
 void Pool::reset(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
@@ -105,9 +106,18 @@ void* Pool::reserve(std::string_view what, int64_t bytes, int64_t align, int64_t
     return (char*)base_ + off;
 }
 
+int64_t Pool::va_arena(int64_t bytes, int64_t align) {
+    if (!elastic_ || bytes <= 0 || align <= 0) return -1;
+    const int64_t off = align_up(arena_cursor_, align);
+    if (off + bytes > arena_end_) return -1;
+    arena_cursor_ = off + bytes;
+    return off;
+}
+
 /* ------------------------------------------------------------------ elastic */
 
-int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
+int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a,
+                       int64_t va_extra) {
     /* Without virtual memory management this is init(): commits succeed against memory that is
      * already there and the pool holds its maximum for the whole run. */
     if (!VMem::supported() || kind != RAD_MEM_DEVICE)
@@ -116,17 +126,21 @@ int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocato
     reset(nm, bytes, kind, a);
     if (bytes_ <= 0) return RAD_OK;
 
-    const int rc = vm_.reserve(bytes_, RAD_ALIGN_POOL);
+    const int64_t arena = std::max<int64_t>(va_extra, 0);
+    const int64_t arena_lo = align_up(bytes_, (int64_t)RAD_ALIGN_POOL);
+    const int rc = vm_.reserve(arena_lo + arena, RAD_ALIGN_POOL);
     if (rc < 0) {
         /* Refuse; never retry smaller. A failed address reservation on a 64-bit card is a bug,
          * not a budget limit. */
         const char* why = rad_dev_last_error();
-        shortfalls_.push_back({ name_, "address reservation", bytes_, 0,
+        shortfalls_.push_back({ name_, "address reservation", arena_lo + arena, 0,
                                 *why ? why : "the device layer gave no reason" });
         bytes_ = 0;
         return rc;
     }
     base_ = vm_.base();
+    arena_cursor_ = arena_lo;
+    arena_end_ = arena_lo + arena;
     /* bytes_ stays the requested budget, not vm_.size() (rounded up to a granule): using the
      * rounded size would let reserve() grant more than the split allows. The rounded tail stays
      * reserved so the last reservation's commit can round outward into it. */
@@ -161,7 +175,7 @@ std::string Pool::report() const {
 /* ------------------------------------------------------------------ Pools */
 
 int Pools::configure(const Config& cfg, int64_t vram_capacity,
-                     MemAllocator* device, MemAllocator* host) {
+                     MemAllocator* device, MemAllocator* host, int64_t weights_va_extra) {
     configured_ = false;
     fit_report_.clear();
 
@@ -209,7 +223,12 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
     int s;
     /* Order matters only for diagnostics: the two big pools go first so a failure names the one
      * that could not be served. */
-    if ((s = weights_.init("vram_weights", w,  RAD_MEM_DEVICE, device)) < 0) st = s;
+    if (weights_va_extra > 0) {
+        if ((s = weights_.init_elastic("vram_weights", w, RAD_MEM_DEVICE, device,
+                                       weights_va_extra)) < 0) st = s;
+    } else if ((s = weights_.init("vram_weights", w,  RAD_MEM_DEVICE, device)) < 0) {
+        st = s;
+    }
     /* The KV pool is always elastic. Its budget still caps what the cache may address; elasticity
      * only decides whether the unused part has VRAM behind it. What the cache releases, the
      * expert plane can promote into, so the split follows actual demand. There is no fixed-pool

@@ -158,6 +158,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         router_ptr->note_prepared(id, prepared, bytes);
     });
     router.set_weight_store(&weights);
+    router.set_group_planner(&group);
 
     /* --debug-graph: the default model's first start dumps its graph instead of serving. */
     std::atomic<bool> dumped{false};

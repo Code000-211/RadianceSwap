@@ -633,6 +633,14 @@ private:
     void group_tick(bool idle);
     uint64_t group_last_ns_ = 0;
     uint32_t group_ticks_ = 0;
+    /* Per rank, address space past the weights pool's budget for the elastic expert slab; 0: a plain
+     * pool (plan(), Pools::configure). */
+    std::vector<int64_t> weights_va_extra_;
+    /* group_tick: the last step an engine ran (idle heat cools from it), what each rank last
+     * reported as held, and the cap last applied to each slab class (ranks x class). */
+    uint64_t group_busy_ns_ = 0;
+    std::vector<int64_t> group_held_;
+    std::map<std::pair<size_t, int32_t>, int64_t> group_cap_;
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx

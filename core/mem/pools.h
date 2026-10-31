@@ -66,7 +66,7 @@ public:
     const char* name()  const { return name_.c_str(); }
     int64_t     bytes() const { return bytes_; }
     int64_t     used()  const { return used_; }
-    int64_t     avail() const { return bytes_ - used_; }
+    int64_t     avail() const { return bytes_ - used(); }
     void*       base()  const { return base_; }
     int         kind()  const { return kind_; }
 
@@ -75,6 +75,20 @@ public:
      * `off_out` receives the byte offset from base, which fixed-stride slabs use because the base
      * may be a device pointer the host cannot dereference. */
     void* reserve(std::string_view what, int64_t bytes, int64_t align, int64_t* off_out = nullptr);
+
+    /* Fresh address space of an elastic pool, for ranges the caller backs and gives back (the expert
+     * slab, Mover). Returns the offset from base() of `bytes` that no earlier call returned and
+     * nothing has been mapped at since the pool was made, or -1 when the arena is used up.
+     *
+     * An address is never handed out twice, because the device layer cannot map it twice: after an
+     * unmap, a map at the same address leaves the old translation in place on this ROCr/kernel
+     * (hsa_amd_vmem_map; docs/swap/elastic-slab.md, tests/device_test.cpp
+     * vmem_stress_*), so the new page is never reached and the old one, given to another range
+     * since, is read and written instead. The arena is virtual only. */
+    int64_t va_arena(int64_t bytes, int64_t align = RAD_ALIGN_POOL);
+    int64_t va_arena_left() const { return arena_end_ - arena_cursor_; }
+    /* Whole range of an elastic pool, arena included; equals bytes() otherwise. */
+    int64_t va_bytes() const { return arena_end_ > 0 ? arena_end_ : bytes_; }
 
     /* True when nothing was refused. Checked once at the end of startup so the report names every
      * failure, not only the first (spec §3.1). */
@@ -87,7 +101,7 @@ public:
      * stay valid while unused pages go back to the card for another pool. Addresses cannot move
      * between pools; pages can.
      *
-     * Used by the KV cache and the expert slab. A KV block can be released only once nothing
+     * Used by the KV cache and, in manifest mode, the expert slab (Mover::init). A KV block can be released only once nothing
      * holds it; an expert slot is a copy of a weight that also lives in host memory or the
      * container, so the mover can release it at will. That policy lives with the callers.
      *
@@ -110,9 +124,12 @@ public:
 
 private:
     /* Reserve the address range and back nothing. `bytes` is the maximum the pool may ever hold
-     * and what reserve() carves against; committed() is what it costs the card. Falls back to a
-     * whole allocation without virtual memory management. */
-    int init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a);
+     * and what reserve() carves against; committed() is what it costs the card. `va_extra` is
+     * address space past the budget for va_arena() (the expert slab of a model that may take bytes
+     * another gives up). Falls back to a whole allocation without virtual memory
+     * management, with no tails: elastic() is then false and callers must not grow. */
+    int init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a,
+                     int64_t va_extra = 0);
 
     friend class Pools;
     int init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a);
@@ -123,6 +140,7 @@ private:
     std::string   name_;
     int64_t       bytes_ = 0;
     int64_t       used_  = 0;
+    int64_t       arena_cursor_ = 0, arena_end_ = 0;   /* the fresh address space past `bytes_` (va_arena) */
     void*         base_  = nullptr;
     int           kind_  = RAD_MEM_DEVICE;
     bool          elastic_ = false;
@@ -143,9 +161,14 @@ public:
      *   - if the weight or KV budget is zero (the resolver did not run);
      *   - if weights + kv exceeds the card;
      *   - if a pool's backing allocation fails.
+     *
+     * `weights_va_extra` > 0 makes the weights pool elastic with that much address space past its
+     * budget: the expert slab can then give pages back to the card and take others (a model in a
+     * group, docs/swap/elastic-slab.md). 0 is the plain allocation every other engine gets.
      */
     int configure(const Config& cfg, int64_t vram_capacity,
-                  MemAllocator* device = nullptr, MemAllocator* host = nullptr);
+                  MemAllocator* device = nullptr, MemAllocator* host = nullptr,
+                  int64_t weights_va_extra = 0);
 
     Pool& weights()     { return weights_; }
     Pool& kv()          { return kv_; }

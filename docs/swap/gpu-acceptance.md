@@ -285,3 +285,60 @@ Aktivierung. Abgeleitet: Request-Wanduhr = Router-Wartezeit + `activation_second
 - Nicht geprüft: MoE/MoE mit `cache.host_budget_mib`, mehr als zwei Models, Streaming unter
   gleichzeitiger Deaktivierung eines zweiten Models, 120 Zyklen für das MoE (eine Aktivierung
   dauert 60–70 s), Sampling/Stream/Abbruch/langer Prompt am MoE.
+
+## 9 Elastischer Expert-Slab (#35)
+
+Zwei Einträge desselben MoE (`m_el.json`: wie `m_mm.json`, aber `--host-pool-mib 26000`, damit der Floor
+unter dem Angebot liegt), TP=2, `idle_timeout_ms` 0. Skripte: `elastic.py` (Last nur auf ein Model, VRAM
+und `/radiance/models` je Phase, Greedy-Tokens beider Models danach). Das Angebot (Pool = Summe) ist je Rank
+20 680 / 20 773 MiB; die Spalten sind `committed / target / offer` des Expert-Slabs in MiB.
+
+| Phase | Rank | m1 | m2 | Σ committed ≤ Pool |
+|---|---|---|---|---|
+| Ende `m1:50` (nur m1 unter Last) | 0 | 13 448 / 13 449 / 10 314 | 7 231 / 5 168 / 10 366 | 20 679 ≤ 20 680 |
+| | 1 | 14 327 / 14 328 / 10 361 | 6 445 / 5 192 / 10 412 | 20 772 ≤ 20 773 |
+| Beginn `m2:60` (Übergang) | 0 | 8 613 / 7 042 / 10 314 | 8 894 / 12 067 / 10 366 | 17 507 ≤ 20 680 |
+| | 1 | 13 513 / 7 037 / 10 361 | 6 572 / 7 260 / 10 412 | 20 085 ≤ 20 773 |
+| Ende `m2:60` (nur m2 unter Last) | 0 | 7 220 / 5 168 / 10 314 | 13 460 / 13 460 / 10 366 | 20 680 ≤ 20 680 |
+| | 1 | 6 445 / 5 192 / 10 361 | 14 319 / 14 328 / 10 412 | 20 764 ≤ 20 773 |
+
+- Unter m1-Last hält m2 rund 3 GiB je Rank weniger als sein Angebot (committed 7 231 gegen 10 366 auf Rank 0), und m1
+  committet sie (13 448 gegen sein Angebot von 10 314); unter m2-Last kehrt es sich um (m2 13 460, m1 7 220).
+  Die Summe der Commits übersteigt den Pool nie (die Planer-Gate vergibt Wachstum erst nach der Meldung
+  des Gebers). Das Target des Gebers fällt sofort (5 168), das des Nehmenden folgt der Freigabe
+  (Zeile "Beginn `m2:60`": m2-Target 12 067 gegen committed 8 894, Rest folgt in 128-MiB-Schritten).
+- `rocm-smi` je Karte: 32,4–32,5 GiB belegt am Phasenende, zwischendurch bis 26,5 GiB (die Freigabe ist
+  sichtbar, die Summe pro Karte allein belegt aber nicht, wer sie bekommt: dafür `committed` je Engine).
+- Greedy-Tokens beider Models nach jeder Phase identisch zur Referenz (`5e8678d0682f`); keine Hänger, 0
+  Fehler in 897 / 1282 Tokens unter Last.
+- Rampe: ein Schritt Wachstum (128 MiB) kostet das Entmappen/Mappen von 64 Granulen; 5 GiB Umschichtung
+  dauern wenige Sekunden. Ein Phasenwechsel erreicht das Ziel innerhalb der ersten 20–30 s (Idle-Heat der
+  Gegenseite kühlt in 20 s auf kalt).
+
+**Bekanntes Risiko, nicht behoben.** Bei mehreren Läufen (Varianten mit echtem Entmappen/Wiedermappen,
+während die andere Engine Seiten zurückgibt) lieferte eine Greedy-Anfrage mit `logprobs` kein endliches
+Logit (`row 0 has no finite logit`, HTTP 500); der vollständige Lauf oben (alle Phasen, alle Digests)
+war fehlerfrei. Ausgeschlossen durch Gegenproben: ein Leser eines freien Slots (Vergiften der freigegebenen
+Slots statt Entmappen: kein Fehler), nur logisches Schrumpfen (kein Fehler), Stream-Synchronisation vor dem
+Entmappen, Entmappen nur im Leerlauf, Kopien über Blit-Kernel statt der DMA-Liste (der Fehler blieb).
+Es bleibt der Verdacht auf das Entmappen/Wiedermappen derselben Adresse unter Last (Treiber/TLB). Bis das
+geklärt ist, ist die Arbeit hinter der Manifest-Bedingung (mehr als ein Model) zu bewerten, nicht als
+Dauerbetrieb zu empfehlen; die Single-Engine-Pfade sind nicht betroffen.
+
+### Single-Engine (ohne Manifest), vorher / nachher
+
+`--model`, TP=2; `origin/main` gegen diesen Branch, je drei Wiederholungen. Der Pool ist dort unverändert
+eine `rad_dev_alloc`; der Mover reserviert wie zuvor.
+
+| Aufbau | C1 tok/s | C8 tok/s | Prefill tok/s |
+|---|---|---|---|
+| dicht 0,8B, main | 325–332 | 2032–2056 | 57 000–65 100 |
+| dicht 0,8B, Branch | 326–333 | 2015–2039 | 57 300–64 700 |
+| MoE `--deterministic`, main | 73,8–77,7 | 129–151 | 4645–4866 |
+| MoE `--deterministic`, Branch | 72,8–89,0 | 137–226 | 4697–5150 |
+| MoE dynamisch, main | 119,6–181,5 | 298–702 | 3183–3377 |
+| MoE dynamisch, Branch | 119,2–183,0 | 267–552 | 3078–3331 |
+
+C1 und C8 liegen im dichten Fall innerhalb 1 %. Prefill streut bei beiden Builds von Lauf zu Lauf um
+±5 % (Basis allein 57 257–65 110); ein systematischer Unterschied ist nicht messbar. Die MoE-Läufe
+streuen durch die Heat (dynamisch) und die Kartenlage stärker als 2 %; ein Unterschied zwischen den Builds ist darin nicht zu erkennen (nicht statistisch geprüft).

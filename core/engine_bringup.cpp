@@ -1894,17 +1894,36 @@ int Engine::plan() {
          * it does not grant stay unclaimed, free for the next model's budget. Only the weights
          * pool shrinks (the cache and the staging region keep their share), and by whole MiB
          * rounded down, so the pool never falls under what was granted. */
+        weights_va_extra_.assign(facts.size(), 0);
         if (group_) {
+            /* Several models share the group's expert pool: this one's slab sits on elastic pages
+             * (docs/swap/elastic-slab.md), with 8 TiB of fresh address space to map its pieces at.
+             * A lone model keeps the plain allocation: nothing could use what it would give back. */
+            /* RADIANCE_ELASTIC_SLAB=off keeps the plain pool in a group (a control for measurements). */
+            const char* const el = getenv("RADIANCE_ELASTIC_SLAB");
+            const bool shared = registry_ && registry_->models().size() > 1 && !(el && !std::strcmp(el, "off"));
+            if (shared && rad_dev_set(ranks_[0]->device) >= 0 && !VMem::supported())
+                RAD_INFO("group planner: this device layer has no virtual memory management, so "
+                         "the expert slab is not elastic: '%s' keeps its share's bytes",
+                         cfg_.served_model_name.c_str());
             GroupFacts gf(facts.size());
             for (size_t i = 0; i < facts.size(); ++i) {
                 const int64_t unit = wfs[i].expert_unit_max;
                 const int64_t n = unit > 0 ? facts[i].experts / unit : 0;
                 gf[i].offer = vb.experts;
                 gf[i].floor = facts[i].expert_floor;
+                if (shared && n > 0 && VMem::supported()) {
+                    gf[i].elastic = true;
+                    weights_va_extra_[i] = (int64_t)8 << 40;   /* the arena: address space only (Pool::va_arena) */
+                }
                 /* No heat yet: one cold bin for the plane. */
                 if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
             }
             const GroupBudget gb = group_->join(cfg_.served_model_name, std::move(gf));
+            for (size_t i = 0; i < gb.size(); ++i)
+                RAD_INFO("group planner: '%s' rank %zu joins offering %s of experts and starts with %s",
+                         cfg_.served_model_name.c_str(), i, humanb(vb.experts).c_str(),
+                         humanb(gb[i].bytes).c_str());
             int64_t granted = vb.experts;
             for (const RankBudget& rb : gb) granted = std::min(granted, rb.bytes);
             const int64_t cut_mib = (vb.experts - granted) >> 20;
@@ -2032,7 +2051,8 @@ int Engine::plan() {
 
         /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
          * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
-        int s = r->pools.configure(rc, props.vram_bytes);
+        int s = r->pools.configure(rc, props.vram_bytes, nullptr, nullptr,
+                                   ri < weights_va_extra_.size() ? weights_va_extra_[ri] : 0);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
             report_pool_refusal(r->index, r->device, r->pools, rc);
@@ -3028,6 +3048,8 @@ int Engine::load_weights() {
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
         mc.shrinkable = group_ != nullptr;
+        mc.device = r->device;
+        mc.grow_floor = (int64_t)Config{}.gpu_headroom_mib << 20;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3046,7 +3068,8 @@ int Engine::load_weights() {
          * and the host spins in the runtime, like a hang. Checked for every copy before any
          * starts. */
         const uint8_t* wp_lo = (const uint8_t*)r->pools.weights().base();
-        const uint8_t* wp_hi = wp_lo + r->pools.weights().bytes();
+        /* An elastic pool's arena is address space inside its range (va_bytes). */
+        const uint8_t* wp_hi = wp_lo + r->pools.weights().va_bytes();
         auto dst_fits = [&](const void* p, int64_t len, const char* nm) {
             const uint8_t* q = (const uint8_t*)p;
             if (!wp_lo || (q >= wp_lo && q + len <= wp_hi)) return true;

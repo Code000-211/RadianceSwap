@@ -632,6 +632,13 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
         }
         if (c.vram_released_mib >= 0) m["vram_released_mib"] = c.vram_released_mib;
         m["prepared_bytes"] = c.prepared_bytes;
+        if (group_) {
+            nlohmann::json ranks = nlohmann::json::array();
+            for (const auto& v : group_->view(id))
+                ranks.push_back({ { "target_bytes", v.target }, { "committed_bytes", v.committed },
+                                  { "offer_bytes", v.offer }, { "elastic", v.elastic } });
+            if (!ranks.empty()) m["expert_slab"] = std::move(ranks);
+        }
         m["warm_activations"] = c.loads[1];
         m["cold_activations"] = c.loads[0];
         if (c.has_load)
@@ -723,6 +730,20 @@ std::string ModelRouter::metrics_text() const {
          "# TYPE radiance:model_vram_released_mib gauge\n";
     for (const auto& [id, c] : cold_)
         if (c.vram_released_mib >= 0) line("radiance:model_vram_released_mib", id, "", (double)c.vram_released_mib);
+    if (group_) {
+        o += "# HELP radiance:model_expert_slab_committed_bytes Bytes of the model's expert slab with pages behind them, per rank\n"
+             "# TYPE radiance:model_expert_slab_committed_bytes gauge\n"
+             "# HELP radiance:model_expert_slab_target_bytes What the group planner entitles the model's expert slab to, per rank\n"
+             "# TYPE radiance:model_expert_slab_target_bytes gauge\n";
+        for (const auto& [id, c] : cold_) {
+            const auto views = group_->view(id);
+            for (size_t r = 0; r < views.size(); ++r) {
+                const std::string rk = ",rank=\"" + std::to_string(r) + "\"";
+                line("radiance:model_expert_slab_committed_bytes", id, rk, (double)views[r].committed);
+                line("radiance:model_expert_slab_target_bytes", id, rk, (double)views[r].target);
+            }
+        }
+    }
     o += "# HELP radiance:model_prepared_bytes Host-RAM bytes of the model's prepared weights\n"
          "# TYPE radiance:model_prepared_bytes gauge\n";
     for (const auto& [id, c] : cold_) line("radiance:model_prepared_bytes", id, "", (double)c.prepared_bytes);

@@ -248,6 +248,49 @@ TEST(pool_reservation_never_falls_through) {
     CHECK_EQ(p.kv().used(), 512ll << 10);
 }
 
+/* An elastic weights pool (ticket #35) has fresh address space past its budget (the arena): ranges
+ * taken from it are never handed out twice, since the device layer cannot map an address again
+ * after an unmap. A plain pool, or a pool without virtual memory, has no arena. */
+TEST(the_arena_of_an_elastic_pool_hands_out_every_address_once) {
+    if (!VMem::supported()) return;
+    Config c = small_config();
+    Pools p;
+    const int64_t MiB = 1 << 20;
+    CHECK_OK(p.configure(c, 0, nullptr, nullptr, 64 * MiB));
+    Pool& w = p.weights();
+    CHECK(w.elastic());
+    const int64_t budget = w.bytes();
+    CHECK(w.va_bytes() >= budget + 64 * MiB);
+    CHECK_EQ(w.va_arena_left(), 64 * MiB);
+    CHECK_EQ(w.committed(), 0ll);
+
+    const int64_t a = w.va_arena(10 * MiB);
+    const int64_t b = w.va_arena(10 * MiB);
+    REQUIRE(a >= budget && b >= a + 10 * MiB);          /* past the budget, disjoint, aligned to a granule */
+    CHECK_EQ(a % RAD_ALIGN_POOL, 0ll);
+    CHECK_EQ(b % RAD_ALIGN_POOL, 0ll);
+    /* Backing is the caller's: only what it commits costs the card, and decommitting does not hand
+     * the address out again. */
+    CHECK_OK(w.commit(a, 4 * MiB));
+    CHECK(w.committed() > 0 && w.committed() <= 4 * MiB);
+    CHECK_OK(w.decommit(a, 10 * MiB));
+    CHECK_EQ(w.committed(), 0ll);
+    const int64_t d = w.va_arena(10 * MiB);
+    CHECK(d >= b + 10 * MiB);
+    /* The arena is finite, and a request beyond it is refused without taking anything. */
+    CHECK_EQ(w.va_arena(64 * MiB), -1ll);
+    CHECK(w.va_arena_left() <= 64 * MiB - 30 * MiB);
+    /* The budget is untouched by it. */
+    CHECK_EQ(w.used(), 0ll);
+    CHECK(w.reserve("static", budget, RAD_ALIGN_UNIT) != nullptr);
+
+    Pools plain;
+    CHECK_OK(configure_pools(plain, c));
+    CHECK(!plain.weights().elastic());
+    CHECK_EQ(plain.weights().va_arena(4 << 10), -1ll);
+    CHECK_EQ(plain.weights().va_bytes(), plain.weights().bytes());
+}
+
 /* A refused backing allocation is reported as a refusal, with the allocator's reason, not as
  * "0 B available", which would read as a measurement of the card. */
 TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {

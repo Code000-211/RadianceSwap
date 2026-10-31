@@ -67,6 +67,7 @@
 
 #include "http.h"
 #include "model/weight_store.h"
+#include "place/group_planner.h"
 
 #include <algorithm>
 #include <chrono>
@@ -143,6 +144,9 @@ public:
     /* The process's PreparedWeightStore, whose host-memory figures (budget, use by kind, evictions)
      * status and metrics report. Set before run(). */
     void set_weight_store(const PreparedWeightStore* s) { weights_ = s; }
+    /* The group's planner, whose per-model expert-slab figures (target, bytes with pages behind them)
+     * status and metrics report. Set before run(). */
+    void set_group_planner(const GroupPlanner* g) { group_ = g; }
     /* GET /radiance/models: each model's state and activation and deactivation counts. */
     std::string status_json() const;
     /* Prometheus text (radiance:model_*), appended to the default model's /metrics. */
@@ -233,6 +237,7 @@ private:
     const size_t      n_models_;
     ModelRegistry* const registry_;
     const PreparedWeightStore* weights_ = nullptr;
+    const GroupPlanner* group_ = nullptr;
     ActivationOptions act_;
     Router            router_;
     HttpTransport     transport_;
