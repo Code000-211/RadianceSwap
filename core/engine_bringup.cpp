@@ -1736,10 +1736,10 @@ int Engine::plan() {
             /* The staging region is sized only where the arena lends its top: without smaller
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
-            if (!r->arena_levels.empty() && !cfg_.deterministic) {
-                f.expert_layer_max = wf.expert_layer_max;
-                f.static_layer_max = wf.static_layer_max;
-            }
+            if (!r->arena_levels.empty() && !cfg_.deterministic) f.expert_layer_max = wf.expert_layer_max;
+            /* The statics' ring needs no smaller level: where the arena has none it is not lent, and
+             * the stager owns the region (init_contexts). A deterministic plan moves nothing. */
+            if (!cfg_.deterministic) f.static_layer_max = wf.static_layer_max;
             /* A throwaway manager: plan_groups is configure()'s pure-arithmetic half and touches no
              * memory, and the real pool does not exist yet. */
             KVManager probe;
@@ -3976,7 +3976,8 @@ int Engine::init_contexts() {
 
         /* The prefill stager, where the budget made room. Only a step larger than every smaller
          * arena level finds the ring unlent, so that is the smallest pass it arms for. */
-        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
+        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic &&
+            (!r->arena_levels.empty() || r->plan.static_streamed_bytes > 0)) {
             /* The smallest pass is one past every level that lends the ring. The span's shared
              * level does not: it keeps its own place for it, right above its buffers and the
              * guard, wherever that is below the region at the top (stager.h). */
@@ -3988,15 +3989,24 @@ int Engine::init_contexts() {
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_low_off = std::min(off, r->program.arena_stage_off);
             }
+            /* No smaller level: nothing lends the ring, so no step is too small to find it, and
+             * the smallest pass is chosen by size instead. Decode steps and short chunks read the
+             * streamed statics in place, as the levels' lower bound does (probe_arena_levels:
+             * at least 256 rows); a prompt chunk above it copies them ahead. The ring is where
+             * the full plan has it from the first step. */
+            if (r->arena_levels.empty())
+                top_level = std::max<int64_t>(256, cfg_.max_seqs * (1 + std::max(cfg_.n_spec, 0)));
             char* const base = (char*)r->ctx.arena_base();
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
                                    r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
                                    r->program.arena_stage_bytes, top_level + 1));
+            r->stager.set_ring(r->stager.ring_full());
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
-                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
-                         "the card up to %d layers ahead of the layers that read them",
+                         "than %lld tokens copies the host-pool weights (pooled experts, streamed "
+                         "statics) of %zu layers onto the card up to %d layers ahead of the "
+                         "layers that read them",
                          humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }

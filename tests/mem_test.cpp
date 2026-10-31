@@ -406,6 +406,68 @@ static VramFacts big_moe_facts() {
     return f;
 }
 
+/* RAM-Streaming of statics (ticket #18): when the static weights do not fit beside one
+ * full-length sequence of cache, the card holds the statics that fit after that sequence and the
+ * prefill ring, the rest is the host pool's, and the cache keeps exactly one sequence. A model
+ * that fits is untouched; so is a placement that cannot stream. */
+TEST(statics_that_do_not_fit_beside_one_sequence_stream_and_the_cache_keeps_that_sequence) {
+    const int64_t MiB = 1LL << 20, GiB = 1LL << 30;
+    VramFacts f = big_moe_facts();
+    f.statics    = 40 * GiB;                     /* more than the card can give */
+    f.experts    = 0;
+    f.kv_one     = 2 * GiB;
+    f.static_layer_max = 600 * MiB;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+
+    CHECK_EQ(b.statics_total, f.statics);
+    CHECK(b.statics_streamed > 0);
+    CHECK_EQ(b.statics + b.statics_streamed, f.statics);
+    CHECK_EQ(b.statics % MiB, (int64_t)0);                   /* a whole MiB: no rounding off the cache */
+    /* The ring: two layers' share of the statics that left, out of the statics' room. */
+    CHECK(b.stage > 0 && b.stage_from_statics);
+    const double left = (double)b.statics_streamed / (double)f.statics;
+    CHECK(b.stage <= 2 * ((int64_t)std::ceil(left * (double)f.static_layer_max) + RAD_ALIGN_UNIT));
+    /* Every byte is spent once: the cache's one sequence, the ring and the card's statics. */
+    CHECK(b.kv >= f.kv_one && b.kv - f.kv_one < MiB);       /* the sub-MiB the statics' rounding left */
+    CHECK_EQ(b.experts, (int64_t)0);
+    CHECK_EQ(b.statics + b.stage + b.kv, b.claimable);
+    CHECK_EQ(b.weights, b.statics);
+    CHECK_EQ(c.vram_weights_mib * MiB, b.weights);
+    CHECK(c.vram_kv_mib * MiB >= f.kv_one);                  /* configure_kv's requirement */
+    CHECK(b.report.find("stream from the pinned host pool") != std::string::npos);
+
+    /* No ring is sized where the arena has no smaller level (static_layer_max 0). */
+    VramFacts g = f;
+    g.static_layer_max = 0;
+    Config c2 = derive_config();
+    VramBudget b2;
+    CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
+    CHECK_EQ(b2.stage, (int64_t)0);
+    CHECK(b2.statics > b.statics);
+
+    /* Statics that fit beside the sequence: the floor, as before. */
+    VramFacts h = f;
+    h.statics = 4 * GiB;
+    Config c3 = derive_config();
+    VramBudget b3;
+    CHECK_OK(vram_budget_resolve(c3, { h }, &b3));
+    CHECK_EQ(b3.statics_streamed, (int64_t)0);
+    CHECK_EQ(b3.statics, h.statics);
+    CHECK_EQ(b3.stage, (int64_t)0);
+
+    /* A placement that cannot stream keeps the floor, and the cache gets what is left. */
+    for (const char* pl : { "all_vram", "layer_offload" }) {
+        Config c4 = derive_config();
+        c4.placement = pl;
+        VramBudget b4;
+        CHECK_OK(vram_budget_resolve(c4, { f }, &b4));
+        CHECK_EQ(b4.statics_streamed, (int64_t)0);
+        CHECK_EQ(b4.statics, b4.claimable);
+    }
+}
+
 /* A lending cache takes everything the experts can do without. The experts keep on the card only
  * what the host pool cannot hold (expert_vram_floor, checked against the planner in place_test);
  * every block the cache does not use is lent back to them. */

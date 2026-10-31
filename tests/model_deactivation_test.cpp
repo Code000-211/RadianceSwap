@@ -233,6 +233,33 @@ TEST(an_idle_model_is_deactivated_and_its_engine_destroyed) {
     CHECK_EQ(f.status("a")["deactivations"].get<int>(), 1);
 }
 
+/* RAM-Streaming (ticket #18): an active model's streamed share of the static weights is in
+ * status and in /metrics; a model that is not active has none to report. */
+TEST(the_streamed_share_of_the_static_weights_is_in_status_and_metrics) {
+    Fleet f(0);
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    WeightLoadReport rep;
+    rep.static_bytes = 1000;
+    rep.static_streamed_bytes = 250;
+    f.mr->note_weight_load("a", rep);
+    f.mr->note_weight_load("b", rep);                /* a cold model: nothing to say yet */
+    const json st = f.status("a");
+    CHECK_EQ(st["static_bytes"].get<int64_t>(), (int64_t)1000);
+    CHECK_EQ(st["static_streamed_bytes"].get<int64_t>(), (int64_t)250);
+    CHECK_EQ(st["static_streamed_fraction"].get<double>(), 0.25);
+    CHECK(!f.status("b").contains("static_streamed_fraction"));
+    const std::string m = f.mr->metrics_text();
+    CHECK(m.find("radiance:model_static_bytes{model=\"a\"} 1000") != std::string::npos);
+    CHECK(m.find("radiance:model_static_streamed_bytes{model=\"a\"} 250") != std::string::npos);
+    CHECK(m.find("radiance:model_static_streamed_fraction{model=\"a\"} 0.25") != std::string::npos);
+    CHECK(m.find("radiance:model_static_streamed_fraction{model=\"b\"}") == std::string::npos);
+
+    /* A model with all its statics on the card reports a share of zero. */
+    rep.static_streamed_bytes = 0;
+    f.mr->note_weight_load("a", rep);
+    CHECK_EQ(f.status("a")["static_streamed_fraction"].get<double>(), 0.0);
+}
+
 /* A model whose weights stay in the PreparedWeightStore is VORBEREITET after its deactivation,
  * its next activation is warm, and status and metrics tell the two kinds apart. */
 TEST(a_deactivated_model_with_prepared_weights_is_prepared_and_reactivates_warm) {
