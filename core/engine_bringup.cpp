@@ -401,6 +401,23 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
     return std::max<int64_t>(most, 0);
 }
 
+bool Engine::host_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why,
+                       bool mandatory) {
+    while (!lockable_room(need, still, margin, mlocks, why))
+        if (!weight_store_ || !weight_store_->evict_one(weight_model_id(), mandatory)) return false;
+    return true;
+}
+
+void Engine::claim_host(int64_t bytes, HostUse kind) {
+    if (!weight_store_ || bytes <= 0) return;
+    if (!weight_store_->claim(weight_model_id(), kind, bytes))
+        RAD_WARN("host budget: '%s' takes %s of host memory (%s) and the budget of %s is exceeded "
+                 "although no other model's copy is left to drop; the pools of active models are "
+                 "not evictable", weight_model_id().c_str(), humanb(bytes).c_str(),
+                 kind == HostUse::Pools ? "pools" : "staging",
+                 humanb(weight_store_->stats().budget_bytes).c_str());
+}
+
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
  * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). With
  * --ngram-placement ram=DIR the pinned memory is a file in DIR mapped shared (core/format/
@@ -540,7 +557,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                 cfg_.prefix_cache_mib * MiB + host_late;
     std::string emb_room_why;
     auto emb_room = [&]() {
-        return lockable_room(emb_pin, pools_still, host_headroom_bytes(), false, &emb_room_why);
+        return host_room(emb_pin, pools_still, host_headroom_bytes(), false, &emb_room_why);
     };
     if (emb_max == 0) {
         if (emb == TablePlacement::Ram && emb_asked) {
@@ -595,8 +612,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
         std::string why;
         const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
-        if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
-                           host_headroom_bytes(), false, &why)) {
+        if (!host_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
+                       host_headroom_bytes(), false, &why)) {
             RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
                     "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
                     why.c_str());
@@ -716,7 +733,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         std::string card_why, ram_why;
         const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
         const bool room =
-            !card && lockable_room(need, still, host_headroom_bytes(), !ngram_device, &ram_why);
+            !card && host_room(need, still, host_headroom_bytes(), !ngram_device, &ram_why);
         if (ng == TablePlacement::Ram) {
             if (!room) {
                 RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
@@ -1813,6 +1830,14 @@ int Engine::plan() {
          * same card as one that does not (VramFacts::held_out). */
         const int64_t cvec_bytes = cvec_.loaded() ? (int64_t) cvec_.dir.size() * 4 : 0;
         for (VramFacts& f : facts) f.held_out = cvec_bytes;
+        /* The host pool, the prefix cache's host tier and the activation arenas are this model's
+         * host RAM from here; the pinned tables the placement below resolves and the drafter's
+         * growth of the pool are claimed after it. The checkpoint store is claimed once sized
+         * (configure_kv). */
+        const int64_t host_MiB = (int64_t)1 << 20;
+        const int64_t pool_mib_claimed = cfg_.host_pool_mib;
+        claim_host((int64_t)cfg_.tp * pool_mib_claimed * host_MiB +
+                   cfg_.prefix_cache_mib * host_MiB + host_arenas);
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
         /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
@@ -1847,6 +1872,8 @@ int Engine::plan() {
                          humanb(draft_max).c_str(), (long long)add);
             }
         }
+        claim_host((int64_t)cfg_.tp * (cfg_.host_pool_total_mib() - pool_mib_claimed) * host_MiB +
+                   (cfg_.ngram_resolved == TablePlacement::Ram ? align_up(ngram_bytes, (int64_t)2 << 20) : 0));
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
@@ -2898,6 +2925,24 @@ int Engine::load_weights() {
         ~AbortCapture() { if (s && !done) s->abort(id); }
     } abort_capture{ store, model_id };
     if (store) store->begin(model_id, weight_store_key(cfg_));
+    /* The load's host staging, for the host budget: a ring of 8 pinned 4 MiB slots a worker
+     * (RelayoutPool::Bounce) and the window the relayout inputs share (at most 4 GiB). Counted
+     * while the load runs; a load that reads nothing from the source needs only the ring. */
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int workers_cold = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+    auto staging_bytes = [](int workers, bool relayout, int64_t inputs) {
+        return (int64_t)workers * 8 * (4ll << 20) + (relayout ? std::min<int64_t>(4ll << 30, inputs) : 0);
+    };
+    struct StagingClaim {
+        Engine* e; PreparedWeightStore* s; const std::string& id; int64_t bytes = 0;
+        void set(int64_t b) {
+            if (!s) return;
+            if (b > bytes) e->claim_host(b - bytes, HostUse::Staging);
+            else if (b < bytes) s->unclaim(id, HostUse::Staging, bytes - b);
+            bytes = b;
+        }
+        ~StagingClaim() { if (s) s->unclaim(id, HostUse::Staging, bytes); }
+    } staging_claim{ this, store, model_id };
     /* A buffer for the weight's stored form, if this load fills the store: only while the host has
      * room for the whole model beside the --host-headroom-mib it keeps free. */
     auto reserve_capture = [&](int rank, const WeightInfo& w) -> uint8_t* {
@@ -2909,7 +2954,19 @@ int Engine::load_weights() {
                 for (size_t i = 1; i < r->program.weights.size(); ++i)
                     need += r->program.weights[i].stored_bytes;
             std::string why;
-            if (!lockable_room(need, 0, host_headroom_bytes(), false, &why)) {
+            /* A weight is read from the source: the load's staging is host memory beside the copy
+             * for as long as it runs, so it is counted before the copy asks for room. */
+            staging_claim.set(staging_bytes(workers_cold, true, need));
+            /* Prepared models give way (LRU) for the copy, active ones do not. */
+            if (!store->make_room(model_id, need - store->ram_bytes(model_id))) {
+                RAD_WARN("load: the model's %s of weights do not fit the host budget (%s) beside "
+                         "the other host memory in use, with no prepared model left to drop; they "
+                         "are not kept for a warm activation", humanb(need).c_str(),
+                         humanb(store->stats().budget_bytes).c_str());
+                capture = false;
+                return nullptr;
+            }
+            if (!host_room(need, 0, host_headroom_bytes(), false, &why, false)) {
                 RAD_WARN("load: the model's %s of weights do not fit the host memory beside "
                          "--host-headroom-mib (%s); they are not kept for a warm activation",
                          humanb(need).c_str(), why.c_str());
@@ -3277,12 +3334,12 @@ int Engine::load_weights() {
     int64_t staged_bytes = 0;
     for (const StagedWeight& sw : staged) staged_bytes += sw.in_bytes;
     RelayoutPool pool(staged);
-    const unsigned hw = std::thread::hardware_concurrency();
     /* Started even with nothing staged: the same workers fill host pool slots. */
-    int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+    int workers = workers_cold;
     /* Prepared weights only cross the staging ring (8 pinned slots a worker, 4 MiB each) and one
      * copy saturates the link, so a warm load pins a fraction of what a relayout load does. */
     if (n_cold == 0) workers = std::min(workers, 4);
+    staging_claim.set(staging_bytes(workers, n_cold > 0, staged_bytes));
     pool.start(workers, 4ll << 30);
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
@@ -3592,10 +3649,11 @@ int Engine::configure_kv() {
             const int64_t marg = host_reserve_for_floor(
                 want_bytes, lockable_bytes(0, host_headroom_bytes(), &guard_why),
                 host_headroom_bytes());
-            if (!lockable_room(want_bytes, 0, marg, false, &why))
+            if (!host_room(want_bytes, 0, marg, false, &why))
                 return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
+            claim_host(ck_store_.cap_bytes());
             if (!sized_auto)
                 RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
                          "none of it on the card", (long long)n, what, humanb(slot).c_str(),

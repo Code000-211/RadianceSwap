@@ -123,7 +123,10 @@ public:
      * (served_model_name, else the path); a later load of the same artifact and config uploads
      * them without reading the checkpoint. The store outlives the Engine. Null: every load reads
      * the source, as without a manifest. */
-    void set_weight_store(PreparedWeightStore* s) { weight_store_ = s; }
+    void set_weight_store(PreparedWeightStore* s) {
+        weight_store_ = s;
+        if (s) s->activate(weight_model_id());   /* ends in ~Engine (host budget, ticket #13) */
+    }
     /* What start() did to load the weights: from the store (warm) or from the source (cold), the
      * bytes, the time and the bytes actually read. Valid after a successful start(). */
     const WeightLoadReport& weight_load_report() const { return weight_load_; }
@@ -277,6 +280,18 @@ private:
      * pins host memory (engine_bringup.cpp). 4 GiB suits a busy server; a small host wants to
      * leave less to make room for its tiers, which is why it is a flag and not a constant. */
     int64_t host_headroom_bytes() const { return cfg_.host_headroom_mib * ((int64_t)1 << 20); }
+    /* The name the model has in the PreparedWeightStore. */
+    std::string weight_model_id() const { return cfg_.served_model_name.empty() ? cfg_.model : cfg_.served_model_name; }
+    /* lockable_room (engine_hostmem.h) with the store's copies as the reserve: where it refuses and
+     * a PreparedWeightStore holds copies, the one idle longest is freed and the check repeats, so a
+     * vorbereitetes Model never makes an activation fail for host memory. `mandatory` (an
+     * activation's pools and pins) may also drop the copy of an active model, then its own; a copy
+     * being made (false) only evicts prepared models. */
+    bool host_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why,
+                   bool mandatory = true);
+    /* Records `bytes` of host RAM this activation takes (host pools, pinned tables) in the store's
+     * ledger and, under an explicit budget, makes room for it. */
+    void claim_host(int64_t bytes, HostUse kind = HostUse::Pools);
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup

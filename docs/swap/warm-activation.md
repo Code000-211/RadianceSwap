@@ -40,7 +40,7 @@ vom Host-Budget (#13) gezählt und verdrängt. Nicht im Store (und damit nicht �
 
 Der Store legt die Kopie nur an, wenn das ganze Model neben `--host-headroom-mib` und den cgroup-Limits
 in den Host-RAM passt (`lockable_room`); sonst bleibt das Model kalt (Warnung im Log). Das ist eine
-Schutzgrenze, keine Verdrängung (LRU/Budget: #13).
+Schutzgrenze; Budget und LRU-Verdrängung: [host-budget.md](host-budget.md) (#13).
 
 ## Schlüssel
 
@@ -77,7 +77,7 @@ wenige KiB und tauchen nur in `disk_read_bytes` auf, nicht in `source_read_bytes
 
 - Nur `Engine::load_weights` (die deklarierten Gewichte). Encoder-Türme, Drafter und n-gram-Tabellen
   im Mapped-Tier laden wie bisher.
-- Kein Budget und keine Verdrängung (#13): jedes deaktivierte Model hält seine Gewichte bis zum
-  Prozessende (`~PreparedWeightStore`). Mehrere große Models belegen entsprechend Host-RAM.
+- Ohne `cache.host_budget_mib` hält jedes deaktivierte Model seine Gewichte, solange die Host-Checks
+  es zulassen (dann verdrängt der Store das am längsten ungenutzte, `host-budget.md`).
 - Der Host-Test deckt die Upload-Strecke zur GPU (`Bounce::upload`) nicht ab; sie ist dieselbe wie
   im bisherigen Identity-Pfad.

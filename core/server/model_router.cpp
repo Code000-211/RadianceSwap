@@ -117,6 +117,10 @@ void ModelRouter::note_prepared(const std::string& id, bool prepared, int64_t ra
     if (const auto c = cold_.find(id); c != cold_.end()) {
         c->second.prepared = prepared;
         c->second.prepared_bytes = prepared ? ram_bytes : 0;
+        /* A prepared model the host budget evicted is cold at once; one that is active, activating
+         * or being deactivated gets its state from the router. */
+        if (registry_ && !prepared && registry_->state_of(id) == ModelState::Prepared)
+            registry_->set_state(id, ModelState::Cold);
     }
 }
 
@@ -602,12 +606,14 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
     return c.attempt;
 }
 
+/* The store's lock is taken before the router's: its eviction listener calls note_prepared. */
 std::string ModelRouter::status_json() const {
+    const HostMemoryStats host = weights_ ? weights_->stats() : HostMemoryStats{};
     std::lock_guard<std::mutex> lk(m_);
-    return status_json_locked();
+    return status_json_locked(host);
 }
 
-std::string ModelRouter::status_json_locked() const {
+std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
     nlohmann::json models = nlohmann::json::array();
     for (const auto& [id, c] : cold_) {
         const char* state = state_locked(id, c);
@@ -640,13 +646,46 @@ std::string ModelRouter::status_json_locked() const {
     }
     nlohmann::json out = { { "object", "list" }, { "idle_timeout_ms", act_.idle_timeout_ms },
                            { "healthy", !unhealthy_ }, { "data", std::move(models) } };
+    if (weights_)
+        out["host_memory"] = { { "budget_bytes", host.budget_bytes },   /* 0: derived from the host's limits */
+                               { "used_bytes", host.used() },
+                               { "store_bytes", host.store_bytes },
+                               { "pool_bytes", host.pool_bytes },
+                               { "staging_bytes", host.staging_bytes },
+                               { "evicted_prepared", host.evicted_prepared },
+                               { "evicted_active_copies", host.evicted_active_copies },
+                               { "evicted_bytes", host.evicted_bytes },
+                               { "over_budget_claims", host.over_budget_claims } };
     if (unhealthy_) out["unhealthy_reason"] = unhealthy_reason_;
     return out.dump();
 }
 
 std::string ModelRouter::metrics_text() const {
+    const HostMemoryStats host = weights_ ? weights_->stats() : HostMemoryStats{};
     std::lock_guard<std::mutex> lk(m_);
     std::string o;
+    if (weights_) {
+        char buf[64];
+        auto gauge = [&](const char* name, const char* label, int64_t v) {
+            std::snprintf(buf, sizeof buf, "%lld", (long long)v);
+            o += std::string(name) + label + " " + buf + "\n";
+        };
+        o += "# HELP radiance:host_budget_bytes cache.host_budget_mib in bytes; 0: derived from the host's limits\n"
+             "# TYPE radiance:host_budget_bytes gauge\n";
+        gauge("radiance:host_budget_bytes", "", host.budget_bytes);
+        o += "# HELP radiance:host_used_bytes Host RAM the budget counts, by kind\n"
+             "# TYPE radiance:host_used_bytes gauge\n";
+        gauge("radiance:host_used_bytes", "{kind=\"store\"}", host.store_bytes);
+        gauge("radiance:host_used_bytes", "{kind=\"pools\"}", host.pool_bytes);
+        gauge("radiance:host_used_bytes", "{kind=\"staging\"}", host.staging_bytes);
+        o += "# HELP radiance:host_evictions_total Copies dropped for the host budget: a prepared model made cold, or an active model's copy\n"
+             "# TYPE radiance:host_evictions_total counter\n";
+        gauge("radiance:host_evictions_total", "{kind=\"prepared\"}", host.evicted_prepared);
+        gauge("radiance:host_evictions_total", "{kind=\"active_copy\"}", host.evicted_active_copies);
+        o += "# HELP radiance:host_evicted_bytes_total Bytes of those copies\n"
+             "# TYPE radiance:host_evicted_bytes_total counter\n";
+        gauge("radiance:host_evicted_bytes_total", "", host.evicted_bytes);
+    }
     auto line = [&](const char* name, const std::string& id, const std::string& extra, double v) {
         char buf[64];
         std::snprintf(buf, sizeof buf, "%.9g", v);

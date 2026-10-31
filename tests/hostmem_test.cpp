@@ -59,6 +59,26 @@ TEST(a_v2_cgroups_room_is_its_limit_less_unreclaimable_usage) {
     CHECK_EQ(room, (int64_t)0);
 }
 
+/* Page-cache backing is not RAM backing (ticket #13): a cgroup whose usage is all file pages (a
+ * model's container read through the page cache, mapped weights) has its whole limit left for the
+ * host budget, since reclaim gives those pages back; the same usage as anonymous memory (a
+ * PreparedWeightStore copy, a host pool) takes its share. */
+TEST(page_cache_usage_leaves_the_whole_limit_and_anonymous_usage_does_not) {
+    TmpTree t;
+    REQUIRE(!t.root.empty());
+    t.put("/cache/memory.max", "4294967296\n");
+    t.put("/cache/memory.current", "3221225472\n");
+    t.put("/cache/memory.stat", "anon 0\nfile 3221225472\n");
+    t.put("/anon/memory.max", "4294967296\n");
+    t.put("/anon/memory.current", "3221225472\n");
+    t.put("/anon/memory.stat", "anon 3221225472\nfile 0\n");
+    int64_t room = -1;
+    CHECK(cgroup_room(t.root + "/cache", true, &room));
+    CHECK_EQ(room, 4 * GiB);
+    CHECK(cgroup_room(t.root + "/anon", true, &room));
+    CHECK_EQ(room, 1 * GiB);
+}
+
 /* v1: the same from usage_in_bytes less total_cache (cache when there is no total_cache), and
  * the near-INT64_MAX value v1 reports for no limit is no limit. */
 TEST(a_v1_cgroups_room_reads_its_cache_and_its_no_limit_sentinel) {
