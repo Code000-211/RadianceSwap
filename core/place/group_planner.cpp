@@ -53,13 +53,31 @@ std::vector<RankBudget> allocate_rank(int64_t pool, const std::vector<const Rank
 
     const int64_t share = (int64_t)(std::clamp(min_share, 0.0, 1.0) *
                                     (double)(pool / (int64_t)(n + (size_t)pending)));
-    const int64_t avail = std::max<int64_t>(pool - (int64_t)pending * share, 0);
+    int64_t avail = std::max<int64_t>(pool - (int64_t)pending * share, 0);
 
     std::vector<int64_t> keep(n);
     int64_t keep_sum = 0;
     for (size_t i = 0; i < n; ++i) {
         keep[i] = std::min(std::max(facts[i]->floor, share), ceiling_of(*facts[i]));
         keep_sum += keep[i];
+    }
+
+    /* KV claims come off the pool before the experts see it. Only what the minimums leave over is
+     * claimable, shared in proportion to the claims when it falls short. */
+    std::vector<int64_t> claim(n, 0);
+    int64_t claimed = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const KvPartition& k = facts[i]->kv;
+        const int64_t cap  = std::max(k.cap, k.held);
+        const int64_t want = std::clamp(k.want, k.held, cap);
+        claim[i] = std::min(std::max<int64_t>(want - k.carve, 0), std::max<int64_t>(k.growable, 0));
+        claimed += claim[i];
+    }
+    if (claimed > 0) {
+        const int64_t grant = std::min(claimed, std::max<int64_t>(avail - keep_sum, 0));
+        for (size_t i = 0; i < n; ++i)
+            out[i].kv_grow = (int64_t)((__int128)claim[i] * grant / claimed);
+        avail -= grant;
     }
     /* The minimums do not fit: scale them down together rather than serve the first in order. */
     if (keep_sum > avail)
@@ -244,6 +262,13 @@ void GroupPlanner::update(const std::string& id, size_t rank, std::vector<HeatBi
     std::lock_guard<std::mutex> lk(mu_);
     for (GroupMember& m : members_)
         if (m.id == id && rank < m.facts.size()) m.facts[rank].bins = std::move(bins);
+    recompute();
+}
+
+void GroupPlanner::update_kv(const std::string& id, size_t rank, const KvPartition& kv) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (GroupMember& m : members_)
+        if (m.id == id && rank < m.facts.size()) m.facts[rank].kv = kv;
     recompute();
 }
 

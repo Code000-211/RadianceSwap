@@ -44,6 +44,20 @@
  * (group_resident_cap, Mover::set_resident_cap), which gives slots back or takes them again.
  * What a shrink frees is logical: the engine's slab stays one reservation in its own weights
  * pool, so the bytes are not another engine's to use (Mover::set_resident_cap).
+ *
+ * ---- KV partitions (ticket #17, docs/swap/kv-lend.md) -------------------------------------------
+ *
+ * A model's KV partition is its pool's carve. When a partition needs more than it has, it claims
+ * the difference from the group's expert pool, and the existing allocation above decides which
+ * models' experts go: the pool the experts share shrinks by the grant, so the coldest units of any
+ * model (the claimant's own included) give way and every model keeps its minimum. The planner only
+ * ever adds to a partition: a partition's held bytes (running sequences, prefix cache) are the
+ * floor of its want, and no output names a byte of any partition to give up.
+ *
+ * A partition claims only what its pool can physically back (KvPartition::growable). No pool can
+ * today (the slab sits in the weights pool, docs/swap/slot-release.md), so every engine reports 0
+ * and a claim is never granted: evicting experts for bytes the claimant cannot use would only cost
+ * decode time. The expert slab of ticket #35 raises `growable`.
  */
 #pragma once
 #include "heat.h"
@@ -67,17 +81,30 @@ struct HeatBin {
     int32_t slab_class = 0;
 };
 
+/* One rank's KV partition of a model, in bytes of that rank's pool. All zero: no claim. */
+struct KvPartition {
+    int64_t carve = 0;      /* the pool's carve (KVManager::pool_bytes_carved, summed over groups) */
+    int64_t held = 0;       /* held by sequences or the prefix cache (pool_bytes_used): never given up */
+    int64_t want = 0;       /* what the cache wants in hand: held plus its buffer or a refused request */
+    int64_t cap = 0;        /* the most it can ever use (KVManager::ceiling) */
+    int64_t growable = 0;   /* bytes the pool can back beyond `carve` today; 0 until #35 */
+};
+
 /* One rank's side of an engine's report. */
 struct RankFacts {
     int64_t offer = 0;   /* expert bytes the single-engine resolver gave it: VramBudget::experts */
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
+    KvPartition kv;
 };
 using GroupFacts = std::vector<RankFacts>;   /* by rank */
 
 struct RankBudget {
     int64_t bytes = 0;
     std::map<int32_t, int64_t> class_units;   /* slots per slab class; empty for a sole engine */
+    /* Bytes its KV partition may take on beyond its carve, paid out of the expert pool (the other
+     * budgets already exclude them). Never negative: a partition is not shrunk here. */
+    int64_t kv_grow = 0;
 };
 using GroupBudget = std::vector<RankBudget>;   /* by rank */
 
@@ -125,6 +152,8 @@ public:
     void update(const std::string& id, const std::vector<std::vector<HeatBin>>& bins);
     /* The same for one rank, which reports on its own: the other ranks' bins stay as they were. */
     void update(const std::string& id, size_t rank, std::vector<HeatBin> bins);
+    /* A rank's KV partition; targets are recomputed. Ignored for an unknown id or rank. */
+    void update_kv(const std::string& id, size_t rank, const KvPartition& kv);
     /* What the engine is entitled to now (empty when it is not registered). */
     GroupBudget target(const std::string& id) const;
 

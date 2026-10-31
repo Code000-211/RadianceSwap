@@ -34,8 +34,8 @@ std::atomic<bool> g_signalled{false};   /* set by the SIGINT/SIGTERM handler, re
  * The registry and the router belong to the process; an Engine belongs to the thread that serves
  * it and is destroyed when that thread returns.
  *
- * The fixed share caps a model's KV cache and static weights until KV is lent between models
- * (#17). The group planner (place/group_planner.h) divides only the experts, inside those shares:
+ * The fixed share caps a model's KV cache and static weights until the KV partitions can grow
+ * (#17, docs/swap/kv-lend.md: needs the elastic expert slab, #35). The group planner (place/group_planner.h) divides only the experts, inside those shares:
  * every engine, the default one and a cold one at its activation, joins it when it plans and
  * leaves it when it is destroyed. */
 static int serve_manifest(rad::ModelRegistry& registry) {

@@ -10,6 +10,7 @@
  *   Single      one engine gets back exactly what it offered
  *   Shares      no model is granted or owed more than it offered (its fixed VRAM share)
  *   Cold start  a model activated later joins the running group; leaving frees its room
+ *   KV claims   a partition that needs room takes it from the experts of any model (ticket #17)
  *
  * Pure host arithmetic: no device, no model.
  */
@@ -362,6 +363,134 @@ TEST(a_target_states_a_resident_cap_per_slab_class) {
     const std::vector<int32_t> classes = group_classes(p);
     CHECK_EQ(classes.size(), (size_t)2);
     CHECK(classes == (std::vector<int32_t>{ 0, 2 }));
+}
+
+/* ---- KV partitions (ticket #17) ---------------------------------------------------------------- */
+
+/* A model's side with a KV partition: `carve`/`held`/`want`/`cap`/`growable` in MiB. */
+GroupFacts with_kv(GroupFacts f, int64_t carve, int64_t held, int64_t want, int64_t cap,
+                   int64_t growable) {
+    f[0].kv = { carve * MiB, held * MiB, want * MiB, cap * MiB, growable * MiB };
+    return f;
+}
+
+TEST(a_partition_that_needs_room_takes_it_from_the_experts_of_another_model) {
+    /* A's cold slab fills its whole 30 MiB offer; B's 10 MiB of experts are hot. B's KV carve of
+     * 8 MiB is full (held) and it wants 14. Without the claim A keeps 30. */
+    const GroupFacts a = one_rank(30, { bin(15, 2, 0.1f) });
+    const GroupFacts b = one_rank(10, { bin(5, 2, 5.0f) });
+    const auto calm = allocate(40, { a, b });
+    CHECK_EQ(calm[0][0].bytes, (int64_t)30 * MiB);
+    CHECK_EQ(calm[1][0].kv_grow, (int64_t)0);
+
+    const auto got = allocate(40, { a, with_kv(b, 8, 8, 14, 32, 16) });
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)6 * MiB);   /* B gets its KV ... */
+    CHECK_EQ(got[0][0].bytes, (int64_t)24 * MiB);    /* ... out of A's slab, the colder one */
+    CHECK_EQ(got[1][0].bytes, (int64_t)10 * MiB);    /* B's hot experts stay */
+    CHECK_EQ(got[0][0].kv_grow, (int64_t)0);
+    /* One pool, planned once: experts plus KV growth never pass it. */
+    CHECK(got[0][0].bytes + got[1][0].bytes + got[0][0].kv_grow + got[1][0].kv_grow <=
+          (int64_t)40 * MiB);
+}
+
+TEST(a_claimant_can_evict_its_own_experts_when_they_are_the_coldest) {
+    const auto got = allocate(40, { one_rank(20, { bin(10, 2, 5.0f) }),
+                                    with_kv(one_rank(20, { bin(10, 2, 0.1f) }), 8, 8, 14, 32, 16) });
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(got[0][0].bytes, (int64_t)20 * MiB);   /* the hot slab is untouched */
+    CHECK_EQ(got[1][0].bytes, (int64_t)14 * MiB);   /* its own cold experts paid */
+}
+
+TEST(a_claim_never_takes_a_models_minimum) {
+    /* B claims everything, but A keeps max(floor 16, 0.5 * 20 = 10) MiB of its slab. */
+    const auto got = allocate(40, { one_rank(30, { bin(15, 2, 0.1f) }, /*floor*/ 16),
+                                    with_kv(one_rank(10, { bin(5, 2, 0.1f) }), 8, 8, 200, 200, 200) });
+    CHECK(got[0][0].bytes >= (int64_t)16 * MiB);
+    CHECK(got[1][0].bytes >= (int64_t)10 * MiB);   /* its own minimum share, 0.5 * (40 / 2) */
+    CHECK(got[1][0].kv_grow <= (int64_t)14 * MiB);
+    CHECK(got[0][0].bytes + got[1][0].bytes + got[1][0].kv_grow <= (int64_t)40 * MiB);
+}
+
+TEST(running_sequences_are_never_evicted_a_partition_is_only_ever_added_to) {
+    /* A holds 20 of its 20 MiB carve and says it wants 5: held is the floor of want, so A claims
+     * nothing and no output takes a byte from any partition. */
+    const auto got = allocate(40, { with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 20, 20, 5, 32, 12),
+                                    with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 8, 6, 12, 32, 12) });
+    CHECK_EQ(got[0][0].kv_grow, (int64_t)0);
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)4 * MiB);
+    CHECK(got[0][0].kv_grow >= 0 && got[1][0].kv_grow >= 0);
+    /* A cap under the held bytes cannot make a claim negative or evict anyone's sequence. */
+    const auto low = allocate(40, { with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 20, 20, 30, 10, 12),
+                                    one_rank(20, { bin(10, 2, 1.0f) }) });
+    CHECK_EQ(low[0][0].kv_grow, (int64_t)0);
+}
+
+TEST(a_claim_stops_at_what_the_partition_can_use_and_back) {
+    /* Wants more than its ceiling: only up to the cap (20 - 8 = 12 MiB) ... */
+    auto got = allocate(40, { one_rank(20, { bin(10, 2, 1.0f) }),
+                              with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 8, 8, 100, 20, 100) });
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)12 * MiB);
+    /* ... and only up to what its pool can back. Today that is nothing: no claim, no eviction. */
+    got = allocate(40, { one_rank(20, { bin(10, 2, 1.0f) }),
+                         with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 8, 8, 100, 20, 0) });
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)0);
+    CHECK_EQ(got[0][0].bytes, (int64_t)20 * MiB);
+    CHECK_EQ(got[1][0].bytes, (int64_t)20 * MiB);
+}
+
+TEST(claims_that_do_not_fit_share_what_the_minimums_leave_in_proportion) {
+    /* Pool 40, minimums 10 + 10 leave 20; the claims are 30 and 10. */
+    const auto got = allocate(40, { with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 4, 4, 34, 64, 64),
+                                    with_kv(one_rank(20, { bin(10, 2, 1.0f) }), 4, 4, 14, 64, 64) });
+    CHECK_EQ(got[0][0].kv_grow, (int64_t)15 * MiB);
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)5 * MiB);
+    CHECK(got[0][0].bytes >= (int64_t)10 * MiB && got[1][0].bytes >= (int64_t)10 * MiB);
+}
+
+TEST(a_sole_engine_is_unchanged_by_a_kv_report) {
+    GroupPlanner g(0);
+    const GroupBudget b = g.join("only", with_kv(one_rank(20, { bin(8, 2, 1.0f) }), 8, 8, 99, 99, 99));
+    CHECK_EQ(b[0].bytes, (int64_t)20 * MiB);
+    g.update_kv("only", 0, { 8 * MiB, 8 * MiB, 99 * MiB, 99 * MiB, 99 * MiB });
+    CHECK_EQ(g.target("only")[0].bytes, (int64_t)20 * MiB);
+    CHECK_EQ(g.target("only")[0].kv_grow, (int64_t)0);
+}
+
+TEST(a_kv_report_moves_the_targets_and_ending_the_need_gives_the_experts_back) {
+    GroupPlanner g(0);
+    g.join("a", one_rank(30, { bin(15, 2, 0.1f) }));
+    g.join("b", one_rank(10, { bin(5, 2, 5.0f) }));
+    CHECK_EQ(g.target("a")[0].bytes, (int64_t)30 * MiB);
+
+    g.update_kv("b", 0, { 8 * MiB, 8 * MiB, 14 * MiB, 32 * MiB, 16 * MiB });
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(g.target("a")[0].bytes, (int64_t)24 * MiB);
+    g.update_kv("none", 0, { MiB, MiB, 99 * MiB, 99 * MiB, 99 * MiB });   /* ignored */
+    g.update_kv("b", 3, { MiB, MiB, 99 * MiB, 99 * MiB, 99 * MiB });      /* no such rank */
+    CHECK_EQ(g.target("a")[0].bytes, (int64_t)24 * MiB);
+
+    /* B's sequences end: it wants only what it holds again, and A's slab regrows. */
+    g.update_kv("b", 0, { 14 * MiB, 0, 0, 32 * MiB, 16 * MiB });
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)0);
+    CHECK_EQ(g.target("a")[0].bytes, (int64_t)30 * MiB);
+}
+
+TEST(a_claim_is_decided_per_rank_at_world_size_2) {
+    auto side = [](int64_t offer_mib, float heat, int64_t want_mib) {
+        GroupFacts f(2);
+        for (RankFacts& r : f) {
+            r.offer = offer_mib * MiB;
+            r.bins = { bin(offer_mib / 2, 2, heat) };
+        }
+        f[1].kv = { 8 * MiB, 8 * MiB, want_mib * MiB, 32 * MiB, 32 * MiB };   /* only rank 1 */
+        return f;
+    };
+    std::vector<GroupMember> m = { { "a", side(30, 0.1f, 0) }, { "b", side(10, 5.0f, 14) } };
+    const auto got = group_allocate({ 40 * MiB, 40 * MiB }, m, 0, 0.5);
+    CHECK_EQ(got[1][0].kv_grow, (int64_t)0);
+    CHECK_EQ(got[1][1].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(got[0][0].bytes, (int64_t)30 * MiB);
+    CHECK_EQ(got[0][1].bytes, (int64_t)24 * MiB);
 }
 
 RAD_TEST_MAIN()
