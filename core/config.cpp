@@ -50,7 +50,9 @@ static const Flag g_flags[] = {
                                         "model is started at once, the others on their first request, each with\n"
                                         "its own share of the VRAM (--gpu-headroom-mib per model moves it),\n"
                                         "behind one listener that routes by the request's\n"
-                                        "`model`. Text only; excludes --model and LoRA" },
+                                        "`model`; a model idle for cache.idle_timeout_ms is deactivated\n"
+                                        "and its VRAM freed (0: never). Text only; excludes --model\n"
+                                        "and LoRA" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"

@@ -73,6 +73,7 @@ struct FakeEngine {
         ServerOptions o;
         o.model_id = id;
         o.max_ctx = 200;
+        o.host = "127.0.0.1";
         o.port = 0;
         srv = std::make_unique<Server>(deps, o);
     }
@@ -106,6 +107,7 @@ struct Fleet {
     std::mutex m;
     std::map<std::string, FakeEngine*> live;
     std::unique_ptr<ModelRouter> mr;
+    std::thread listener;   /* run(): the idle monitor starts with the listener */
 
     explicit Fleet(int64_t idle_ms, bool manual_sched = false, Gate* slow_teardown = nullptr)
         : teardown(slow_teardown), manual(manual_sched) {
@@ -140,10 +142,15 @@ struct Fleet {
                 return rc;
             });
         mr->activate("a");
-        REQUIRE(eventually([&] { return state("a") == ModelState::Active; }));
+        listener = std::thread([this] { mr->run(); });
+        REQUIRE(eventually([&] { return mr->port() > 0; }));
     }
     /* The router must go before the models it serves. */
-    ~Fleet() { mr.reset(); }
+    ~Fleet() {
+        mr->stop();
+        if (listener.joinable()) listener.join();
+        mr.reset();
+    }
 
     HttpResponse post(const std::string& model, bool stream = false) {
         HttpRequest q;

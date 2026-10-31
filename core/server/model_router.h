@@ -17,8 +17,8 @@
  * its Engine is ready on every rank. A Launcher that returns before attaching has failed: its
  * waiters get a 503 naming the status, and the next request starts a new attempt.
  *
- * Deactivation (ticket #10): with `idle_timeout_ms` set, a monitor thread deactivates an active
- * model that has had no request for that long. It is idle when no request is between the route
+ * Deactivation (ticket #10): with `idle_timeout_ms` set, a monitor thread (started by run(), once
+ * the listener is up) deactivates an active model that has had no request for that long. It is idle when no request is between the route
  * lookup and the end of its dispatch (`users`) and its Server has nothing admitted (in_flight(),
  * which a streaming response holds until its last chunk), so a running generation is never cut.
  * Deactivating takes the Server out of the route table in the same locked step: from then on a
@@ -74,7 +74,9 @@ public:
         : default_id_(std::move(default_id)), n_models_(n_models), registry_(registry),
           act_(act) {
         if (act_.max_queued <= 0) act_.max_queued = ActivationOptions::kDefaultMaxQueued;
-        start_routes_and_monitor();
+        router_.get("/radiance/models", [this](const HttpRequest&) {
+            return HttpResponse::json_body(200, status_json());
+        });
     }
     /* Stops, then joins the activation threads. */
     ~ModelRouter();
@@ -145,7 +147,6 @@ private:
     Server* await_model(const std::string& id, const HttpRequest& q, HttpResponse* refusal);
     /* Starts `c`'s Launcher on its thread; the attempt number. Under m_. */
     uint64_t start_locked(const std::string& id, Cold& c);
-    void start_routes_and_monitor();
     void monitor_idle();
     /* A request that names no model while the default one is not attached: probes and scrapes the
      * router answers itself, so they never activate a model. */

@@ -101,13 +101,6 @@ int64_t ModelRouter::queued(const std::string& id) const {
     return c == cold_.end() ? 0 : c->second.waiters;
 }
 
-void ModelRouter::start_routes_and_monitor() {
-    router_.get("/radiance/models", [this](const HttpRequest&) {
-        return HttpResponse::json_body(200, status_json());
-    });
-    if (act_.idle_timeout_ms > 0) idle_thread_ = std::thread([this] { monitor_idle(); });
-}
-
 /* Every poll: stamps a model in use as busy, and deactivates one that has not been for the idle
  * timeout. The poll is a fifth of the timeout, within [1, 100] ms: a stream that ends is seen
  * idle that much late. */
@@ -192,6 +185,9 @@ int ModelRouter::run() {
         /* A request waiting for its cold model holds a transport thread. */
         t.max_threads += (int)(act_.max_queued * (int64_t)cold_.size());
         serving_ = true;
+        /* Only now: the options above were read from the default model's Server, which a
+         * deactivation would take away. */
+        if (act_.idle_timeout_ms > 0) idle_thread_ = std::thread([this] { monitor_idle(); });
     }
     const int rc = transport_.serve(router_, t);
     {
