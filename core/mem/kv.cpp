@@ -563,6 +563,7 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     for (auto& p : plans_) p.carve_blocks = p.paged() ? p.n_blocks : 0;
     plan_growth(kv_pool);
+    const int64_t reserved_before = kv_pool.used();   /* the streaming maps, if any */
 
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
@@ -647,11 +648,12 @@ int KVManager::carve_into(Pool& kv_pool) {
         } else {
             /* A growing group is backed where its stripes are, up to its carve; the budget range
              * it was accounted in stays unbacked. The others keep their place in the budget. */
+            rc = pool_->commit(0, reserved_before);
             for (const auto& p : plans_) {
-                if (p.zero || p.pool_bytes <= 0) continue;
-                if (!p.growable()) { rc = pool_->commit(p.pool_offset, p.pool_bytes); }
-                else rc = commit_ids(p, 0, p.carve_blocks);
                 if (rc < 0) break;
+                if (p.zero || p.pool_bytes <= 0) continue;
+                rc = p.growable() ? commit_ids(p, 0, p.carve_blocks)
+                                  : pool_->commit(p.pool_offset, p.pool_bytes);
             }
         }
         if (rc < 0) {
@@ -777,9 +779,11 @@ void KVManager::plan_growth(Pool& pool) {
     const int64_t left = pool.va_arena_left() - base_bytes - (int64_t)gs.size() * align;
     if (left < bytes) return;
     int64_t n = left / bytes;
+    /* A slot index is an int32 (RadKVGroupBatch::slot_mapping): ids times the block size must fit. */
     for (size_t i : gs) {
         const KVGroupPlan& p = plans_[i];
-        n = std::min(n, ((int64_t)1 << 30) / std::max<int64_t>(tokens / p.block_size, 1));
+        const int64_t e0 = align_up_to(p.n_blocks, gran / std::gcd(gran, p.layer_bytes_per_block()));
+        n = std::min(n, (INT32_MAX / p.block_size - e0) / std::max<int64_t>(tokens / p.block_size, 1));
     }
     if (n < 1) return;
     for (size_t i : gs) {
