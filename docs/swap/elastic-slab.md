@@ -42,7 +42,8 @@ etwas zu entmappen.
 
 ## Grenzen
 
-- Der KV-Carve bleibt fest (`KvPartition::growable` = 0); die modellübergreifende KV-Leihe ist unverändert.
+- Der KV-Carve wächst jetzt in Stücken auf frischem Adressraum, aus dem, was die Slabs zurückgeben
+  (`kv-lend.md`, Teil 2 von #17). Der Slab selbst ist davon unverändert.
 - Ein Model, das erst aktiviert wird, während ein anderes über sein Angebot hinaus gewachsen ist, startet
   mit dem, was frei ist; das Wachstum des anderen schrumpft binnen Sekunden zurück, wenn das Target fällt.
 - Bis die Engine ihre erste Messung meldet, gilt das Angebot des Resolvers als belegt (`held = Angebot`),

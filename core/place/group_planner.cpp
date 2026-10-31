@@ -217,13 +217,27 @@ std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
                                     const std::vector<int64_t>& static_pending) {
     for (size_t r = 0; r < pool.size(); ++r) {
         const size_t n = members.size();
-        std::vector<int64_t> reserved(n, 0), extra(n, 0);
-        int64_t wanted = 0, taken = 0;
+        std::vector<int64_t> reserved(n, 0), extra(n, 0), kv_extra(n, 0);
+        int64_t wanted = 0, taken = 0, kv_wanted = 0;
         std::vector<char> grows(n, 0);
         for (size_t i = 0; i < n && i < want.size(); ++i) {
             if (r >= want[i].size()) continue;
             const int64_t t = want[i][r].bytes;
             const RankFacts* f = r < members[i].facts.size() ? &members[i].facts[r] : nullptr;
+            /* A KV partition holds `grown` bytes of the pool. A claim above that is paid only out of
+             * the free bytes, like an elastic slab's growth; the part granted and not yet backed
+             * (`prev`) stays reserved while it is still wanted. At or below `grown` the partition is
+             * told to give chunks back, and holds them until it reports them returned. */
+            const int64_t kv_want = want[i][r].kv_grow;
+            const int64_t grown = f ? std::max<int64_t>(f->kv.grown, 0) : 0;
+            if (kv_want > 0 || grown > 0) {
+                const int64_t before = i < prev.size() && r < prev[i].size() ? prev[i][r].kv_grow : 0;
+                const int64_t kv_res = kv_want <= grown ? grown : std::max(grown, std::min(before, kv_want));
+                kv_extra[i] = std::max<int64_t>(kv_want - kv_res, 0);
+                if (kv_want > grown) want[i][r].kv_grow = kv_res;
+                taken += kv_res;
+                kv_wanted += kv_extra[i];
+            }
             if (!f || !f->elastic) { reserved[i] = t; taken += t; continue; }
             const int64_t held = std::max<int64_t>(f->held, 0);
             if (t <= held) { reserved[i] = held; taken += held; continue; }
@@ -234,9 +248,21 @@ std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
             taken += reserved[i];
             wanted += extra[i];
         }
-        /* Statics are read every token and take the free bytes before an expert may grow. */
+        /* The order of the free bytes: statics, then the KV partitions' claims, then the experts' growth.
+         * Statics are read every token; a partition that holds waiting sequences stalls them all when it
+         * cannot grow, and an expert is only a cache line. Each step takes from what the one before it
+         * left, so no byte is planned twice. */
         const int64_t statics = r < static_pending.size() ? static_pending[r] : 0;
-        const int64_t free_bytes = std::max<int64_t>(pool[r] - taken - statics, 0);
+        int64_t free_bytes = std::max<int64_t>(pool[r] - taken - statics, 0);
+        /* The experts were already cut by the claim (group_allocate). */
+        const int64_t kv_free = free_bytes;
+        for (size_t i = 0; i < n && i < want.size(); ++i) {
+            if (r >= want[i].size() || kv_extra[i] <= 0) continue;
+            const int64_t give = kv_wanted <= kv_free ? kv_extra[i]
+                                                     : (int64_t)((__int128)kv_extra[i] * kv_free / kv_wanted);
+            want[i][r].kv_grow += give;
+            free_bytes -= give;
+        }
         for (size_t i = 0; i < n && i < want.size(); ++i) {
             if (r >= want[i].size() || !grows[i]) continue;
             RankBudget& b = want[i][r];
@@ -270,6 +296,8 @@ std::vector<int64_t> group_statics(const std::vector<int64_t>& free,
             const int64_t held = std::max<int64_t>(f->held, 0);
             /* Bytes an elastic member was granted and has not backed yet are spoken for. */
             if (f->elastic && p) avail -= std::max<int64_t>(p->bytes - held, 0);
+            /* So are the bytes a KV partition was granted and has not backed yet. */
+            if (p) avail -= std::max<int64_t>(p->kv_grow - f->kv.grown, 0);
             if (p) reserved[i] = std::clamp(p->statics_cap - f->statics.held, (int64_t)0, f->statics.left);
             avail -= reserved[i];
         }
@@ -469,7 +497,8 @@ std::vector<GroupPlanner::RankView> GroupPlanner::view(const std::string& id) co
         if (members_[i].id != id) continue;
         for (size_t r = 0; r < members_[i].facts.size() && r < targets_[i].size(); ++r)
             out.push_back({ targets_[i][r].bytes, members_[i].facts[r].held, members_[i].facts[r].offer,
-                            members_[i].facts[r].elastic, members_[i].facts[r].statics });
+                            members_[i].facts[r].elastic, members_[i].facts[r].statics,
+                            targets_[i][r].kv_grow, members_[i].facts[r].kv.grown });
     }
     return out;
 }

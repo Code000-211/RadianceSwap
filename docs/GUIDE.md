@@ -2457,8 +2457,20 @@ did not vary `host_budget_mib`.
   weights pool and no other model can use them. Elastic expert slabs that free them physically
   are not yet available (#35).
 - **KV between models.** The KV loan (§4.3: idle KV blocks lent to the experts) works inside one model.
-  A model's KV partition does not grow into another's: the planner layer for it exists but is not connected,
-  because no pool can yet back the bytes (#17, needs #35).
+  A model's KV partition also grows physically at the expense of the group's experts (#17): the share fixes only
+  the cache a model starts with (its carve), its ceiling is `--max-model-len` x `--max-num-seqs`, and when running
+  or waiting prompts need more blocks than the carve holds, the cache claims chunks of about 128-256 MiB (a chunk
+  is 32 768 tokens of every growing group) from the group's expert pool. The planner takes the bytes from the
+  coldest experts of any model (each keeps its minimum) and grants them once those pages are back on the card; a
+  running sequence is never touched, and the cache gives a chunk back five seconds after the need ends, once no
+  sequence holds a block in it (blocks only the prefix cache holds are evicted for that). Free bytes go to streamed
+  static weights first (§4.12, "Streamed static weights"), then to a cache claim, then to the growth of expert slabs.
+  `GET /radiance/models` shows `kv_growth{grown_bytes, target_bytes}` per rank, `/metrics`
+  `radiance:model_kv_grown_bytes` and `radiance:model_kv_grow_target_bytes`. Measured on two Flash-Next MoE: a
+  cache with a 1.9 GiB carve grew by 468-702 MiB per card under 12-16 concurrent long prompts while the other model's
+  slab gave back 2.8-3.5 GiB, with no lost sequence and no non-finite logit; it returned to its carve 13-20 s after the
+  load. Only in a manifest with more than one model on a card with virtual memory management;
+  `RADIANCE_ELASTIC_SLAB=off` turns it off. Not built: lending one model's idle KV to another model's expert slab.
 - **Heat warmup.** A model's expert heat is saved when it is deactivated. With `cache.warmup_budget_mib` > 0
   the next activation ranks its experts by that heat and puts the hottest, within the budget (bytes of
   expert slots per rank), on the card at load time, instead of starting with the container's profile (an explicit
@@ -2616,8 +2628,10 @@ steps after an activation that were already on the card (also `early_hit=…%` i
 - **Slot release is logical** (#35 open): a model that gives experts away frees no VRAM another model can use,
   and the shares stay fixed. The shrink and regrow path did not run in the acceptance (two MoE models with
   equal shares).
-- **No cross-model KV loan** (#17 open): a model's KV partition cannot grow at another's expense. The loan runs
-  inside one model.
+- **No lending of one model's idle KV to another model's expert slab** (#17): the loan of idle KV blocks to the
+  experts runs inside one model. What does cross models is the growth of a KV partition at the expense of the
+  experts (above); it takes seconds from the claim to the backed chunk (a request that cannot wait is queued or
+  preempted like on any full pool), and the cache's ceiling is what `--max-model-len` x `--max-num-seqs` states.
 - **Streamed static weights stay in RAM** (#19 open): a model that streams keeps doing so until it is deactivated;
   nothing moves them into VRAM when another model frees slots. Under `--deterministic` such a model does not start.
 - **Host RAM is the limit of large models.** Two Flash-Next on 170 GiB fill the host; the store copy of the
