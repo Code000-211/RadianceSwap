@@ -64,10 +64,12 @@
  * ever adds to a partition: a partition's held bytes (running sequences, prefix cache) are the
  * floor of its want, and no output names a byte of any partition to give up.
  *
- * A partition claims only what its pool can physically back (KvPartition::growable). No pool can
- * today (the slab sits in the weights pool, docs/swap/slot-release.md), so every engine reports 0
- * and a claim is never granted: evicting experts for bytes the claimant cannot use would only cost
- * decode time. The expert slab of ticket #35 raises `growable`.
+ * A partition claims only what its pool can physically back (KvPartition::growable): a pool that
+ * cannot grow reports 0 and a claim is never granted, since evicting experts for bytes the
+ * claimant cannot use would only cost decode time. The engine reports a partition whose KVManager
+ * can grow (Engine::group_tick); the bytes follow the expert slab's rule (group_gate): the experts
+ * give theirs back first, the partition's chunks are backed after that (`KvPartition::grown`), and
+ * a grant not yet used stays reserved.
  */
 #pragma once
 #include "heat.h"
@@ -93,11 +95,13 @@ struct HeatBin {
 
 /* One rank's KV partition of a model, in bytes of that rank's pool. All zero: no claim. */
 struct KvPartition {
-    int64_t carve = 0;      /* the pool's carve (KVManager::pool_bytes_carved, summed over groups) */
+    int64_t carve = 0;      /* the pool's carve at start (KVManager::pool_bytes_carved, summed over groups) */
     int64_t held = 0;       /* held by sequences or the prefix cache (pool_bytes_used): never given up */
     int64_t want = 0;       /* what the cache wants in hand: held plus its buffer or a refused request */
     int64_t cap = 0;        /* the most it can ever use (KVManager::ceiling) */
-    int64_t growable = 0;   /* bytes the pool can back beyond `carve` today; 0 until #35 */
+    int64_t growable = 0;   /* bytes the pool can back beyond `carve` at most: `grown` plus the address space left;
+                             * 0 for a pool that cannot grow (KVManager::growth_enabled) */
+    int64_t grown = 0;      /* bytes beyond the carve the pool has pages behind now (KVManager::chunks) */
 };
 
 /* One rank's side of an engine's report. */
@@ -119,8 +123,11 @@ using GroupFacts = std::vector<RankFacts>;   /* by rank */
 struct RankBudget {
     int64_t bytes = 0;
     std::map<int32_t, int64_t> class_units;   /* slots per slab class; empty for a sole engine */
-    /* Bytes its KV partition may take on beyond its carve, paid out of the expert pool (the other
-     * budgets already exclude them). Never negative: a partition is not shrunk here. */
+    /* Bytes its KV partition may hold beyond its carve, paid out of the expert pool (the other
+     * budgets already exclude them). Never negative: a partition is not shrunk below its carve, and
+     * its running sequences are never touched. After group_gate it is what the pool may back now:
+     * a claim waits for the bytes no member holds, and falls to `grown` or below when the claim
+     * ends, which is the engine's cue to give chunks back. */
     int64_t kv_grow = 0;
 };
 using GroupBudget = std::vector<RankBudget>;   /* by rank */
@@ -145,7 +152,9 @@ std::vector<GroupBudget> group_allocate(const std::vector<int64_t>& pool,
  * reserved while the member still wants it, so two takers are never granted the same free bytes.
  * `want` is group_allocate's result; `prev` is by member (empty: none given yet). Non-elastic
  * members pass through. VRAM is never planned twice: per rank, the sum of what elastic members
- * hold or are granted does not exceed the pool. */
+ * hold or are granted does not exceed the pool. A KV partition's claim (`kv_grow`) is gated the same
+ * way, against `KvPartition::grown`, and is served before the elastic slabs' growth from the bytes
+ * no one holds. */
 std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
                                     const std::vector<GroupMember>& members,
                                     std::vector<GroupBudget> want,
@@ -198,8 +207,12 @@ public:
     GroupBudget target(const std::string& id) const;
 
     /* One rank of a member, for status and metrics: the target (bytes), what its slab has pages
-     * behind (held, the physical commit) and the offer the pool counts for it. */
-    struct RankView { int64_t target = 0, committed = 0, offer = 0; bool elastic = false; };
+     * behind (held, the physical commit) and the offer the pool counts for it; and the KV
+     * partition's side (kv_target, kv_grown). */
+    struct RankView {
+        int64_t target = 0, committed = 0, offer = 0; bool elastic = false;
+        int64_t kv_target = 0, kv_grown = 0;   /* the KV partition's claim beyond its carve, and what it has backed */
+    };
     std::vector<RankView> view(const std::string& id) const;
 
 private:

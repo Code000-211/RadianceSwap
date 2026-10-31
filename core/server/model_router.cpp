@@ -638,6 +638,10 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
                 ranks.push_back({ { "target_bytes", v.target }, { "committed_bytes", v.committed },
                                   { "offer_bytes", v.offer }, { "elastic", v.elastic } });
             if (!ranks.empty()) m["expert_slab"] = std::move(ranks);
+            nlohmann::json kv = nlohmann::json::array();
+            for (const auto& v : group_->view(id))
+                kv.push_back({ { "grown_bytes", v.kv_grown }, { "target_bytes", v.kv_target } });
+            if (!kv.empty()) m["kv_growth"] = std::move(kv);
         }
         m["warm_activations"] = c.loads[1];
         m["cold_activations"] = c.loads[0];
@@ -734,13 +738,19 @@ std::string ModelRouter::metrics_text() const {
         o += "# HELP radiance:model_expert_slab_committed_bytes Bytes of the model's expert slab with pages behind them, per rank\n"
              "# TYPE radiance:model_expert_slab_committed_bytes gauge\n"
              "# HELP radiance:model_expert_slab_target_bytes What the group planner entitles the model's expert slab to, per rank\n"
-             "# TYPE radiance:model_expert_slab_target_bytes gauge\n";
+             "# TYPE radiance:model_expert_slab_target_bytes gauge\n"
+             "# HELP radiance:model_kv_grown_bytes Bytes of the model's KV cache beyond its carve with pages behind them, per rank\n"
+             "# TYPE radiance:model_kv_grown_bytes gauge\n"
+             "# HELP radiance:model_kv_grow_target_bytes What the group planner grants the model's KV cache beyond its carve, per rank\n"
+             "# TYPE radiance:model_kv_grow_target_bytes gauge\n";
         for (const auto& [id, c] : cold_) {
             const auto views = group_->view(id);
             for (size_t r = 0; r < views.size(); ++r) {
                 const std::string rk = ",rank=\"" + std::to_string(r) + "\"";
                 line("radiance:model_expert_slab_committed_bytes", id, rk, (double)views[r].committed);
                 line("radiance:model_expert_slab_target_bytes", id, rk, (double)views[r].target);
+                line("radiance:model_kv_grown_bytes", id, rk, (double)views[r].kv_grown);
+                line("radiance:model_kv_grow_target_bytes", id, rk, (double)views[r].kv_target);
             }
         }
     }

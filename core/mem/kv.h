@@ -141,6 +141,18 @@ struct KVGroupPlan {
      * rewritten `layer_slot`, which is also the host mirror's row (docs/KV-STREAMING.md §3.5.1). Set
      * by carve() when the ring is smaller than the context. */
     int64_t     depth = 0;
+    /* A group whose cache can grow (KVManager, "growth"): the blocks carve() backed at the start,
+     * the stripe depth in blocks (`va_blocks`, so layer_stride() is fixed for the group's life and
+     * the kernels' bindings never change), and the blocks one growth step adds (`chunk_blocks`,
+     * a multiple of `chunk_align` so a step starts and ends on a commit granule of every layer's
+     * stripe). `n_blocks` is then the ids addressed so far; some of them are dead (never backed or
+     * given back, and never used again: an address is mapped once, docs/swap/elastic-slab.md).
+     * Zero `va_blocks`: the group is fixed, `carve_blocks` equals `n_blocks`. */
+    int64_t     carve_blocks = 0;
+    int64_t     va_blocks = 0;
+    int64_t     chunk_blocks = 0;
+    int64_t     chunk_align = 0;
+    bool        growable() const { return chunk_blocks > 0; }
     /* rad_kv_group_zero: this rank keeps no cache for the group. The plan keeps its position and
      * block count (one block table serves every rank); its costs are zero and nothing is carved.
      * No op on this rank names it (issue refuses a group with no pool bound). */
@@ -170,7 +182,9 @@ struct KVGroupPlan {
     /* Blocks of device pool this group owns: `n_slots`, which is `n_blocks` unless the group
      * streams. Every carve and stride goes through here; every allocation and guard uses
      * `n_blocks`. */
-    int64_t     pool_blocks() const { return n_slots > 0 ? n_slots : n_blocks; }
+    int64_t     pool_blocks() const {
+        return n_slots > 0 ? n_slots : va_blocks > 0 ? va_blocks : n_blocks;
+    }
     /* The pool holds fewer blocks than the group addresses; a residency map says which. */
     bool        streamed() const { return paged() && n_slots > 0 && n_slots < n_blocks; }
 
@@ -506,6 +520,49 @@ public:
     /* Blocks of a group the cache may hand out: the carve less the loan. */
     int64_t live_blocks(int32_t group) const;
 
+    /* ---------------- growth ----------------
+     *
+     * A partition can take on bytes the expert slabs of the group gave up (GroupPlanner,
+     * docs/swap/kv-lend.md). The lendable (FULL) groups are carved with a stripe per layer deep
+     * enough for the ids growth will ever use (`KVGroupPlan::va_blocks`, address space only, taken
+     * from the pool's arena, Pool::va_arena) and back only the first `carve_blocks` of it. A growth
+     * step, a chunk, backs the next ids of every such group on fresh address space, the same
+     * number of tokens in each so they still run out together. An address is mapped once: a chunk
+     * that is given back (retire_chunk) is never mapped again, its ids are dead for good, and the
+     * next chunk takes the ids after them. (hsa_amd_vmem_map on an address mapped before does not
+     * take effect; docs/swap/elastic-slab.md.) The arena is finite, so is the number of steps.
+     *
+     * Block ids are shared across ranks, so every rank backs the same chunk before rank 0 offers
+     * its blocks: back_chunk() on each rank, then publish_chunk() on followers and last on rank 0
+     * (abandon_chunk() on the ranks that backed it if another could not). A chunk is given back
+     * from the top and only while every block of it is free; it is a loss of nothing.
+     *
+     * The loan and growth exclude each other: a loan lends the top of the carve and only a cache
+     * with no chunk lends; a chunk is backed only while nothing is lent. A cache that grows holds
+     * more than its carve, so it has nothing to lend. */
+    bool    growth_enabled() const { return chunk_bytes_ > 0; }
+    /* Bytes one chunk backs on this rank, over every growing group; the tokens it adds to each. */
+    int64_t chunk_bytes() const { return chunk_bytes_; }
+    int64_t chunk_tokens() const { return chunk_tokens_; }
+    /* Chunks backed now, and chunks the address space still has. */
+    int     chunks() const { return (int)chunks_.size(); }
+    int     chunks_left() const;
+    /* True when the topmost chunk is published and every block of it is free. */
+    bool    top_chunk_free() const;
+    /* Back the next chunk (RAD_E_STATE while a loan is out or a chunk is pending, RAD_E_NOMEM when
+     * the ids are used up, or the device's refusal). A refusal leaves nothing backed and burns the
+     * ids it tried. */
+    int     back_chunk();
+    /* Offer the chunk's blocks. */
+    void    publish_chunk();
+    /* Return the pages of a chunk back_chunk() backed and publish_chunk() did not offer. */
+    void    abandon_chunk();
+    /* Return the topmost chunk's pages. `check` false trusts the caller that rank 0 found it free
+     * (a follower tracks no blocks). RAD_E_STATE if a block of it is held. */
+    int     retire_chunk(bool check = true);
+    /* The ceiling() of the configured context: the most a partition can ever use. */
+    int64_t ceiling() const { return ceiling(max_ctx_); }
+
     /* ---------------- preemption by recompute (spec §7.1, §17) ---------------- */
     /* Frees the sequence's blocks and state slots and resets it to zero tokens. A recurrent
      * state that was not snapshotted cannot be resumed, so the sequence replays from its last
@@ -727,6 +784,24 @@ private:
     std::vector<int64_t>  free_usable_;     /* per group: free ids below live_ */
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
     std::vector<std::vector<int32_t>> held_hist_;   /* per group, per bucket: held blocks */
+
+    /* ---- growth (see the public block) ---- */
+    struct Chunk { std::vector<int64_t> first, n; };   /* by group: ids [first, first + n) */
+    std::vector<Chunk> chunks_;                         /* published, in id order */
+    bool      chunk_pending_ = false;                       /* back_chunk() ran, publish_chunk() has not */
+    Chunk     pend_;
+    int64_t   chunk_tokens_ = 0, chunk_bytes_ = 0;
+    std::vector<int64_t> dead_;                         /* per group: ids never to be handed out */
+    /* Decides which groups grow and sets their stripes (carve_into). */
+    void    plan_growth(Pool& kv_pool);
+    /* Makes ids up to `upto` addressable, dead until publish_chunk() revives a range. */
+    void    extend_ids(size_t i, int64_t upto);
+    /* Commits or decommits [first, first + n) of every layer's stripe of group i. */
+    int     commit_ids(const KVGroupPlan& p, int64_t first, int64_t n);
+    void    decommit_ids(const KVGroupPlan& p, int64_t first, int64_t n);
+    /* The blocks of a group that can be held: ids below the live mark, less the dead ones among them. */
+    int64_t usable(size_t i, int64_t live) const;
+    int64_t live_for(size_t i, int64_t tokens) const;
 
     int64_t  buf_blocks(size_t i) const;
     /* One past the highest held block, rounded up to a bucket. */
