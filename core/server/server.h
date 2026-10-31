@@ -92,7 +92,8 @@ struct ServerOptions {
      * (the served name says nothing about the file behind it). Empty omits the field. */
     std::string model_path;
     /* Manifest mode: the other configured models, listed by /v1/models beside the served one
-     * (id and root only; only model_id is started and answered). Empty without a manifest. */
+     * (id and root only; each is answered by its own Server, behind a ModelRouter). Empty without
+     * a manifest. */
     std::vector<ModelCard> other_models;
     std::string host = "0.0.0.0";
     int         port = 8000;

@@ -10,8 +10,9 @@
  *
  * JSON because nlohmann/json is already a dependency and the project parses no YAML. A model's
  * `engine` is an argv-style list handed to config_parse over the command line's own options, so
- * there is one option parser and one validation. The gpu_group and cache sections are only parsed
- * and checked here; nothing reads the cache values yet.
+ * there is one option parser and one validation. Every model is started at once as its own Engine on
+ * the same GPU group (main.cpp, server/model_router.h). The gpu_group and cache sections are only
+ * parsed and checked here; nothing reads the cache values yet.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
 #pragma once
