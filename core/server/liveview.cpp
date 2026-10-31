@@ -254,6 +254,9 @@ std::string LiveView::render_line(const LiveSnapshot& s) const {
         if (s.experts.routed > 0)
             o += " hit=" + f2(100.0 * (double)s.experts.routed_resident /
                               (double)s.experts.routed) + "%";
+        if (s.experts.early_routed > 0)
+            o += " early_hit=" + f2(100.0 * (double)s.experts.early_routed_resident /
+                                    (double)s.experts.early_routed) + "%";
         if (s.experts.promotions || s.experts.demotions) {
             o += " promo=" + std::to_string(s.experts.promotions);
             o += " demo=" + std::to_string(s.experts.demotions);

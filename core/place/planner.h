@@ -240,6 +240,9 @@ public:
      * units, and the share threshold it derived from the fraction (Plan::report). */
     int64_t pinned_units = 0;
     int64_t profile_units = 0;
+    /* The experts and slot bytes the saved heat ranked first (PlannerInput::warmup_budget_bytes). */
+    int64_t warmup_units = 0;
+    int64_t warmup_bytes = 0;
     float   pin_threshold = 0.0f;
     /* --ngram-placement ram: RAM for the n-gram tables the load phase copies out of the mapping.
      * Every pool still sees them on the mapped tier. `ngram_copy_card` selects pinned memory a
@@ -287,6 +290,10 @@ struct PlannerInput {
      * fine and costs about a point of hit rate. See Planner::rank_units. */
     const RadFileProfile* profile = nullptr;
     int64_t               n_profile = 0;
+    /* > 0: `profile` is a deactivated model's saved heat (ticket #20), and only its hottest experts
+     * within this many bytes (slot bytes on this rank) are placed ahead of the default order. The
+     * rest of the profile is dropped. 0: the profile ranks every expert it names. */
+    int64_t               warmup_budget_bytes = 0;
     /* The weights are in a container, which the file and mapped tiers read in place. A checkpoint
      * served directly is neither grouped by movement unit nor aligned for O_DIRECT, so with this
      * false both tiers are closed (spec §4.3). */
@@ -335,6 +342,7 @@ private:
     int  assign_all_vram(Plan* p);
     int  assign_layer_offload(Plan* p);
     int  assign_expert_tiered(Plan* p);
+    void cut_warmup(Plan* p) const;
     void enforce_op_site_agreement(const Program& prog, Plan* p);
     void schedule_prefetch(Plan* p);
     void finish(const Program& prog, Plan* p);

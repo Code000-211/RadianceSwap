@@ -321,6 +321,9 @@ private:
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
+    /* The expert heat the PreparedWeightStore kept from this model's last deactivation, loaded at
+     * the first rank's plan when cache.warmup_budget_mib asks for a warmup. */
+    std::vector<RadFileProfile> warm_heat_;
     int load_weights();
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */

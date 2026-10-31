@@ -80,6 +80,9 @@ struct ExpertPlane {
      * across the link (priced by LinkStat::stream_bytes). This measures how much of the work, not
      * of the model, is resident. */
     int64_t routed = 0, routed_resident = 0;
+    /* The same over the first 64 steps after the engine started (HeatParams::early_steps): the
+     * hit rate right after an activation, for judging the saved-heat warmup. */
+    int64_t early_routed = 0, early_routed_resident = 0;
     int64_t no_record = 0, starved_slab = 0, starved_pool = 0, quarantined = 0;
     /* The prefill stager's copies (Mover::stage_units), rank 0: layers staged, units and bytes
      * copied onto the card, pooled units a buffer had no room for, and the copies that carried

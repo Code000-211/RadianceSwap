@@ -7,6 +7,7 @@
 #include "engine_priv.h"
 #include "rad_internal.h"
 #include "engine_hostmem.h"
+#include "manifest.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
@@ -2071,6 +2072,20 @@ int Engine::plan() {
                 in.n_profile = (int64_t)expert_profile_.size();
             }
         }
+        /* Manifest mode, cache.warmup_budget_mib > 0: the heat this model had when it was last
+         * deactivated ranks its experts in place of the container's profile, and the hottest
+         * within the budget start resident (docs/swap/heat-warmup.md). An explicit
+         * --expert-profile is the operator's own ranking and stays. Read once, like the profile. */
+        const int64_t warm_budget = registry_ && weight_store_
+            ? registry_->cache.warmup_budget_mib << 20 : 0;
+        if (warm_budget > 0 && cfg_.expert_profile.empty()) {
+            if (ri == 0) warm_heat_ = weight_store_->heat(weight_model_id());
+            if (!warm_heat_.empty()) {
+                in.profile   = warm_heat_.data();
+                in.n_profile = (int64_t)warm_heat_.size();
+                in.warmup_budget_bytes = warm_budget;
+            }
+        }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
         Planner planner(in);
@@ -2078,6 +2093,10 @@ int Engine::plan() {
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        if (in.warmup_budget_bytes > 0)
+            RAD_INFO("warmup: %lld saved-heat experts (%s of the %s budget) rank first on rank %d",
+                     (long long)r->plan.warmup_units, humanb(r->plan.warmup_bytes).c_str(),
+                     humanb(in.warmup_budget_bytes).c_str(), r->index);
         /* The planner's slab must match the weights pool the mover fills. */
         RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
         if (r->index == 0) {
