@@ -1334,6 +1334,105 @@ TEST(libavx_alone_serves_every_family_within_rounding_of_libref) {
               "--max-num-seqs", "1" }));
 }
 
+/* RAM-Streaming of the static weights (ticket #18). A device too small for a model's static
+ * weights beside one sequence of cache (RADIANCE_HOST_VRAM_MIB; the host backend's pinned pool and
+ * its card are both RAM, so the placement and the staging are the card's, the link is a memcpy)
+ * puts part of them in the pinned host pool: decode reads them in place, a prompt chunk of more
+ * than 256 rows copies them through the stager's ring. The bytes are the same, so the recording
+ * must equal the one with every weight on the card, to the bit.
+ *
+ * The device size is found, not fixed: the budget's reserves decide how much the statics get, and
+ * a change to them should land here as a case that no longer streams, by name. */
+int streaming_device_mib(const std::string& model, const std::vector<std::string>& kernels,
+                         std::string* why) {
+    World& w = world();
+    for (int mib = 20; mib <= 120; ++mib) {
+        tiny::TempDir out("e2e_stream");
+        std::vector<std::string> a = { "--kld-record", out / "rec", "--kld-corpus", w.corpus_probe,
+                                       "--max-num-batched-tokens", "512", "--max-num-seqs", "1",
+                                       "--gpu-headroom-mib", "0" };
+        a.insert(a.end(), kernels.begin(), kernels.end());
+        const Ran r = radiance(model, a, device_env(mib));
+        if (r.status != 0) continue;
+        static const std::string kTag = "of static weights (";
+        const size_t at = r.log.find(kTag);
+        if (at == std::string::npos) continue;
+        const double share = std::atof(r.log.c_str() + at + kTag.size());
+        /* With room for the ring: the cache keeps its sequence only above that. */
+        if (share >= 10.0 && share <= 90.0 && r.log.find("prefill staging: a ") != std::string::npos)
+            return mib;
+    }
+    *why = "no device size from 20 to 120 MiB streams between a tenth and nine tenths of the "
+           "static weights with a staging ring";
+    return 0;
+}
+
+void check_streamed_recording_matches(const std::string& model, const std::string& corp,
+                                      const std::vector<std::string>& kernels) {
+    World& w = world();
+    REQUIRE(w.ok);
+    std::string why;
+    const int mib = streaming_device_mib(model, kernels, &why);
+    if (!mib) fprintf(stderr, "    %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    const std::vector<std::string> args = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
+    /* The resident run: the same arguments on the default device, everything on the card. */
+    tiny::TempDir dir("e2e_stream_cmp");
+    std::vector<std::string> ra = { "--kld-record", dir / "resident", "--kld-corpus", corp,
+                                    "--gpu-headroom-mib", "0" };
+    ra.insert(ra.end(), args.begin(), args.end());
+    ra.insert(ra.end(), kernels.begin(), kernels.end());
+    const Ran resident = radiance(model, ra);
+    REQUIRE_RAN(resident);
+    CHECK(resident.log.find("read from the pinned host pool at run time") == std::string::npos);
+
+    std::vector<std::string> sa = { "--kld-record", dir / "streamed", "--kld-corpus", corp,
+                                    "--gpu-headroom-mib", "0" };
+    sa.insert(sa.end(), args.begin(), args.end());
+    sa.insert(sa.end(), kernels.begin(), kernels.end());
+    const Ran streamed = radiance(model, sa, device_env(mib));
+    REQUIRE_RAN(streamed);
+    CHECK(streamed.log.find("read from the pinned host pool at run time") != std::string::npos);
+    /* The prompt chunks above 256 rows go through the ring. */
+    CHECK(streamed.log.find("prefill staging: a ") != std::string::npos);
+    std::string diff;
+    const bool same = same_recording(dir / "resident", dir / "streamed", &diff);
+    if (!same) fprintf(stderr, "    %s\n", diff.c_str());
+    CHECK(same);
+}
+
+TEST(streamed_statics_record_what_resident_statics_record_on_libref) {
+    check_streamed_recording_matches(world().g31, world().corpus, { "--kernels", "libref" });
+}
+
+/* --deterministic has no stager: a prefill would read the streamed statics over the link in place,
+ * which ADR 0002 excludes, so the same device that streams without it is refused with it. */
+TEST(deterministic_refuses_streaming_statics) {
+    World& w = world();
+    REQUIRE(w.ok);
+    std::string why;
+    const std::vector<std::string> kernels = { "--kernels", "libref" };
+    const int mib = streaming_device_mib(w.g31, kernels, &why);
+    if (!mib) fprintf(stderr, "    %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    const Ran r = radiance(w.g31, { "--deterministic", "--kernels", "libref", "--max-num-batched-tokens",
+                                    "512", "--max-num-seqs", "1", "--gpu-headroom-mib", "0",
+                                    "--kld-record", tiny::TempDir("e2e_det_stream") / "rec",
+                                    "--kld-corpus", w.corpus }, device_env(mib));
+    CHECK(r.status != 0);
+    CHECK(r.log.find("--deterministic: ") != std::string::npos);
+    CHECK(r.log.find("no prefill stager") != std::string::npos);
+}
+
+TEST(streamed_statics_record_what_resident_statics_record_on_libavx) {
+#if defined(__x86_64__)
+    NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
+#else
+    SKIP("libavx is x86-64 only");
+#endif
+    check_streamed_recording_matches(world().g31, world().corpus, { "--kernels", "libavx" });
+}
+
 /* A 16 kHz mono 16-bit WAV of `n` samples: two tones, so every mel band the tower reads carries
  * something. */
 std::string wav16(int64_t n) {

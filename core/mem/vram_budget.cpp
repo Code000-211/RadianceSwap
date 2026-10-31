@@ -23,6 +23,14 @@ int64_t to_mib_up(int64_t bytes) { return bytes > 0 ? (bytes + kMiB - 1) / kMiB 
  * has come in 4 MiB below what the driver later held, leaving the first kernel launches short of
  * headroom. Four times that, charged before anything is split. */
 constexpr int64_t kDriverDrift = 16 * kMiB;
+
+/* The cache a model keeps when its static weights are streamed (RAM-Streaming, ticket #18): one
+ * full-length sequence, but at most this. A GiB holds a few thousand to some tens of thousands of
+ * tokens, enough to answer; the whole of a long --max-model-len is a provisioning choice that a
+ * smaller context lowers, and must not cost decode speed by streaming statics for it.
+ * shortcut: a fixed GiB, not a per-token figure; upgrade when a model's KV bytes a token make a
+ * GiB too little to answer a request. */
+constexpr int64_t kStreamCacheMax = 1024 * kMiB;
 }  /* namespace */
 
 /* The fraction of the paged (context) part of the ceiling the cache backs. The ceiling also
@@ -44,7 +52,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * re-split afterwards (vram_budget_rank_split, from Engine::plan). */
     b.capacity   = per_rank[0].capacity;
     int64_t freeb = per_rank[0].free;
-    int64_t layer_max = 0, kv_one = 0;
+    int64_t layer_max = 0, kv_one = 0, static_layer_max = 0;
     for (const VramFacts& f : per_rank) {
         b.capacity   = std::min(b.capacity, f.capacity);
         freeb        = std::min(freeb, f.free);
@@ -61,6 +69,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.statics    = std::max(b.statics, f.statics);
         b.expert_ceiling = std::max(b.expert_ceiling, f.experts);
         layer_max        = std::max(layer_max, f.expert_layer_max);
+        static_layer_max = std::max(static_layer_max, f.static_layer_max);
         /* The rank that needs most on the card sets the floor. */
         b.expert_floor = std::max(b.expert_floor, f.expert_floor);
         kv_one = std::max(kv_one, f.kv_one);
@@ -130,9 +139,52 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         return RAD_E_NOMEM;
     }
 
-    /* ---- the static weights come off the top, as a floor ------------------------------------ */
-    b.statics = std::min(b.statics, b.claimable);
-    if (b.statics >= b.claimable && b.claimable > 0) {
+    /* ---- the static weights come off the top, as a floor ------------------------------------
+     *
+     * Unless they do not fit beside a workable cache (one full-length sequence, at most a GiB):
+     * before this, such a model got a cache of what was left, none at all once the statics filled
+     * the card. Under a placement that can stream, the card then holds the statics that fit once
+     * that cache and the prefill staging ring are paid, and the planner reads the rest from the
+     * pinned host pool (docs/swap/static-streaming.md). Statics that fit beside it are untouched. */
+    b.statics_total = b.statics;
+    /* A streamed KV plan needs its whole conversation (kv_one is a requirement there). */
+    const int64_t kv_keep = cfg.kv_streams ? kv_one : std::min(kv_one, kStreamCacheMax);
+    const bool streaming = (cfg.placement == "auto" || cfg.placement == "expert_tiered") &&
+                           b.statics > 0 && b.statics + kv_keep > b.claimable;
+    int64_t stream_stage = 0;
+    if (streaming) {
+        /* What the statics and the ring share: all but the cache's one sequence. The ring is two
+         * layers' share of the statics left off the card, and the more it takes the more is left
+         * off, so it is settled in a few steps (it only grows; the last one is paid in full). */
+        const int64_t room = std::max<int64_t>(b.claimable - kv_keep, 0);
+        auto card_of = [&](int64_t stage) {
+            return std::min(b.statics_total, std::max<int64_t>(room - stage, 0) / kMiB * kMiB);
+        };
+        if (static_layer_max > 0)
+            for (int i = 0; i < 4; ++i) {
+                const double f = (double)(b.statics_total - card_of(stream_stage)) /
+                                 (double)b.statics_total;
+                const int64_t one = ((int64_t)std::ceil(f * (double)static_layer_max) +
+                                     RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                const int64_t want = std::min(2 * one, room);
+                if (want == stream_stage) break;
+                stream_stage = want;
+            }
+        b.statics = card_of(stream_stage);
+        b.statics_streamed = b.statics_total - b.statics;
+        if (log)
+            RAD_WARN("the static (non-expert) weights (%s) and a workable cache (%s) do not fit the %s "
+                     "this card can give: %s of the static weights (%.0f%%) "
+                     "are read from the pinned host pool, over a link 20-60x slower than VRAM. "
+                     "Decode slows by about that share; use more cards, a smaller "
+                     "--max-num-batched-tokens, or deactivate another model",
+                     humanb(b.statics_total).c_str(), humanb(kv_keep).c_str(),
+                     humanb(b.claimable).c_str(), humanb(b.statics_streamed).c_str(),
+                     100.0 * (double)b.statics_streamed / (double)b.statics_total);
+    } else {
+        b.statics = std::min(b.statics, b.claimable);
+    }
+    if (!streaming && b.statics >= b.claimable && b.claimable > 0) {
         /* Not fatal: the planner demotes what does not fit and the model serves slowly. Warn so
          * the slowdown is explained at startup. */
         if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card can "
@@ -149,7 +201,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
          * real: weight_footprint always measures it. */
         const int64_t kv_cap = b.kv_ceiling > 0 ? b.kv_ceiling : b.elastic;
         int64_t kv = 0, exp = 0;
-        if (kv_cap + b.expert_ceiling <= b.elastic) {
+        if (streaming) {
+            /* Nothing is left for experts: the cache holds what it keeps (more only once the
+             * statics are all on the card, which the trigger excludes), the ring is paid, and
+             * every expert is read from the host pool. */
+            kv = std::min(kv_cap, std::max<int64_t>(b.elastic - stream_stage, 0));
+        } else if (kv_cap + b.expert_ceiling <= b.elastic) {
             /* Both fit: nothing trades. */
             kv  = kv_cap;
             exp = b.expert_ceiling;
@@ -178,7 +235,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.experts  = exp;
         b.kv       = kv;
         b.weights  = b.statics + exp;
-        b.unusable = std::max<int64_t>(b.elastic - kv - exp, 0);
+        b.unusable = std::max<int64_t>(b.elastic - kv - exp - stream_stage, 0);
     }
     /* The weights pool must exist even when empty (every weight read from the container's
      * mapping on the host backend), since the pools treat a zero budget as an unresolved one. One
@@ -196,7 +253,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * The share is what the slab alone leaves off, the most a step can see: KV and arena loans only
      * add residency. A layer larger than its share stages what fits and streams the rest. */
     bool stage_from_experts = false;
-    if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
+    if (streaming) {
+        /* Funded by the statics, above. */
+        b.stage = stream_stage;
+        b.stage_from_statics = stream_stage > 0;
+    } else if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
@@ -290,7 +351,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                : "left unclaimed on purpose",
         humanb(b.claimable).c_str(),
         humanb(b.statics).c_str(),
-        "off the top: every rank's own shard, and not a share of anything",
+        b.statics_streamed > 0
+            ? fmt("off the top: %s of the %s stream from the pinned host pool",
+                  humanb(b.statics_streamed).c_str(), humanb(b.statics_total).c_str()).c_str()
+            : "off the top: every rank's own shard, and not a share of anything",
         humanb(b.elastic).c_str(),
         b.lends ? "the experts keep what the host pool cannot hold; the cache takes the rest\n"
                   "                                  and lends what no live request holds to the "
@@ -328,10 +392,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             : "",
         b.stage > 0
             ? fmt("    prefill staging  %10s   out of the %s: two buffers of one layer's "
-                  "non-resident experts,\n"
+                  "non-resident weights,\n"
                   "                                  at the arena's top and lent back to the "
                   "slab while steps are small\n", humanb(b.stage).c_str(),
-                  stage_from_experts ? "experts" : "cache").c_str()
+                  b.stage_from_statics ? "static weights" : stage_from_experts ? "experts" : "cache").c_str()
             : "",
         humanb(cfg.vram_weights_mib * kMiB).c_str(), "static + experts",
         humanb(cfg.vram_kv_mib * kMiB).c_str(), "the cache's share",

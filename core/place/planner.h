@@ -34,7 +34,10 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ strategy */
-enum class Strategy { AllVram = 0, LayerOffload = 1, ExpertTiered = 2, Auto = 3 };
+/* StaticStream is only ever the outcome of `auto`, for a model with no routed experts whose
+ * static weights do not fit: the ones that fit stay on the card and the rest are read from the
+ * pinned host pool (Planner::assign_static_stream). It cannot be asked for by name. */
+enum class Strategy { AllVram = 0, LayerOffload = 1, ExpertTiered = 2, Auto = 3, StaticStream = 4 };
 
 const char* strategy_name(Strategy s);
 /* RAD_E_INVAL and *out untouched if the string is not one of the four. */
@@ -260,6 +263,11 @@ public:
     /* Slab VRAM no weight occupies: shadow slots (the cost of dynamic placement) and the staging
      * ring (the cost of offload). Reported separately from the tier totals. */
     int64_t slab_overhead = 0;
+    /* RAM-Streaming of the static (non-expert) weights, ticket #18: the weight bytes the planner
+     * put off the card (host pool, read in place at decode, staged through the prefill ring) and
+     * all such bytes, mapped and flag-placed tables excluded. Per rank. */
+    int64_t static_bytes = 0;
+    int64_t static_streamed_bytes = 0;
 
     /* What did not fit. `notes` holds whole-plan statements ("the budget is 3 GiB short");
      * `unfit` holds per-unit misfits aggregated by class and reason, so hundreds of stranded
@@ -342,6 +350,7 @@ private:
     int  assign_all_vram(Plan* p);
     int  assign_layer_offload(Plan* p);
     int  assign_expert_tiered(Plan* p);
+    int  assign_static_stream(Plan* p);
     void cut_warmup(Plan* p) const;
     void enforce_op_site_agreement(const Program& prog, Plan* p);
     void schedule_prefetch(Plan* p);
@@ -381,6 +390,11 @@ struct WeightFootprint {
      * staging ring and tail pad (Planner::assign_expert_tiered). Same weight budget as residents. */
     int64_t expert_spare     = 0;
     int64_t layer_unit_max   = 0;   /* the widest per-layer unit's slot: the file tier's staging */
+    /* The statics that can be streamed (ticket #18): the most static bytes one layer holds, which
+     * sizes the prefill staging ring, and the largest static unit's slot, the first-fit slack of
+     * the host pool that takes what leaves the card. */
+    int64_t static_layer_max = 0;
+    int64_t static_unit_max  = 0;
     bool    routed           = false;   /* a layer has experts: the file tier's read windows */
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
     int64_t hosted  = 0;   /* --embedding-placement ram: in the pinned host pool, off the card */
