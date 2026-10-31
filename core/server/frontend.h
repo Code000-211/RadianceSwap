@@ -5,7 +5,12 @@
  * (Engine::stop_execution) never touches it. A request takes a FrontendLease when it is
  * generated and drops it only after its response is over, final stream chunks and reap included,
  * so the incremental decoder and reply stream it holds stay valid however the runtime fares. The
- * frontend is freed with the last lease. */
+ * frontend is freed with the last lease.
+ *
+ * Nothing in it may point into the Engine: a model is deactivated (ModelRouter) and its Engine
+ * destroyed while a response's lease can still be alive. The bridges own what they read (the
+ * tokenizer and the grammar compiler share the vocabulary, the template its parsed source), and
+ * the vocabulary is a copy, not a view into the mapped container. */
 #pragma once
 #include "iface.h"
 #include "oai.h"

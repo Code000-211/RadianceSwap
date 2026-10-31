@@ -13,16 +13,23 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <memory>
 #include <mutex>
 #include <thread>
 
+namespace {
+std::atomic<bool> g_signalled{false};   /* set by the SIGINT/SIGTERM handler, read by serve_manifest */
+}
+
 /* Manifest mode: every model is its own Engine (a model runtime) on the same GPU group, each with a
  * fixed share of the free VRAM, behind one listener that routes by the request's `model`
  * (server/model_router.h). Only the default model is started here; the others are cold and the
- * router starts them on their first request, each on its own activation thread. The registry and
- * the router belong to the process; an Engine belongs to the thread that serves it and is destroyed
- * when that thread returns.
+ * router starts them on their first request, each on its own activation thread. A model idle for
+ * `cache.idle_timeout_ms` is deactivated (0: never), the default one too, and its Engine destroyed.
+ * The registry and the router belong to the process; an Engine belongs to the thread that serves
+ * it and is destroyed when that thread returns.
  *
  * The fixed share caps a model's KV cache and static weights until KV is lent between models
  * (#17). The group planner (place/group_planner.h) divides only the experts, inside those shares:
@@ -92,14 +99,15 @@ static int serve_manifest(rad::ModelRegistry& registry) {
 
     std::atomic<bool> serve_failed{false};
     rad::server::ModelRouter* router_ptr = nullptr;
-    /* Serves `e` until the router stops. A failure of the default model, or of a model that had
-     * attached (its step loop), stops the process; a cold model whose serve() fails before it
-     * attached is an activation failure, which the router reports to the requests waiting for it. */
-    auto serve_engine = [&](rad::Engine& e, const std::string& id) {
+    /* Serves `e` until the router stops or deactivates the model. A failure of a model that had
+     * attached (its step loop) stops the process, and so does a failure of the default model's
+     * first start (`startup`): nothing listens before it. A cold model whose serve() fails before
+     * it attached is an activation failure, which the router reports to the requests waiting. */
+    auto serve_engine = [&](rad::Engine& e, const std::string& id, bool startup) {
         const int st = e.serve(nullptr, router_ptr);
         if (st < 0) {
             if (!e.startup_report_printed()) e.print_startup_report(st);
-            if (id == registry.default_model().id || registry.state_of(id) == rad::ModelState::Active) {
+            if (startup || registry.state_of(id) == rad::ModelState::Active) {
                 serve_failed = true;
                 router_ptr->stop();
             }
@@ -110,31 +118,82 @@ static int serve_manifest(rad::ModelRegistry& registry) {
     const std::string default_id = registry.default_model().id;
     rad::server::ActivationOptions act;
     act.max_queued = registry.cache.max_queued_requests;
+    act.idle_timeout_ms = registry.cache.idle_timeout_ms;
     rad::server::ModelRouter router(default_id, 1, &registry, act);
     router_ptr = &router;
-    size_t default_idx = 0;
+
+    /* --debug-graph: the default model's first start dumps its graph instead of serving. */
+    std::atomic<bool> dumped{false};
+    std::atomic<int> dump_exit{0};
+    std::atomic<bool> default_started{false};
+
+    /* Every model, the default one too, is built and served by its Launcher, and the Engine is
+     * destroyed when the Launcher returns: at the router stopping, or at a deactivation, which
+     * frees the model's VRAM (the free memory before and after is reported). */
     for (size_t i = 0; i < n; ++i) {
-        if (models[i].id == default_id) { default_idx = i; continue; }
-        router.add_cold(models[i].id, [&, i](const std::string& id) {
+        const bool is_default = models[i].id == default_id;
+        router.add_cold(models[i].id, [&, i, is_default](const std::string& id) {
+            const bool startup = is_default && !default_started.exchange(true);
             std::unique_ptr<rad::Engine> e;
             int dump_rc = 0;
-            const int s = build(i, false, &e, &dump_rc);
-            return s < 0 ? s : serve_engine(*e, id);
+            const int s = build(i, startup, &e, &dump_rc);
+            if (s != 0) {
+                if (startup) {
+                    if (s < 0) serve_failed = true;
+                    else { dumped = true; dump_exit = dump_rc; }
+                    router_ptr->stop();
+                }
+                return s < 0 ? s : 0;
+            }
+            const int64_t before = free_mib(models[i].config.tp);
+            const int st = serve_engine(*e, id, startup);
+            const bool deactivated = router_ptr->deactivating(id);
+            e.reset();
+            if (deactivated) {
+                const int64_t after = free_mib(models[i].config.tp);
+                if (before >= 0 && after >= 0) {
+                    router_ptr->note_vram_released(id, after - before);
+                    RAD_INFO("model '%s' deactivated: %lld MiB of VRAM freed on the group's "
+                             "tightest card (%lld MiB free now; the rest of its use is other "
+                             "models and the process's persistent overhead)", id.c_str(),
+                             (long long)(after - before), (long long)after);
+                }
+            }
+            return st;
         });
     }
 
-    std::unique_ptr<rad::Engine> engine;
-    int dump_rc = 0;
-    registry.set_state(default_id, rad::ModelState::Activating);
-    const int bs = build(default_idx, true, &engine, &dump_rc);
-    if (bs < 0) return 1;
-    if (bs > 0) return dump_rc;
+    /* The signals belong to the process, not to a model's watcher: the default model can be
+     * deactivated. They are taken once the default model is up, as before: a signal during startup
+     * still ends the process at once. */
+    std::atomic<bool> finished{false};
+    std::thread signals([&] {
+        while (!finished && registry.state_of(default_id) != rad::ModelState::Active)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (finished) return;
+        struct sigaction sa {};
+        sa.sa_handler = [](int) { g_signalled.store(true, std::memory_order_relaxed); };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESETHAND;      /* a second one takes the default disposition and kills */
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+        while (!finished) {
+            if (g_signalled.load(std::memory_order_relaxed)) {
+                RAD_INFO("stopping: draining in-flight requests");
+                router_ptr->stop();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
 
-    std::thread serving([&] { serve_engine(*engine, default_id); });
+    router.activate(default_id);
     const int s = router.run();
     router.stop();
-    serving.join();
     router.join();
+    finished = true;
+    signals.join();
+    if (dumped) return dump_exit;
     return s < 0 || serve_failed ? 1 : 0;
 }
 

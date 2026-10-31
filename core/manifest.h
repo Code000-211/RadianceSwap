@@ -14,8 +14,9 @@
  * group (main.cpp, server/model_router.h): the default model is started at once, the others on
  * their first request. Each has a fixed VRAM share, and the group planner (place/group_planner.h)
  * divides the experts between them inside those shares. `cache.max_queued_requests` bounds the
- * requests waiting for one cold model (0: 64). The gpu_group section and the other cache values
- * are only parsed and checked here.
+ * requests waiting for one cold model (0: 64), and `cache.idle_timeout_ms` is how long an active
+ * model may go without a request before it is deactivated (0: never). The gpu_group section and
+ * the other cache values are only parsed and checked here.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
 #pragma once

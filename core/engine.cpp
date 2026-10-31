@@ -2132,7 +2132,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch, server::ModelRouter* router
     int s = cfg_.kld() ? run_kld() : run_server(router);
     startup_watch_.reset();
 
-    stop_execution(StopMode::Immediate);
+    /* A deactivated model (ModelRouter) has no admitted request left, but the scheduler may still
+     * hold cancelled ones; they finish. Any other end of serving is the process stopping. */
+    stop_execution(router && router->deactivating(cfg_.served_model_name) ? StopMode::Drain
+                                                                          : StopMode::Immediate);
 
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
@@ -3350,19 +3353,23 @@ int Engine::run_server(server::ModelRouter* router) {
         live->start();
     }
 
-    struct sigaction sa {};
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND;      /* a second one takes the default disposition and kills */
-    sigaction(SIGINT,  &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+    /* With a router the process owns the signals (main.cpp): this engine may be deactivated while
+     * the process runs on. */
+    if (!router) {
+        struct sigaction sa {};
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESETHAND;      /* a second one takes the default disposition and kills */
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
 
     std::atomic<bool> watching{true};
     std::thread watcher([&] {
         while (watching.load(std::memory_order_relaxed)) {
-            if (g_signalled.load(std::memory_order_relaxed)) {
+            if (!router && g_signalled.load(std::memory_order_relaxed)) {
                 RAD_INFO("stopping: draining in-flight requests");
-                if (router) router->stop(); else srv.stop();
+                srv.stop();
                 return;
             }
             /* The step loop died and its requests were already failed (Engine::fail_loop); stop
