@@ -67,6 +67,10 @@ Engine::Readback::~Readback() {
 Engine::~Engine() {
     stop_execution(StopMode::Immediate);
     if (group_) group_->leave(cfg_.served_model_name);
+    /* The expert heat outlives the runtime as plain metadata (rank 0: routing is the same on
+     * every rank), for the next activation's warmup. */
+    if (weight_store_ && !ranks_.empty() && ranks_[0])
+        weight_store_->save_heat(weight_model_id(), ranks_[0]->heat.export_profile());
     if (weight_store_) weight_store_->deactivate(weight_model_id());
 
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
@@ -2570,6 +2574,8 @@ int Engine::run_server(server::ModelRouter* router) {
                 /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
+                s.experts.early_routed          = (int64_t)hs.early_routed;
+                s.experts.early_routed_resident = (int64_t)hs.early_routed_resident;
 
             }
 

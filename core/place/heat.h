@@ -91,6 +91,10 @@ struct HeatParams {
      * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
      * container is ground truth), so the cost of an admission mistake is one future re-read. */
     float admit_heat = 8.0f;
+
+    /* The window of the early hit rate (HeatStats::early_routed), in steps: every layer is
+     * credited once a step, so it is early_steps * layers observe() calls. */
+    int early_steps = 64;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
@@ -120,6 +124,9 @@ struct HeatStats {
      * traffic, the cost promotions exist to avoid. Weighted by the histogram's `weight`, since a
      * draft head's histogram stands for several routing passes; the hit rate is unaffected. */
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
+    /* The same routed/resident pair, over only the first HeatParams::early_steps steps after
+     * init: the hit rate right after an activation, which a saved heat (ticket #20) should lift. */
+    uint64_t early_routed = 0, early_routed_resident = 0;
 };
 
 /* The live twin of HeatStats: every counter an atomic, so the HTTP thread's /stats and LiveView
@@ -132,6 +139,7 @@ struct HeatCounters {
     std::atomic<uint64_t> refused{0}, no_candidate{0};
     std::atomic<uint64_t> distinct_promoted{0}, readmits{0};
     std::atomic<uint64_t> routed{0}, routed_resident{0}, stream_bytes{0};
+    std::atomic<uint64_t> early_routed{0}, early_routed_resident{0};
 
     /* HeatEngine is copyable — place_test snapshots engines — so its counters must copy too.
      * A copy takes the current values: relaxed loads into the copy's own atomics. */
@@ -153,6 +161,10 @@ struct HeatCounters {
                               std::memory_order_relaxed);
         stream_bytes.store(o.stream_bytes.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
+        early_routed.store(o.early_routed.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        early_routed_resident.store(o.early_routed_resident.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
         return *this;
     }
 
@@ -169,6 +181,8 @@ struct HeatCounters {
         routed.store(0, std::memory_order_relaxed);
         routed_resident.store(0, std::memory_order_relaxed);
         stream_bytes.store(0, std::memory_order_relaxed);
+        early_routed.store(0, std::memory_order_relaxed);
+        early_routed_resident.store(0, std::memory_order_relaxed);
     }
 
     HeatStats snapshot() const {
@@ -184,6 +198,8 @@ struct HeatCounters {
         s.routed            = routed.load(std::memory_order_relaxed);
         s.routed_resident   = routed_resident.load(std::memory_order_relaxed);
         s.stream_bytes      = stream_bytes.load(std::memory_order_relaxed);
+        s.early_routed      = early_routed.load(std::memory_order_relaxed);
+        s.early_routed_resident = early_routed_resident.load(std::memory_order_relaxed);
         return s;
     }
 };
@@ -290,6 +306,11 @@ public:
      * dropped proposal leaves both units busy forever, with no counter to show it. */
     int step(std::vector<Swap>* out);
     void abandon(const Swap& s);
+
+    /* The heat of every routed expert as a profile (the container's form): `share` is the expert's
+     * fraction of all heat, zero-heat experts left out. Metadata only, no unit or address, so it
+     * outlives the Engine (ticket #20). Empty if the engine is not enabled. Call between steps. */
+    std::vector<RadFileProfile> export_profile() const;
 
     float heat(int32_t unit) const { return heat_[(size_t)pos_[(size_t)unit]]; }
     /* Resident units in this unit's layer: the tie-break every residency decision needs (see

@@ -423,7 +423,36 @@ void Planner::build_units(const Program& prog, Plan* p) {
             auto it = share.find(std::make_pair(mu.layer, mu.expert));
             if (it != share.end()) mu.profile_share = it->second;
         }
+        if (in_.warmup_budget_bytes > 0) cut_warmup(p);
     }
+}
+
+/* The profile is a deactivated model's saved heat (PlannerInput::warmup_budget_bytes): only its
+ * hottest experts within the byte budget keep their share, so they alone are placed ahead of the
+ * default order. The cut stops at the first expert that no longer fits, never skipping to a
+ * smaller, colder one. */
+void Planner::cut_warmup(Plan* p) const {
+    std::vector<MoveUnit*> hot;
+    for (MoveUnit& mu : p->units)
+        if (mu.expert >= 0 && mu.profile_share > 0.0f) hot.push_back(&mu);
+    std::stable_sort(hot.begin(), hot.end(), [](const MoveUnit* a, const MoveUnit* b) {
+        if (a->profile_share != b->profile_share) return a->profile_share > b->profile_share;
+        if (a->expert != b->expert) return a->expert < b->expert;
+        return a->layer < b->layer;
+    });
+    int64_t used = 0;
+    bool full = false;
+    for (MoveUnit* mu : hot) {
+        const int64_t slot = align_up(mu->bytes, RAD_ALIGN_UNIT);
+        if (!full && used + slot <= in_.warmup_budget_bytes) {
+            used += slot;
+            ++p->warmup_units;
+        } else {
+            full = true;
+            mu->profile_share = 0.0f;
+        }
+    }
+    p->warmup_bytes = used;
 }
 
 /* ------------------------------------------------------------------ slab classes */

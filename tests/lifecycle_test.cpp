@@ -11,6 +11,7 @@
 #include "engine.h"
 #include "tiny_model.h"
 #include "build/startup.h"
+#include "manifest.h"
 #include "model/weight_store.h"
 #include "place/group_planner.h"
 #include "runtime/collective_sequencer.h"
@@ -1202,9 +1203,11 @@ namespace {
 /* One Engine over the tiny checkpoint, started with `store`: its weight load report and its first
  * four greedy tokens. */
 std::vector<int32_t> activate_tiny(rad::Config cfg, rad::PreparedWeightStore& store,
-                                   rad::WeightLoadReport* rep) {
+                                   rad::WeightLoadReport* rep,
+                                   const rad::ModelRegistry* registry = nullptr) {
     cfg.served_model_name = "tiny";
     rad::Engine engine(std::move(cfg));
+    engine.set_registry(registry);
     engine.set_weight_store(&store);
     CHECK_EQ(engine.start(), RAD_OK);
     *rep = engine.weight_load_report();
@@ -1294,6 +1297,36 @@ TEST(a_second_activation_from_the_prepared_store_reads_no_checkpoint_bytes) {
     (void)activate_tiny(cfg, store, &released);
     CHECK(!released.warm);
     CHECK(released.source_read_bytes > 0);
+}
+
+/* Heat warmup (ticket #20) on a model with nothing to warm: a dense model has no routed experts,
+ * so its deactivation saves no heat; a saved heat that names experts it does not have, under a
+ * warmup budget, changes nothing -- the tokens are those of the activation without one. Without a
+ * manifest registry (a single model) the saved heat is not read at all. */
+TEST(a_warmup_budget_leaves_a_model_without_routed_experts_unchanged) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_warmup");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::PreparedWeightStore store;
+    rad::ModelRegistry registry;
+    registry.cache.warmup_budget_mib = 64;
+    const rad::Config cfg = tiny_config(dir.path, home);
+
+    rad::WeightLoadReport first, second, third;
+    const std::vector<int32_t> t1 = activate_tiny(cfg, store, &first, &registry);
+    CHECK_EQ(t1.size(), (size_t)4);
+    CHECK(store.heat("tiny").empty());
+
+    store.save_heat("tiny", { { 0, 3, 0.6f, 0.0f }, { 1, 5, 0.4f, 0.0f } });
+    const std::vector<int32_t> t2 = activate_tiny(cfg, store, &second, &registry);
+    CHECK(second.warm);
+    CHECK(t1 == t2);
+
+    const std::vector<int32_t> t3 = activate_tiny(cfg, store, &third);
+    CHECK(t1 == t3);
 }
 
 /* A host budget the model's weights do not fit under: the activation still succeeds and generates

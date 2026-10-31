@@ -44,6 +44,9 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#include "rad_format.h"
 
 namespace rad {
 
@@ -139,6 +142,14 @@ public:
     bool evict_one(const std::string& requester, bool include_active);
     HostMemoryStats stats() const;
 
+    /* ---- expert heat (ticket #20, docs/swap/heat-warmup.md) ----
+     * The model's expert heat at its deactivation, as a profile: layer, expert and share, no unit,
+     * slot or address. Kept apart from the weight entries, so evicting the weights (kalt) or a
+     * changed key leaves it; it is a few bytes per expert and not counted by the host budget. */
+    void save_heat(const std::string& model, std::vector<RadFileProfile> heat);
+    /* Empty if none was saved. */
+    std::vector<RadFileProfile> heat(const std::string& model) const;
+
 private:
     struct Buffer {
         std::unique_ptr<uint8_t, WeightBufferUnmap> data;
@@ -157,6 +168,7 @@ private:
     bool evict_locked(const std::string& requester, bool include_active);
     mutable std::mutex m_;
     std::unordered_map<std::string, Model> models_;
+    std::unordered_map<std::string, std::vector<RadFileProfile>> heat_;
     int64_t budget_ = 0;
     uint64_t clock_ = 0;
     HostMemoryStats stats_;

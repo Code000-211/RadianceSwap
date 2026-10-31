@@ -254,8 +254,33 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
 
     stats_.routed += (uint64_t)routed * passes;
     stats_.routed_resident += (uint64_t)resident * passes;
+    if (stats_.dispatches < (uint64_t)params_.early_steps * (uint64_t)n_layer_) {
+        stats_.early_routed += (uint64_t)routed * passes;
+        stats_.early_routed_resident += (uint64_t)resident * passes;
+    }
     stats_.stream_bytes += (uint64_t)miss * passes;
     ++stats_.dispatches;
+}
+
+std::vector<RadFileProfile> HeatEngine::export_profile() const {
+    std::vector<RadFileProfile> out;
+    if (!enabled_) return out;
+    double total = 0;
+    for (int32_t l = 0; l < n_layer_; ++l)
+        for (int32_t e = 0; e < n_ex_[(size_t)l]; ++e)
+            if (unit_at_[(size_t)(slot_lo_[(size_t)l] + e)] >= 0) total += heat_[(size_t)(slot_lo_[(size_t)l] + e)];
+    if (!(total > 0)) return out;
+    for (int32_t l = 0; l < n_layer_; ++l)
+        for (int32_t e = 0; e < n_ex_[(size_t)l]; ++e) {
+            const size_t q = (size_t)(slot_lo_[(size_t)l] + e);
+            if (unit_at_[q] < 0 || !(heat_[q] > 0)) continue;
+            RadFileProfile p{};
+            p.layer = l;
+            p.expert = e;
+            p.share = (float)((double)heat_[q] / total);
+            out.push_back(p);
+        }
+    return out;
 }
 
 void HeatEngine::set_tier(int32_t unit, Tier t) {

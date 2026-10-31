@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -4418,6 +4419,128 @@ TEST(a_pinned_resident_is_never_demoted) {
     for (int i = 0; i < 8; ++i) h.observe_ids(0, ids, counts, 1);
     Swap sw{};
     if (h.pick(&sw)) CHECK(sw.demote != pinned_u);
+}
+
+/* ---- ticket #20: heat warmup ---- */
+
+namespace {
+
+/* A dynamic plan of eight 1 MiB experts with room for three, planned from `prof` (null: cold) and
+ * `budget_mib` of warmup (0: the profile ranks every expert). */
+Plan plan_eight_experts(Fixture& f, const std::vector<RadFileProfile>* prof, int64_t budget_mib) {
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 6;      /* 1 MiB embedding + three experts + one shadow slot */
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, prof ? prof->data() : nullptr, prof ? (int64_t)prof->size() : 0};
+    in.warmup_budget_bytes = budget_mib * MiB;
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    return p;
+}
+
+std::vector<int> resident_experts(const Plan& p) {
+    std::vector<int> r;
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::VRAM) r.push_back(mu.expert);
+    return r;
+}
+
+}  /* namespace */
+
+/* The heat a deactivated engine leaves is the container's profile form: share per (layer, expert),
+ * the zero-heat experts left out, no unit index or address. */
+TEST(heat_exports_as_a_profile_and_a_plan_restarts_from_it) {
+    Fixture f;
+    std::vector<rad_weight> ex;
+    build_moe(f, 8, 1 * MiB, &ex);
+    const Plan cold = plan_eight_experts(f, nullptr, 0);
+    CHECK(cold.dynamic);
+    CHECK((resident_experts(cold) == std::vector<int>{0, 1, 2}));   /* expert-major: no profile */
+
+    HeatEngine h;
+    CHECK_OK(h.init(cold, HeatParams{}));
+    CHECK(h.enabled());
+    CHECK(h.export_profile().empty());                               /* nothing routed yet */
+    const int32_t ids[] = {7, 6, 5};
+    const int32_t counts[] = {30, 20, 10};
+    h.observe_ids(0, ids, counts, 3);
+
+    const std::vector<RadFileProfile> prof = h.export_profile();
+    CHECK_EQ(prof.size(), (size_t)3);
+    float total = 0;
+    for (const RadFileProfile& e : prof) total += e.share;
+    CHECK(total > 0.999f && total < 1.001f);
+    std::map<int, float> share;
+    for (const RadFileProfile& e : prof) { CHECK_EQ(e.layer, 0); share[e.expert] = e.share; }
+    CHECK(share.at(7) > share.at(6) && share.at(6) > share.at(5));
+
+    /* Every hot expert fits the budget: the next plan starts with them resident, unlike the cold
+     * one. */
+    const Plan warm = plan_eight_experts(f, &prof, 64);
+    auto r = resident_experts(warm);
+    std::sort(r.begin(), r.end());
+    CHECK((r == std::vector<int>{5, 6, 7}));
+    CHECK_EQ(warm.warmup_units, (int64_t)3);
+    CHECK_EQ(warm.warmup_bytes, 3 * MiB);
+}
+
+TEST(the_warmup_places_the_hottest_experts_and_never_passes_its_budget) {
+    Fixture f;
+    std::vector<rad_weight> ex;
+    build_moe(f, 8, 1 * MiB, &ex);
+    std::vector<RadFileProfile> prof;
+    for (int e = 0; e < 8; ++e) prof.push_back(RadFileProfile{0, e, 0.01f * (float)(e + 1), 0.0f});
+
+    for (int64_t budget : {1, 2, 3, 5}) {
+        const Plan p = plan_eight_experts(f, &prof, budget);
+        CHECK(p.warmup_bytes <= budget * MiB);
+        CHECK_EQ(p.warmup_units, std::min<int64_t>(budget, 8));
+        /* The experts the warmup ranks first are the hottest, 7 first; the room holds three. */
+        auto r = resident_experts(p);
+        std::sort(r.begin(), r.end());
+        std::vector<int> want;
+        for (int e = 8 - (int)std::min<int64_t>(budget, 3); e < 8; ++e) want.push_back(e);
+        for (int e = 0; (int)want.size() < 3; ++e) want.insert(want.begin() + e, e);   /* default order */
+        std::sort(want.begin(), want.end());
+        CHECK(r == want);
+    }
+
+    /* Smaller than one expert: nothing is warmed and the plan is the cold one. */
+    Config c = base_config();
+    const Plan none = plan_eight_experts(f, &prof, 0);   /* 0: the profile ranks everything */
+    CHECK_EQ(none.warmup_units, (int64_t)0);
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    in.warmup_budget_bytes = MiB / 2;
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 6;
+    c.host_pool_mib = 64;
+    Plan tiny;
+    CHECK_OK(Planner(in).plan(&tiny));
+    CHECK_EQ(tiny.warmup_units, (int64_t)0);
+    CHECK_EQ(tiny.warmup_bytes, (int64_t)0);
+    CHECK((resident_experts(tiny) == std::vector<int>{0, 1, 2}));
+}
+
+/* The early hit rate: routed and resident counts over only the first early_steps steps. */
+TEST(heat_counts_the_hit_rate_of_the_first_steps_apart) {
+    Fixture f;
+    std::vector<rad_weight> ex;
+    build_moe(f, 8, 1 * MiB, &ex);
+    const Plan p = plan_eight_experts(f, nullptr, 0);   /* experts 0, 1, 2 resident */
+    HeatEngine h;
+    HeatParams hp;
+    hp.early_steps = 2;                                 /* one layer: two observes */
+    CHECK_OK(h.init(p, hp));
+    const int32_t resident[] = {0}, streamed[] = {7}, late[] = {1};
+    h.observe_ids(0, resident, nullptr, 1);   /* in the window, a hit */
+    h.observe_ids(0, streamed, nullptr, 1);   /* in the window, a miss */
+    h.observe_ids(0, late, nullptr, 1);       /* past it, a hit */
+    const HeatStats s = h.stats();
+    CHECK_EQ(s.routed, (uint64_t)3);
+    CHECK_EQ(s.routed_resident, (uint64_t)2);
+    CHECK_EQ(s.early_routed, (uint64_t)2);
+    CHECK_EQ(s.early_routed_resident, (uint64_t)1);
 }
 
 TEST(the_draft_floor_charges_only_the_trunk) {

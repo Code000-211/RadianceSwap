@@ -208,6 +208,18 @@ void PreparedWeightStore::publish_state(const std::string& model) {
     listener_(model, prepared, prepared ? m->second.bytes : 0);
 }
 
+void PreparedWeightStore::save_heat(const std::string& model, std::vector<RadFileProfile> heat) {
+    std::lock_guard<std::mutex> lk(m_);
+    /* An engine that never routed leaves the earlier heat standing. */
+    if (!heat.empty()) heat_[model] = std::move(heat);
+}
+
+std::vector<RadFileProfile> PreparedWeightStore::heat(const std::string& model) const {
+    std::lock_guard<std::mutex> lk(m_);
+    const auto h = heat_.find(model);
+    return h == heat_.end() ? std::vector<RadFileProfile>{} : h->second;
+}
+
 void PreparedWeightStore::activate(const std::string& model) {
     std::lock_guard<std::mutex> lk(m_);
     models_[model].active = true;

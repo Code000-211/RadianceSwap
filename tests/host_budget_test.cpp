@@ -233,4 +233,36 @@ TEST(only_ram_backing_is_counted) {
     CHECK_EQ(s.stats().used(), (int64_t)0);
 }
 
+/* The expert heat of a deactivated model (ticket #20) is plain metadata: evicting the weights, a
+ * release or a load under another key leaves it, and a deactivation that routed nothing does not
+ * overwrite it. */
+TEST(saved_heat_outlives_the_eviction_of_the_weights) {
+    PreparedWeightStore s;
+    s.set_budget(10 * KiB);
+    CHECK(s.heat("a").empty());                                  /* never saved: as today */
+    CHECK(fill(s, "a", 6 * KiB));
+    const std::vector<RadFileProfile> hot = { { 3, 7, 0.75f, 0.0f }, { 3, 2, 0.25f, 0.0f } };
+    s.save_heat("a", hot);
+    CHECK(fill(s, "b", 6 * KiB));                                /* evicts a: kalt */
+    CHECK(!s.prepared("a"));
+    CHECK_EQ(s.stats().evicted_prepared, (int64_t)1);
+
+    const std::vector<RadFileProfile> got = s.heat("a");
+    CHECK_EQ(got.size(), (size_t)2);
+    CHECK_EQ(got[0].layer, 3);
+    CHECK_EQ(got[0].expert, 7);
+    CHECK_EQ(got[0].share, 0.75f);
+    CHECK_EQ(got[1].expert, 2);
+    CHECK(s.heat("b").empty());                                  /* per model */
+
+    s.save_heat("a", {});                                        /* nothing routed this time */
+    CHECK_EQ(s.heat("a").size(), (size_t)2);
+    s.release("a");
+    s.activate("a");
+    s.begin("a", "another key");
+    s.abort("a");
+    CHECK_EQ(s.heat("a").size(), (size_t)2);
+    CHECK_EQ(s.stats().used(), s.ram_bytes());                   /* the heat costs the budget nothing */
+}
+
 RAD_TEST_MAIN()

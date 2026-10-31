@@ -434,6 +434,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["readmits"]    = s.experts.readmits;
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
+            e["early_routed"]     = s.experts.early_routed;
+            e["early_routed_res"] = s.experts.early_routed_resident;
             e["dispatches"]  = s.experts.dispatches;
             e["refused"]     = s.experts.refused;
             e["no_candidate"] = s.experts.no_candidate;
