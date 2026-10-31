@@ -260,6 +260,40 @@ TEST(the_streamed_share_of_the_static_weights_is_in_status_and_metrics) {
     CHECK_EQ(f.status("a")["static_streamed_fraction"].get<double>(), 0.0);
 }
 
+/* Promoting streamed statics into VRAM (ticket #19): once the engine reports the live figures to the
+ * group planner, status and metrics show those, so the streamed share is seen falling to 0. */
+TEST(the_streamed_share_follows_the_engines_promotions) {
+    GroupPlanner group(0);          /* before the fleet: the router keeps a pointer to it */
+    Fleet f(0);
+    f.mr->set_group_planner(&group);
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    WeightLoadReport rep;
+    rep.static_bytes = 1000;
+    rep.static_streamed_bytes = 250;
+    f.mr->note_weight_load("a", rep);
+    (void)group.join("a", GroupFacts(1));
+    CHECK_EQ(f.status("a")["static_streamed_fraction"].get<double>(), 0.25);   /* nothing reported yet: the plan */
+
+    StaticFacts s;
+    s.total = 1000;
+    s.streamed = 100;
+    group.update_statics("a", 0, s);
+    json st = f.status("a");
+    CHECK_EQ(st["static_streamed_bytes"].get<int64_t>(), (int64_t)100);
+    CHECK_EQ(st["static_streamed_fraction"].get<double>(), 0.1);
+    CHECK(f.mr->metrics_text().find("radiance:model_static_streamed_fraction{model=\"a\"} 0.1") !=
+          std::string::npos);
+
+    s.streamed = 0;
+    group.update_statics("a", 0, s);
+    st = f.status("a");
+    CHECK_EQ(st["static_streamed_bytes"].get<int64_t>(), (int64_t)0);
+    CHECK_EQ(st["static_streamed_fraction"].get<double>(), 0.0);
+    CHECK_EQ(st["static_bytes"].get<int64_t>(), (int64_t)1000);
+    CHECK(f.mr->metrics_text().find("radiance:model_static_streamed_bytes{model=\"a\"} 0") !=
+          std::string::npos);
+}
+
 /* A model whose weights stay in the PreparedWeightStore is VORBEREITET after its deactivation,
  * its next activation is warm, and status and metrics tell the two kinds apart. */
 TEST(a_deactivated_model_with_prepared_weights_is_prepared_and_reactivates_warm) {

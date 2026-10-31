@@ -159,6 +159,9 @@ Grenzen:
   Antwort von `b` davor, dabei (16 bzw. 43 Anfragen am Stück) und danach ist Token für Token die der Referenz (alles
   auf der Karte, `b` allein).
 
+- `model_deactivation_test`: Status und Metriken folgen den Zahlen, die die Engine dem GroupPlanner meldet (der
+  gestreamte Anteil fällt auf 0), sonst gilt der Plan.
+
 ## GPU-Messung (#19)
 
 Siehe `gpu-acceptance.md` §11. Qwen3.5-0.8B (dicht), 2× R9700, TP=2, `--seqs 8`: `b` streamt, `a` wird im
