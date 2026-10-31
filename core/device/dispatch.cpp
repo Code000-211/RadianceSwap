@@ -141,6 +141,7 @@ namespace {
 struct Ledger {
     std::atomic<int64_t> bytes{0};
     std::atomic<int64_t> count{0};
+    std::atomic<int64_t> live{0};   /* handed out and not yet freed */
 };
 Ledger g_ledger[4];        /* indexed by RAD_MEM_*; rad_dev_alloc bounds the kind */
 
@@ -211,6 +212,11 @@ void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count) {
     }
     if (bytes) *bytes = g_ledger[kind].bytes.load(std::memory_order_relaxed);
     if (count) *count = g_ledger[kind].count.load(std::memory_order_relaxed);
+}
+
+int64_t rad_dev_live_allocs(int kind) {
+    return kind < 0 || kind >= (int)std::size(g_ledger)
+               ? 0 : g_ledger[kind].live.load(std::memory_order_relaxed);
 }
 
 int64_t rad_dev_live_events(void) { return g_live_events.load(std::memory_order_relaxed); }
@@ -422,6 +428,7 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     void* p = dev()->alloc(bytes, kind);
     if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger)) {
         rad::g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rad::g_ledger[kind].live.fetch_add(1, std::memory_order_relaxed);
         const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
         const int64_t floor_ = rad::trace_floor();
@@ -449,6 +456,8 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
 void  rad_dev_free(void* p, int kind) {
     /* The ledger counts allocations, not live bytes: rad_dev_free has no size. The engine frees
      * only at teardown, so the two agree while running. */
+    if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger))
+        rad::g_ledger[kind].live.fetch_sub(1, std::memory_order_relaxed);
     dev()->free(p, kind);
 }
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
@@ -659,6 +668,7 @@ void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
     if (p) {
         rad::g_ledger[RAD_MEM_HOST_MAPPED].bytes.fetch_add(bytes, std::memory_order_relaxed);
         rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
+        rad::g_ledger[RAD_MEM_HOST_MAPPED].live.fetch_add(1, std::memory_order_relaxed);
     }
     return p;
 }

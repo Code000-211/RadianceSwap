@@ -12,6 +12,7 @@
 #include "tiny_model.h"
 #include "build/startup.h"
 #include "place/group_planner.h"
+#include "runtime/collective_sequencer.h"
 
 #include <cstring>
 #include <filesystem>
@@ -961,6 +962,138 @@ TEST(host_engine_restart_lifecycle_generates_identical_tokens) {
     CHECK(tokens1 == tokens2);
 
     CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+}
+
+/* ================================================================== a failed bring-up rolls back */
+
+namespace {
+
+/* The allocations of every kind and the events still live. */
+struct DeviceLedger {
+    int64_t live[4] = {}, events = 0;
+    static DeviceLedger now() {
+        DeviceLedger l;
+        for (int k = 0; k < 4; ++k) l.live[k] = rad::rad_dev_live_allocs(k);
+        l.events = rad::rad_dev_live_events();
+        return l;
+    }
+    std::string str() const {
+        std::string o = "live allocations (device, pinned, host, mapped):";
+        for (int k = 0; k < 4; ++k) o += " " + std::to_string(live[k]);
+        return o + "; " + std::to_string(events) + " events";
+    }
+};
+
+rad::Config tiny_config(const std::string& model, const std::string& home) {
+    rad::Config cfg;
+    cfg.model = model;
+    cfg.radiance_home = home;
+    cfg.kernel_hierarchy = { "libavx" };
+    return cfg;
+}
+
+/* A bring-up failure at the step each case reaches: the engine is torn down by stop_execution (a
+ * no-op, nothing runs) and its destructor, twice over, and leaves nothing behind. */
+void check_failed_start_rolls_back(rad::Config cfg, const char* what) {
+    rad::GroupPlanner group(0);
+    cfg.served_model_name = "rollback";
+    const DeviceLedger before = DeviceLedger::now();
+    {
+        rad::Engine engine(std::move(cfg));
+        engine.set_group_planner(&group);
+        const int s = engine.start();
+        if (s >= 0) ::radtest::fail(__FILE__, __LINE__, std::string(what) + ": start() should fail");
+        CHECK(!engine.execution_running());
+        CHECK(engine.start_execution() < 0);   /* a failed engine does not run */
+        CHECK(!engine.execution_running());
+        CHECK_EQ(engine.stop_execution(rad::StopMode::Immediate), RAD_OK);
+        CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+        CHECK_EQ(rad::rad_tools_registry().n_instances(&engine), (size_t)0);
+    }
+    CHECK(group.target("rollback").empty());
+    CHECK_EQ(DeviceLedger::now().str(), before.str());
+    CHECK_EQ(rad::rad_collective_sequencer().active_engines(), (size_t)0);
+}
+
+}  /* namespace */
+
+/* start() fails at different steps -- a missing model, an unknown kernel library, a device count
+ * the host does not have, budgets nothing fits in -- and each time every partial allocation is
+ * back, the engine has left the group planner and the kernel registry holds none of its
+ * instances. */
+TEST(a_failed_start_releases_every_partial_allocation_at_every_step) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_rollback");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    {   /* One run to the end first: the process-wide state it loads is not the engine's. */
+        rad::Engine warm(tiny_config(dir.path, home));
+        REQUIRE(warm.start() == RAD_OK);
+    }
+
+    check_failed_start_rolls_back(tiny_config(dir.path + "/absent", home), "missing model");
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.radiance_home = dir.path;   /* no kernels, no architecture plugins */
+        check_failed_start_rolls_back(c, "no architecture plugin");
+    }
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.tp = 64;
+        check_failed_start_rolls_back(c, "more ranks than devices");
+    }
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.gpu_headroom_mib = int64_t(1) << 40;
+        check_failed_start_rolls_back(c, "headroom larger than the card");
+    }
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.max_seqs = int64_t(1) << 30;
+        check_failed_start_rolls_back(c, "a batch no step staging holds");
+    }
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.host_pool_mib = int64_t(1) << 40;
+        check_failed_start_rolls_back(c, "a host pool larger than the machine");
+    }
+    {
+        rad::Config c = tiny_config(dir.path, home);
+        c.max_ctx = int64_t(1) << 40;
+        check_failed_start_rolls_back(c, "a context no cache holds");
+    }
+}
+
+/* A started engine that never ran, one that ran, and one stopped twice: all three end with the
+ * same clean ledger, and tearing down again changes nothing. */
+TEST(teardown_after_a_complete_start_is_complete_and_repeatable) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_teardown");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+    {
+        rad::Engine warm(tiny_config(dir.path, home));
+        REQUIRE(warm.start() == RAD_OK);
+    }
+    const DeviceLedger before = DeviceLedger::now();
+    {
+        rad::Engine started_only(tiny_config(dir.path, home));
+        CHECK_EQ(started_only.start(), RAD_OK);
+    }
+    CHECK_EQ(DeviceLedger::now().str(), before.str());
+    {
+        rad::Engine engine(tiny_config(dir.path, home));
+        CHECK_EQ(engine.start(), RAD_OK);
+        CHECK_EQ(engine.start_execution(), RAD_OK);
+        CHECK_EQ(engine.stop_execution(rad::StopMode::Immediate), RAD_OK);
+        CHECK_EQ(engine.stop_execution(rad::StopMode::Immediate), RAD_OK);
+        CHECK_EQ(rad::rad_tools_registry().n_instances(&engine), (size_t)0);
+        CHECK_EQ(rad::rad_collective_sequencer().active_engines(), (size_t)0);
+    }
+    CHECK_EQ(DeviceLedger::now().str(), before.str());
 }
 
 RAD_TEST_MAIN()

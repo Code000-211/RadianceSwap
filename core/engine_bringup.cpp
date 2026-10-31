@@ -4129,6 +4129,7 @@ int Engine::start() {
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
     }
+    started_ = true;
     return RAD_OK;
 }
 

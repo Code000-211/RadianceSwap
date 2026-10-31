@@ -398,6 +398,9 @@ constexpr int kTapeOverlapRun = 6;
  * What rad_dev_alloc has handed out since process start, by RAD_MEM_* kind. It does not see a
  * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
+/* Allocations of `kind` handed out and not yet freed, process-wide: a teardown that frees
+ * everything it took brings it back to what it was. */
+int64_t rad_dev_live_allocs(int kind);
 
 /* Event handles created and not yet destroyed, process-wide. */
 int64_t rad_dev_live_events(void);
