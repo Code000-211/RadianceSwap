@@ -1560,7 +1560,7 @@ void Engine::loan_tick(bool idle) {
  * edits of a shrink or a regrow are published by the next step's table sync, never inside a
  * step, and a request in flight keeps running on whatever its experts' addresses are. */
 void Engine::group_tick(bool idle) {
-    if (!group_) return;
+    if (!group_ || ranks_.empty()) return;
     const uint64_t now = rad_mono_ns();
     if (now - group_last_ns_ < 100000000ull) return;    /* 100 ms */
     group_last_ns_ = now;
