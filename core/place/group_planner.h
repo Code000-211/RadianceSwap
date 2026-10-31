@@ -55,6 +55,20 @@
  * (update_held) and the planner recomputes; the first tick after a physical release raises the
  * taker's target, and its mover commits the pages (Mover::set_resident_cap).
  *
+ * ---- static weights (ticket #19, docs/swap/static-streaming.md) -------------------------------
+ *
+ * A model whose static weights did not fit streams them from the pinned pool (ticket #18), and
+ * every token reads them: far more surely than any expert. When the card has bytes free (a model
+ * was deactivated, an elastic slab or a cache gave pages back), they go to those models first,
+ * before any expert may grow into the same bytes (group_gate's `static_pending`). The model reports
+ * what promoting its remaining streamed statics would cost (StaticFacts::left), what it holds of
+ * them, and how busy it is; every engine reports the card's free bytes (update_free). Per rank,
+ * the free bytes less the grants not yet used (statics and experts) go to the busiest models first,
+ * each up to what it still streams (group_statics). A grant is a claim on free bytes only: the
+ * model's mover backs the pages, and a refused commit just waits (Mover::promote_statics). A
+ * grant already made stays reserved until the model holds it, so two takers never share bytes;
+ * promoted statics are never taken back.
+ *
  * ---- KV partitions (ticket #17, docs/swap/kv-lend.md) -------------------------------------------
  *
  * A model's KV partition is its pool's carve. When a partition needs more than it has, it claims
@@ -104,6 +118,17 @@ struct KvPartition {
     int64_t grown = 0;      /* bytes beyond the carve the pool has pages behind now (KVManager::chunks) */
 };
 
+/* One rank's static weights, as the engine reports them. All bytes are this rank's. `left` and
+ * `held` are VRAM costs (the committed span of each unit, Mover::static_cost); `streamed` and
+ * `total` are weight bytes, for status. Zero everywhere: nothing to promote or not reported. */
+struct StaticFacts {
+    int64_t left = 0;       /* what promoting every unit still streamed would take */
+    int64_t held = 0;       /* VRAM the promoted units hold (copies in flight included) */
+    int64_t streamed = 0;   /* weight bytes still read from the pinned pool */
+    int64_t total = 0;      /* all static weight bytes */
+    float   heat = 0.0f;    /* how busy the model is: 1 while it runs, cooling when idle */
+};
+
 /* One rank's side of an engine's report. */
 struct RankFacts {
     int64_t offer = 0;   /* expert bytes the single-engine resolver gave it: VramBudget::experts */
@@ -117,6 +142,7 @@ struct RankFacts {
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
     KvPartition kv;
+    StaticFacts statics;
 };
 using GroupFacts = std::vector<RankFacts>;   /* by rank */
 
@@ -129,6 +155,9 @@ struct RankBudget {
      * a claim waits for the bytes no member holds, and falls to `grown` or below when the claim
      * ends, which is the engine's cue to give chunks back. */
     int64_t kv_grow = 0;
+    /* The most VRAM, in StaticFacts::held's measure, its promoted statics may hold (group_statics):
+     * what it holds, the grants it has not used yet, and what it is newly granted. */
+    int64_t statics_cap = 0;
 };
 using GroupBudget = std::vector<RankBudget>;   /* by rank */
 
@@ -158,7 +187,20 @@ std::vector<GroupBudget> group_allocate(const std::vector<int64_t>& pool,
 std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
                                     const std::vector<GroupMember>& members,
                                     std::vector<GroupBudget> want,
-                                    const std::vector<GroupBudget>& prev);
+                                    const std::vector<GroupBudget>& prev,
+                                    const std::vector<int64_t>& static_pending = {});
+
+/* The streamed statics' share of the card's free bytes. `free[r]` is what rank r has free beyond
+ * the engines' floor; `prev` the budgets handed out last time (empty: none). Per rank, expert
+ * grants not yet used (an elastic member's last target above what it holds) and statics grants not
+ * yet used come off the free bytes first; the rest goes to the members with the highest
+ * StaticFacts::heat (ties: member order), each up to StaticFacts::left. Fills `statics_cap` of each
+ * member's budget in `budgets` (by member, by rank) and returns per rank the statics grants not yet
+ * used, which group_gate keeps experts from growing into. Never gives a member less than it holds. */
+std::vector<int64_t> group_statics(const std::vector<int64_t>& free,
+                                   const std::vector<GroupMember>& members,
+                                   const std::vector<GroupBudget>& prev,
+                                   std::vector<GroupBudget>* budgets);
 
 /* A running engine's expert plane as bins: its conditional units with a slab slot, by class and by
  * the power of two their heat is near. Without a heat engine running every unit has heat 0. `scale`
@@ -203,14 +245,22 @@ public:
     void update_held(const std::string& id, size_t rank, int64_t held, int64_t offer = -1);
     /* A rank's KV partition; targets are recomputed. Ignored for an unknown id or rank. */
     void update_kv(const std::string& id, size_t rank, const KvPartition& kv);
+    /* A rank's static weights (StaticFacts); targets are recomputed. Ignored for an unknown id or
+     * rank. */
+    void update_statics(const std::string& id, size_t rank, const StaticFacts& s);
+    /* The bytes rank `rank`'s card has free beyond the engines' floor, as the last engine to look
+     * measured them; targets are recomputed. */
+    void update_free(size_t rank, int64_t bytes);
     /* What the engine is entitled to now (empty when it is not registered). */
     GroupBudget target(const std::string& id) const;
 
     /* One rank of a member, for status and metrics: the target (bytes), what its slab has pages
-     * behind (held, the physical commit) and the offer the pool counts for it; and the KV
-     * partition's side (kv_target, kv_grown). */
+     * behind (held, the physical commit) and the offer the pool counts for it; its statics; and the
+     * KV partition's side (kv_target, kv_grown). */
     struct RankView {
-        int64_t target = 0, committed = 0, offer = 0; bool elastic = false;
+        int64_t target = 0, committed = 0, offer = 0;
+        bool elastic = false;
+        StaticFacts statics;   /* as last reported; all zero before the first report */
         int64_t kv_target = 0, kv_grown = 0;   /* the KV partition's claim beyond its carve, and what it has backed */
     };
     std::vector<RankView> view(const std::string& id) const;
@@ -225,6 +275,7 @@ private:
     std::vector<GroupBudget> granted_;   /* by member: what each started with */
     std::vector<GroupBudget> targets_;   /* by member */
     std::vector<int64_t>     pool_;      /* by rank */
+    std::vector<int64_t>     free_;      /* by rank: update_free */
     std::map<std::string, GroupBudget> given_;   /* by member: the last targets handed out (group_gate) */
 };
 

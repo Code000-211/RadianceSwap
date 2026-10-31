@@ -1604,9 +1604,38 @@ void Engine::group_tick(bool idle) {
         group_->update_held(id, i, held, offer);
     }
 
+    /* Streamed statics (ticket #19): the card's free bytes and what this engine still streams go to
+     * the group planner, which grants them before any expert may grow; the grant is carried out
+     * below. */
+    const int64_t floor = (int64_t)Config{}.gpu_headroom_mib << 20;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& r = *ranks_[i];
+        if (!r.mover.statics_promotable() || rad_dev_set(r.device) < 0) continue;
+        RadDeviceProps props{};
+        if (rad_dev_props(r.device, &props) < 0) continue;
+        StaticFacts sf;
+        sf.left = r.mover.static_remaining_cost();
+        sf.held = r.mover.static_promoted_cost();
+        sf.streamed = r.mover.static_streamed_bytes();
+        sf.total = r.mover.static_total_bytes();
+        sf.heat = idle ? cool : 1.0f;
+        group_->update_free(i, std::max<int64_t>(props.vram_free - floor, 0));
+        group_->update_statics(id, i, sf);
+    }
+
     const GroupBudget want = group_->target(id);
     for (size_t i = 0; i < ranks_.size() && i < want.size(); ++i) {
         Rank& r = *ranks_[i];
+        if (r.mover.statics_promotable() && rad_dev_set(r.device) >= 0) {
+            const int64_t before = r.mover.static_streamed_bytes();
+            const int st = r.mover.promote_statics(want[i].statics_cap);
+            if (st < 0) RAD_WARN("rank %d: promoting static weights: %s", r.index, rad_strerror(st));
+            else if (r.mover.static_streamed_bytes() != before)
+                RAD_INFO("group: '%s' rank %d: promoted static weights into VRAM; %s of %s still read "
+                         "from the pinned host pool", id.c_str(), r.index,
+                         humanb(r.mover.static_streamed_bytes()).c_str(),
+                         humanb(r.mover.static_total_bytes()).c_str());
+        }
         if (!r.heat.enabled()) continue;
         for (int32_t k : group_classes(r.plan)) {
             const int64_t cap = group_resident_cap(want[i], k);

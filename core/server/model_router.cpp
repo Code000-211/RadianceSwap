@@ -606,6 +606,19 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
     return c.attempt;
 }
 
+/* The static weights of an active model, and how many of those bytes the card does not hold. The
+ * load's plan states them at activation; once the engine promotes streamed units into VRAM
+ * (ticket #19) the group planner has the live figure, summed over ranks. */
+void ModelRouter::static_weights(const std::string& id, const WeightLoadReport& load, int64_t* total,
+                                 int64_t* streamed) const {
+    *total = load.static_bytes;
+    *streamed = load.static_streamed_bytes;
+    if (!group_) return;
+    int64_t t = 0, s = 0;
+    for (const auto& v : group_->view(id)) { t += v.statics.total; s += v.statics.streamed; }
+    if (t > 0) { *total = t; *streamed = s; }
+}
+
 /* The store's lock is taken before the router's: its eviction listener calls note_prepared. */
 std::string ModelRouter::status_json() const {
     const HostMemoryStats host = weights_ ? weights_->stats() : HostMemoryStats{};
@@ -648,12 +661,11 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
         /* RAM-Streaming: the share of the static weights this model reads from the pinned host
          * pool (ticket #18). Only while it is active: a deactivated model has no plan. */
         if (c.has_load && std::string(state) == "active") {
-            m["static_bytes"] = c.last_load.static_bytes;
-            m["static_streamed_bytes"] = c.last_load.static_streamed_bytes;
-            m["static_streamed_fraction"] =
-                c.last_load.static_bytes > 0
-                    ? (double)c.last_load.static_streamed_bytes / (double)c.last_load.static_bytes
-                    : 0.0;
+            int64_t total = 0, streamed = 0;
+            static_weights(id, c.last_load, &total, &streamed);
+            m["static_bytes"] = total;
+            m["static_streamed_bytes"] = streamed;
+            m["static_streamed_fraction"] = total > 0 ? (double)streamed / (double)total : 0.0;
         }
         if (c.has_load)
             m["last_weight_load"] = { { "kind", c.last_load.warm ? "warm" : "cold" },
@@ -775,11 +787,11 @@ std::string ModelRouter::metrics_text() const {
          "# TYPE radiance:model_static_streamed_fraction gauge\n";
     for (const auto& [id, c] : cold_) {
         if (!c.has_load || std::string(state_locked(id, c)) != "active") continue;
-        line("radiance:model_static_bytes", id, "", (double)c.last_load.static_bytes);
-        line("radiance:model_static_streamed_bytes", id, "", (double)c.last_load.static_streamed_bytes);
-        line("radiance:model_static_streamed_fraction", id, "",
-             c.last_load.static_bytes > 0
-                 ? (double)c.last_load.static_streamed_bytes / (double)c.last_load.static_bytes : 0.0);
+        int64_t total = 0, streamed = 0;
+        static_weights(id, c.last_load, &total, &streamed);
+        line("radiance:model_static_bytes", id, "", (double)total);
+        line("radiance:model_static_streamed_bytes", id, "", (double)streamed);
+        line("radiance:model_static_streamed_fraction", id, "", total > 0 ? (double)streamed / (double)total : 0.0);
     }
     static const char* const kinds[2] = { "cold", "warm" };
     o += "# HELP radiance:model_weight_loads_total Weight loads, warm (from the prepared store) or cold\n"

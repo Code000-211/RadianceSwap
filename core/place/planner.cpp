@@ -712,32 +712,38 @@ int Planner::assign_layer_offload(Plan* p) {
  *   decides alike (MoveUnit).
  * No staging ring in the slab and no second algorithm: tier and site are the planner's existing
  * axes. A unit the host pool cannot take is unfit; the file tier does not serve statics. */
-int Planner::assign_static_stream(Plan* p) {
+std::vector<int32_t> static_keep_order(const Program& prog, const Plan& p) {
     std::vector<int32_t> order;
-    for (int32_t i = 0; i < (int32_t)p->units.size(); ++i) {
-        MoveUnit& mu = p->units[(size_t)i];
-        if (mu.preplaced()) continue;
-        mu.tier = Tier::VRAM;
-        mu.site = Site::Device;
-        if (mu.access != RAD_ACCESS_CONDITIONAL) {
-            mu.movable = false;
-            order.push_back(i);
-        }
+    for (int32_t i = 0; i < (int32_t)p.units.size(); ++i) {
+        const MoveUnit& mu = p.units[(size_t)i];
+        if (!mu.preplaced() && mu.access != RAD_ACCESS_CONDITIONAL) order.push_back(i);
     }
     auto tier_of = [&](const MoveUnit& mu) {
         if (mu.draft_head) return 0;
-        if (mu.layer < 0 && !mu.weights.empty() && is_embedding_table(*in_.program, mu.weights.front()))
+        if (mu.layer < 0 && !mu.weights.empty() && is_embedding_table(prog, mu.weights.front()))
             return 4;
         if (access_strength(mu.access) < 4) return 3;
         return mu.layer < 0 ? 1 : 2;
     };
     auto use_of = [](const MoveUnit& mu) { return mu.first_use_op < 0 ? INT32_MAX : mu.first_use_op; };
     std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
-        const MoveUnit& ua = p->units[(size_t)a];
-        const MoveUnit& ub = p->units[(size_t)b];
+        const MoveUnit& ua = p.units[(size_t)a];
+        const MoveUnit& ub = p.units[(size_t)b];
         if (tier_of(ua) != tier_of(ub)) return tier_of(ua) < tier_of(ub);
         return use_of(ua) < use_of(ub);
     });
+    return order;
+}
+
+/* The card is filled first-fit in this order (static_keep_order); what does not fit is streamed. */
+int Planner::assign_static_stream(Plan* p) {
+    for (MoveUnit& mu : p->units) {
+        if (mu.preplaced()) continue;
+        mu.tier = Tier::VRAM;
+        mu.site = Site::Device;
+        if (mu.access != RAD_ACCESS_CONDITIONAL) mu.movable = false;
+    }
+    const std::vector<int32_t> order = static_keep_order(*in_.program, *p);
 
     int64_t used = 0;
     HostFall fall{0, p->host_budget, false};

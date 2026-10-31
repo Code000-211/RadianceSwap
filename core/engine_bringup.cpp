@@ -1890,9 +1890,11 @@ int Engine::plan() {
          * pool (vram_budget.h), so the pool must hold them, and with no card room left for any
          * expert, every expert too. The pool grows by what it lacks before the split, as for the
          * drafter above; the planner places within it. */
+        bool streams_statics = false;
         {
             VramBudget trial;
             if (vram_budget_trial(cfg_, facts, &trial) == RAD_OK && trial.statics_streamed > 0) {
+                streams_statics = true;
                 /* --deterministic has no stager, so a prefill would read the streamed statics over
                  * the link in place; ADR 0002 allows that only through the ring. */
                 if (cfg_.deterministic) {
@@ -1965,6 +1967,10 @@ int Engine::plan() {
                     gf[i].elastic = true;
                     weights_va_extra_[i] = (int64_t)8 << 40;   /* the arena: address space only (Pool::va_arena) */
                 }
+                /* A model that streams statics promotes them into the arena when the card has room
+                 * (Mover::promote_statics, docs/swap/static-streaming.md). */
+                if (shared && streams_statics && VMem::supported())
+                    weights_va_extra_[i] = (int64_t)8 << 40;
                 /* No heat yet: one cold bin for the plane. */
                 if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
             }

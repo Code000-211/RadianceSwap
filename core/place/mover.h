@@ -394,6 +394,8 @@ struct MoverStats {
      * trigger, not read (their weights are re-published to the layer buffer as a dummy
      * address for the pass, and nulled again with the staged units). */
     uint64_t ssd_skipped_units = 0, ssd_skipped_bytes = 0;
+    /* Streamed static weights copied into VRAM (Mover::promote_statics), ticket #19. */
+    uint64_t static_promotions = 0, static_promoted_bytes = 0;
 };
 
 /* The live twin of MoverStats: every counter an atomic. The mover writes these through the
@@ -419,6 +421,7 @@ struct MoverCounters {
     std::atomic<uint64_t> ssd_layers{0}, ssd_units{0}, ssd_read_bytes{0}, ssd_preads{0};
     std::atomic<uint64_t> ssd_read_ns{0}, ssd_wait_ns{0};
     std::atomic<uint64_t> ssd_skipped_units{0}, ssd_skipped_bytes{0};
+    std::atomic<uint64_t> static_promotions{0}, static_promoted_bytes{0};
 
     void reset() {
         /* Field by field: atomics are not copy-assignable. */
@@ -458,6 +461,8 @@ struct MoverCounters {
         ssd_wait_ns.store(0, std::memory_order_relaxed);
         ssd_skipped_units.store(0, std::memory_order_relaxed);
         ssd_skipped_bytes.store(0, std::memory_order_relaxed);
+        static_promotions.store(0, std::memory_order_relaxed);
+        static_promoted_bytes.store(0, std::memory_order_relaxed);
     }
 
     MoverStats snapshot() const {
@@ -498,6 +503,8 @@ struct MoverCounters {
         s.ssd_wait_ns       = ssd_wait_ns.load(std::memory_order_relaxed);
         s.ssd_skipped_units = ssd_skipped_units.load(std::memory_order_relaxed);
         s.ssd_skipped_bytes = ssd_skipped_bytes.load(std::memory_order_relaxed);
+        s.static_promotions = static_promotions.load(std::memory_order_relaxed);
+        s.static_promoted_bytes = static_promoted_bytes.load(std::memory_order_relaxed);
         return s;
     }
 };
@@ -712,6 +719,39 @@ public:
         return false;
     }
 
+    /* ---- promoting streamed static weights into VRAM (ticket #19, docs/swap/static-streaming.md)
+     *
+     * A static unit the plan left in the pinned pool (Plan::static_streamed_bytes) is read over the
+     * link on every token. promote_statics() copies such units into VRAM as the group planner
+     * grants room for them, in static_keep_order (the surest first), and publishes the new
+     * address; the unit's pool slot stays, so the host copy is still valid for any step that
+     * was issued before the publish and for the prefill ring of a unit not yet promoted.
+     *
+     * The room is fresh address space of the elastic weights pool (Pool::va_arena, never mapped
+     * twice: docs/swap/elastic-slab.md) backed by Pool::commit, so it exists physically only if the
+     * card has it free: a refused commit, or less than MoverConfig::grow_floor left, stops the
+     * burst and tries again later. Only the weights pool's arena is used, the plan's budget is not
+     * touched. Without an elastic weights pool (a single model, no VMem) nothing is promotable.
+     *
+     * Called between steps (Engine::group_tick), like set_resident_cap: the table edits are
+     * published by the next step's table sync, and a running request keeps the addresses it has.
+     * A promoted unit stays promoted until the engine ends; the pages go back to the card with the
+     * weights pool.
+     *
+     * `cap` is the most VRAM, in static_promoted_cost() units, the unit set may hold. A unit that
+     * does not fit the cap is skipped and smaller ones behind it may still fit. One call issues a
+     * burst (a commit costs the driver tens of microseconds a granule) and lands what finished. */
+    bool    statics_promotable() const { return promote_ok_; }
+    int     promote_statics(int64_t cap);
+    /* VRAM the promoted units hold, counting copies in flight (their pages are committed), and
+     * what promoting every unit still streamed would take. Both are the units' committed spans. */
+    int64_t static_promoted_cost() const { return promoted_cost_; }
+    int64_t static_remaining_cost() const { return remaining_cost_; }
+    /* Weight bytes still read from the pinned pool, and all static weight bytes (Plan::static_bytes),
+     * for status. */
+    int64_t static_streamed_bytes() const { return plan_ ? plan_->static_streamed_bytes - promoted_bytes_ : 0; }
+    int64_t static_total_bytes() const { return plan_ ? plan_->static_bytes : 0; }
+
     /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`.
      * The range runs to the pool's spare capacity: a shrunk resident is read from there. */
     int pool_ranges(uint64_t* lo, uint64_t* hi, uint64_t* stride, int max) const {
@@ -835,6 +875,9 @@ private:
          * slab slot and left there. Eviction is bookkeeping (kind Evict): re-tier to SSD, free
          * the slot, publish null — the container is ground truth. */
         bool    hot = false;
+        /* A static unit promoted out of the pinned pool (promote_statics): its address in the
+         * weights pool's arena. The pool slot is kept. */
+        char*   vram = nullptr;
     };
 
     /* One weight class's memory. Budgeted slots sit at a fixed stride from one base in the
@@ -948,6 +991,17 @@ private:
     int64_t static_bytes_ = 0;
     void*   pageable_ = nullptr;
     int64_t pageable_bytes_ = 0;
+
+    /* Static promotion (promote_statics). `static_order_` is static_keep_order; a record is one
+     * copy in flight, with the pages it was given. */
+    struct StaticCopy { int32_t unit = -1; char* dst = nullptr; int64_t cost = 0; RadEvent ev = nullptr; };
+    bool                      promote_ok_ = false;
+    std::vector<int32_t>      static_order_;
+    std::vector<StaticCopy>   static_copies_;
+    int64_t                   promoted_cost_ = 0, remaining_cost_ = 0, promoted_bytes_ = 0;
+    uint64_t                  promote_after_ns_ = 0;   /* a refused commit backs off until then */
+    /* The committed span of a unit: its bytes and the kernels' tail pad, in whole granules. */
+    static int64_t            static_cost(int64_t bytes);
 
     FileTier file_;
     void*    stage_ = nullptr;          /* pinned staging ring for file-tier reads */
