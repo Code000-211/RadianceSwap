@@ -38,8 +38,8 @@ bestimmt nur die Startresidenz.
 `HeatStats::early_routed` / `early_routed_resident` zählen geroutete bzw. residente Experts nur in den
 ersten `HeatParams::early_steps` (64) Steps nach dem Start der Engine. Sie stehen in `/stats` (Engine-
 Snapshot, `experts.early_routed`, `early_routed_res`) und als `early_hit=…%` im Live-View.
-Zu messen (GPU-Arbeit, hier nicht gelaufen): dasselbe Model mit `warmup_budget_mib: 0` und mit
-Budget deaktivieren/reaktivieren und `early_hit` vergleichen.
+Gemessen in [gpu-acceptance.md](gpu-acceptance.md): dasselbe Model mit `warmup_budget_mib: 0` und mit
+Budget deaktivieren/reaktivieren und `early_hit` vergleichen (83,45 % gegen 89,12 %).
 
 ## Grenzen
 

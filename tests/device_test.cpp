@@ -791,6 +791,17 @@ TEST(the_null_stream_is_refused) {
     CHECK(rad_stream_sync(nullptr) < 0);
 }
 
+/* A server that activates and deactivates models makes streams for ever (about 46 an activation);
+ * the old limit of 1024 ids ended a TP=2 server at its 23rd activation (docs/swap/gpu-acceptance.md). */
+TEST(a_process_can_make_more_streams_than_once_fitted_the_id_table) {
+    for (int i = 0; i < 1030; ++i) {
+        RadStream s = nullptr;
+        CHECK(rad_stream_create(&s, 0) >= 0);
+        if (!s) return;
+        rad_stream_destroy(s);
+    }
+}
+
 /* ------------------------------------------------------------------ the file tier */
 
 TEST(directfile_write_then_read_roundtrip) {

@@ -2,6 +2,8 @@
 #include "collective_sequencer.h"
 
 #include <algorithm>
+#include <chrono>
+#include <immintrin.h>
 
 namespace rad {
 
@@ -100,6 +102,19 @@ void CollectiveSequencer::cleanup_tickets_locked() {
     }
 }
 
+/* Spin before sleeping: the hand-off between the ranks of two engines is a few microseconds of
+ * work, and a condition-variable sleep and wake costs ~0.5 ms on this host, once per collective. */
+template <class Pred>
+static void wait_turn(std::condition_variable& cv, std::unique_lock<std::mutex>& lk, Pred pred) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+    while (!pred() && std::chrono::steady_clock::now() < until) {
+        lk.unlock();
+        for (int i = 0; i < 16; ++i) _mm_pause();
+        lk.lock();
+    }
+    cv.wait(lk, pred);
+}
+
 uint64_t CollectiveSequencer::before_collective(const void* owner, int rank, int world_size, RadStream stream) {
     if (is_single_engine() || rank < 0 || rank >= kMaxRanks) return 0;
 
@@ -118,12 +133,12 @@ uint64_t CollectiveSequencer::before_collective(const void* owner, int rank, int
             tickets_.push_back(TicketEntry{ ticket, owner });
             cv_.notify_all();
 
-            cv_.wait(lk, [&] {
+            wait_turn(cv_, lk, [&] {
                 return aborted_ || current_ticket_rank_[0] == ticket;
             });
             if (aborted_) return ticket;
         } else {
-            cv_.wait(lk, [&] {
+            wait_turn(cv_, lk, [&] {
                 if (aborted_) return true;
                 if (current_ticket_rank_[rank] >= next_ticket_) return false;
                 return ticket_owner_locked(current_ticket_rank_[rank]) == owner;

@@ -1,0 +1,6 @@
+{ "gpu_group": {"devices": [0,1], "tp": 2},
+  "cache": {"idle_timeout_ms": 400, "warmup_budget_mib": 0},
+  "models": [
+   {"id":"a","path":"/home/orca/models/Qwen3.5-0.8B","default":true,"engine":["--max-model-len","4096","--max-num-seqs","8"]},
+   {"id":"b","path":"/home/orca/models/Qwen3.5-0.8B","engine":["--max-model-len","2048","--max-num-seqs","4"]}
+  ]}

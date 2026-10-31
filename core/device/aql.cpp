@@ -630,7 +630,11 @@ struct Stream {
 /* Every queue this process has made, by an id that is never reused, so "packet i of queue n"
  * stays meaningful after the queue is destroyed. A destroyed queue's entry is null; everything
  * it held has been consumed. */
-constexpr uint32_t kMaxQueues = 1024;
+/* shortcut: ids are never reused, so a process ends its streams after kMaxQueues creations in all.
+ * An activation makes ~46 (most are hipMemset's temporary ones), so the old 1024 ended a TP=2
+ * server at its 23rd activation (docs/swap/gpu-acceptance.md); 1 Mi is 8 MiB of untouched BSS.
+ * Upgrade to generation-tagged ids if a process must outlive ~20 000 activations. */
+constexpr uint32_t kMaxQueues = 1u << 20;
 std::atomic<hsa_queue_t*> g_queue_by_id[kMaxQueues];
 std::atomic<uint32_t>     g_next_queue_id{0};
 
