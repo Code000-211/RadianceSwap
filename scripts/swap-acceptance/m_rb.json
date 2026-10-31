@@ -1,0 +1,7 @@
+{ "gpu_group": {"devices": [0,1], "tp": 2},
+  "cache": {"activation_backoff_ms": 2000, "activation_backoff_max_ms": 4000},
+  "models": [
+   {"id":"a","path":"/home/orca/models/Qwen3.5-0.8B","default":true,"engine":["--max-model-len","4096","--max-num-seqs","8"]},
+   {"id":"nomem","path":"/home/orca/models/Qwen3.5-0.8B","engine":["--max-model-len","2048","--gpu-headroom-mib","32300"]},
+   {"id":"badcfg","path":"/home/orca/models/Qwen3.8-Flash-Next-DFlash2","engine":["--max-model-len","2048"]}
+  ]}
