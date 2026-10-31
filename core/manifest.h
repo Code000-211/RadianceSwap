@@ -4,7 +4,8 @@
  *
  *   { "gpu_group": { "devices": [0, 1], "tp": 2 },
  *     "cache":     { "host_budget_mib": 0, "staging_budget_mib": 0, "idle_timeout_ms": 0,
- *                    "max_queued_requests": 0, "warmup_budget_mib": 0 },
+ *                    "max_queued_requests": 0, "warmup_budget_mib": 0,
+ *                    "activation_backoff_ms": 0, "activation_backoff_max_ms": 0 },
  *     "models": [ { "id": "a", "path": "/m/a.rad", "default": true,
  *                   "engine": ["--max-model-len", "8192"] } ] }
  *
@@ -15,7 +16,9 @@
  * their first request. Each has a fixed VRAM share, and the group planner (place/group_planner.h)
  * divides the experts between them inside those shares. `cache.max_queued_requests` bounds the
  * requests waiting for one cold model (0: 64), and `cache.idle_timeout_ms` is how long an active
- * model may go without a request before it is deactivated (0: never). The gpu_group section and
+ * model may go without a request before it is deactivated (0: never). A model whose activation
+ * failed is not tried again for `cache.activation_backoff_ms` (0: 1000), doubling with each failure
+ * in a row up to `cache.activation_backoff_max_ms` (0: 60000). The gpu_group section and
  * the other cache values are only parsed and checked here.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
@@ -43,6 +46,8 @@ struct ManifestCache {
     int64_t idle_timeout_ms = 0;
     int64_t max_queued_requests = 0;
     int64_t warmup_budget_mib = 0;
+    int64_t activation_backoff_ms = 0;
+    int64_t activation_backoff_max_ms = 0;
 };
 
 struct ModelRecord {

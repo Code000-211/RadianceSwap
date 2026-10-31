@@ -5,6 +5,11 @@
  * a fake model (scheduler, tokenizer, template, Server) after a delay the test controls, and
  * attaches it. Requests go through Router::dispatch, the call the transport makes, with the
  * client's `closed` callback where a test needs one.
+ *
+ * Ticket #11 (a failed activation is rolled back): the launcher can also take part in a fake
+ * bring-up of `kSteps` steps on `kRanks` ranks, each step holding one allocation, and fail (or
+ * throw) at any step of any rank. Its guard gives the allocations back on every way out, as
+ * ~Engine does, so a test sees what a failure at that step leaves held.
  */
 #include "server_fakes.h"
 
@@ -74,7 +79,19 @@ std::string header_of(const HttpResponse& r, const std::string& k) {
 
 /* Model "a" is active from the start; "b" and "c" are cold. Their launcher counts its calls, waits
  * for `gate` if one is set, returns `fail_rc` if that is negative, and otherwise serves a fake. */
+constexpr int kSteps = 4, kRanks = 2;
+
+/* Where the fake bring-up of model "b" fails: the step and rank (step -1: nowhere), with what
+ * status, or by throwing std::bad_alloc. */
+struct Injection {
+    int step = -1, rank = 0, rc = RAD_E_NOMEM;
+    bool throws = false;
+};
+
 struct Fleet {
+    /* Allocations the fake bring-ups hold, per rank. */
+    std::atomic<int> held[kRanks] = {};
+    Injection inject;
     ModelRegistry reg;
     Served a{ "a", "alpha" };
     std::atomic<int> launches{ 0 };
@@ -97,6 +114,20 @@ struct Fleet {
                 if (delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
                 if (gate) gate->wait();
                 if (fail_rc.load() < 0) return fail_rc.load();
+                struct Held {
+                    std::atomic<int>* n;
+                    int taken[kRanks] = {};
+                    ~Held() { for (int r = 0; r < kRanks; ++r) n[r] -= taken[r]; }
+                } hold{ held };
+                for (int step = 0; step < kSteps; ++step)
+                    for (int rank = 0; rank < kRanks; ++rank) {
+                        if (model == "b" && inject.step == step && inject.rank == rank) {
+                            if (inject.throws) throw std::bad_alloc();
+                            return inject.rc;
+                        }
+                        ++held[rank];
+                        ++hold.taken[rank];
+                    }
                 Served s(model, model == "b" ? "beta" : "gamma");
                 return mr->serve_model(model, s.srv.get());
             });
@@ -105,6 +136,13 @@ struct Fleet {
     /* The router must go before the models it serves. */
     ~Fleet() { mr.reset(); }
 
+    int held_total() const { int t = 0; for (int r = 0; r < kRanks; ++r) t += held[r].load(); return t; }
+    HttpResponse get(const std::string& path) {
+        HttpRequest q;
+        q.method = "GET";
+        q.path = path;
+        return mr->router().dispatch(std::move(q));
+    }
     HttpResponse post(const std::string& model, std::function<bool()> closed = nullptr) {
         HttpRequest q;
         q.method = "POST";
@@ -245,7 +283,9 @@ TEST(a_running_model_is_served_while_another_activates) {
 }
 
 TEST(a_failed_activation_is_reported_to_every_waiter_and_the_next_request_tries_again) {
-    Fleet f;
+    ActivationOptions act;
+    act.backoff_ms = 10;
+    Fleet f(act);
     Gate gate;
     f.gate = &gate;
     f.fail_rc = RAD_E_NOMEM;
@@ -267,6 +307,7 @@ TEST(a_failed_activation_is_reported_to_every_waiter_and_the_next_request_tries_
     CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
 
     f.fail_rc = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));   /* past the 10 ms backoff */
     CHECK_EQ(reply_of(f.post("b")), std::string("beta"));
     CHECK_EQ(f.launches.load(), 2);
     CHECK(f.state("b") == ModelState::Active);
@@ -307,6 +348,144 @@ TEST(stopping_releases_the_waiters_and_joins_the_activation) {
     gate.release();
     f.mr->join();
     CHECK_EQ(code_of(f.post("c")), std::string("server_stopping"));
+}
+
+/* ================================================================== rollback (ticket #11) */
+
+TEST(a_failure_at_every_step_of_every_rank_releases_what_was_taken_and_spares_the_other_models) {
+    for (int step = 0; step < kSteps; ++step)
+        for (int rank = 0; rank < kRanks; ++rank) {
+            Fleet f;
+            f.inject = { step, rank, RAD_E_NOMEM, false };
+            const std::string at = "step " + std::to_string(step) + " rank " + std::to_string(rank);
+            HttpResponse waiter;
+            std::thread t([&] { waiter = f.post("b"); });
+            CHECK(eventually([&] { return f.launches.load() == 1; }));
+            t.join();
+            CHECK_EQ(waiter.status, 503);
+            CHECK_EQ(code_of(waiter), std::string("model_activation_failed"));
+            CHECK(waiter.body.find("out of memory") != std::string::npos);
+            /* The Launcher returned before the model was marked failed: nothing is still held. */
+            CHECK_EQ(f.held_total(), 0);
+            CHECK(f.state("b") == ModelState::Failed);
+            /* The model that was active is untouched, and a third one activates beside the failure. */
+            CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+            CHECK(f.state("a") == ModelState::Active);
+            CHECK_EQ(reply_of(f.post("c")), std::string("gamma"));
+            CHECK_EQ(f.held_total(), kSteps * kRanks);   /* only c's resources are held */
+            CHECK(!f.mr->unhealthy());
+            if (f.held_total() != kSteps * kRanks) ::radtest::fail(__FILE__, __LINE__, at);
+            f.mr->stop();
+            f.mr->stop();
+            f.mr->join();
+            f.mr->join();
+            CHECK_EQ(f.held_total(), 0);   /* and stopping releases those */
+        }
+}
+
+TEST(a_launcher_that_throws_is_a_failed_activation_not_the_end_of_the_process) {
+    Fleet f;
+    f.inject = { 2, 1, RAD_E_NOMEM, true };
+    const HttpResponse r = f.post("b");
+    CHECK_EQ(r.status, 503);
+    CHECK_EQ(code_of(r), std::string("model_activation_failed"));
+    CHECK_EQ(f.held_total(), 0);
+    CHECK(f.state("b") == ModelState::Failed);
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+}
+
+TEST(a_failed_model_is_not_tried_again_before_its_backoff_which_doubles_to_a_maximum) {
+    ActivationOptions act;
+    act.backoff_ms = 200;
+    act.backoff_max_ms = 400;
+    Fleet f(act);
+    f.inject = { 1, 0, RAD_E_NOMEM, false };
+    CHECK_EQ(code_of(f.post("b")), std::string("model_activation_failed"));   /* failure 1: 200 ms */
+    CHECK_EQ(f.launches.load(), 1);
+
+    /* Inside the backoff: refused at once, with the wait left, and no attempt started. */
+    const auto t0 = std::chrono::steady_clock::now();
+    const HttpResponse r = f.post("b");
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(150));
+    CHECK_EQ(r.status, 503);
+    CHECK_EQ(code_of(r), std::string("model_activation_backoff"));
+    CHECK(!header_of(r, "Retry-After").empty());
+    CHECK(std::stoi(header_of(r, "Retry-After")) >= 1);
+    CHECK_EQ(f.launches.load(), 1);
+    CHECK(f.state("b") == ModelState::Failed);
+    const json st = json::parse(f.mr->status_json());
+    CHECK_EQ(st["data"][0]["state"].get<std::string>(), std::string("failed"));
+    CHECK(st["data"][0]["retry_after_seconds"].get<int>() >= 1);
+    CHECK_EQ(st["data"][0]["activation_failures"].get<int>(), 1);
+    /* Another model does not wait for it. */
+    CHECK_EQ(reply_of(f.post("c")), std::string("gamma"));
+    CHECK_EQ(f.launches.load(), 2);   /* b's first attempt and c's only one */
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(260));   /* past 200 ms */
+    CHECK_EQ(code_of(f.post("b")), std::string("model_activation_failed"));   /* failure 2: 400 ms */
+    CHECK_EQ(f.launches.load(), 3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));   /* 200 would have passed, 400 has not */
+    CHECK_EQ(code_of(f.post("b")), std::string("model_activation_backoff"));
+    CHECK_EQ(f.launches.load(), 3);
+
+    f.inject.step = -1;                                            /* the fault is gone */
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));   /* past 400 ms */
+    CHECK_EQ(reply_of(f.post("b")), std::string("beta"));
+    CHECK_EQ(f.launches.load(), 4);
+    CHECK(f.state("b") == ModelState::Active);
+    CHECK(json::parse(f.get("/radiance/models").body)["healthy"].get<bool>());
+}
+
+TEST(a_device_error_makes_the_group_unhealthy_with_no_retry_and_no_further_activation) {
+    Fleet f;
+    f.inject = { 2, 1, RAD_E_DEVICE, false };
+    Gate gate;
+    f.gate = &gate;
+    const int n = 3;
+    std::vector<std::thread> ts;
+    std::vector<HttpResponse> got((size_t)n);
+    for (int i = 0; i < n; ++i) ts.emplace_back([&, i] { got[(size_t)i] = f.post("b"); });
+    REQUIRE(eventually([&] { return f.mr->queued("b") == n; }));
+    gate.release();
+    for (auto& t : ts) t.join();
+    for (const HttpResponse& r : got) {
+        CHECK_EQ(r.status, 503);
+        CHECK_EQ(code_of(r), std::string("gpu_group_unhealthy"));
+        CHECK(header_of(r, "Retry-After").empty());   /* waiting does not help */
+    }
+    CHECK_EQ(f.held_total(), 0);   /* rolled back all the same */
+    CHECK(f.mr->unhealthy());
+
+    /* No retry loop, and no activation of another model: every new request is refused. */
+    for (const char* model : { "b", "c" }) {
+        const HttpResponse r = f.post(model);
+        CHECK_EQ(r.status, 503);
+        CHECK_EQ(code_of(r), std::string("gpu_group_unhealthy"));
+    }
+    CHECK_EQ(code_of(f.post("a")), std::string("gpu_group_unhealthy"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_EQ(f.launches.load(), 1);
+    CHECK(f.state("c") == ModelState::Cold);
+    f.mr->activate("c");
+    CHECK_EQ(f.launches.load(), 1);
+
+    /* The probe says so, and the scrape and the status carry it. */
+    const HttpResponse health = f.get("/health");
+    CHECK_EQ(health.status, 503);
+    CHECK(health.body.find("unhealthy") != std::string::npos);
+    CHECK(f.get("/metrics").body.find("radiance:gpu_group_healthy 0") != std::string::npos);
+    const json st = json::parse(f.get("/radiance/models").body);
+    CHECK(!st["healthy"].get<bool>());
+    CHECK(st["unhealthy_reason"].get<std::string>().find("device error") != std::string::npos);
+}
+
+TEST(a_failure_that_is_not_a_device_error_leaves_the_group_healthy) {
+    Fleet f;
+    f.inject = { 0, 0, RAD_E_NOMEM, false };
+    CHECK_EQ(code_of(f.post("b")), std::string("model_activation_failed"));
+    CHECK(!f.mr->unhealthy());
+    CHECK_EQ(f.get("/health").status, 200);
+    CHECK(f.get("/metrics").body.find("radiance:gpu_group_healthy 1") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

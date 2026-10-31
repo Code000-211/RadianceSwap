@@ -115,12 +115,15 @@ bool read_group(const json& j, const Config& base, ModelRegistry* out, int* tp) 
 bool read_cache(const json& j, ManifestCache* c) {
     if (!j.is_object()) { RAD_ERR("manifest: cache must be an object"); return false; }
     if (!only_keys(j, { "host_budget_mib", "staging_budget_mib", "idle_timeout_ms",
-                        "max_queued_requests", "warmup_budget_mib" }, "cache"))
+                        "max_queued_requests", "warmup_budget_mib", "activation_backoff_ms",
+                        "activation_backoff_max_ms" }, "cache"))
         return false;
     struct { const char* key; int64_t* field; } const fields[] = {
         { "host_budget_mib", &c->host_budget_mib }, { "staging_budget_mib", &c->staging_budget_mib },
         { "idle_timeout_ms", &c->idle_timeout_ms }, { "max_queued_requests", &c->max_queued_requests },
         { "warmup_budget_mib", &c->warmup_budget_mib },
+        { "activation_backoff_ms", &c->activation_backoff_ms },
+        { "activation_backoff_max_ms", &c->activation_backoff_max_ms },
     };
     for (const auto& f : fields) {
         if (!j.contains(f.key)) continue;

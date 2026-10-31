@@ -14,8 +14,18 @@
  * most `max_queued` waiters per model (429 beyond it), a deadline (503), and the client leaving
  * (`closed`, which frees the place and leaves the activation running for the next request). The
  * model is active once its Server is attached, which the Launcher does by serving the model once
- * its Engine is ready on every rank. A Launcher that returns before attaching has failed: its
- * waiters get a 503 naming the status, and the next request starts a new attempt.
+ * its Engine is ready on every rank. A Launcher that returns before attaching has failed (or threw:
+ * the router turns an exception into a status), and by then it has destroyed its Engine, which
+ * released every partial allocation on every rank (Engine::~Engine). The model is FEHLGESCHLAGEN,
+ * its waiters get a 503 naming the status, and the other models are not touched. A failed model is
+ * tried again only after a backoff that doubles with each failure in a row (`backoff_ms`, up to
+ * `backoff_max_ms`; a success resets it): a request inside it gets a 503 at once, with a
+ * Retry-After for what is left, and no attempt is started.
+ *
+ * A Launcher that fails with RAD_E_DEVICE (a card refused or faulted) makes the whole GPU group
+ * unhealthy (ticket #11): no activation is started again, no retry, and every new request is a 503
+ * `gpu_group_unhealthy`; /health answers 503, and /metrics and /radiance/models report it. A
+ * generation already running is not cut. The state ends with the process.
  *
  * Deactivation (ticket #10): with `idle_timeout_ms` set, a monitor thread (started by run(), once
  * the listener is up) deactivates an active model that has had no request for that long. It is idle when no request is between the route
@@ -36,6 +46,7 @@
 
 #include "http.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -63,6 +74,9 @@ struct ActivationOptions {
     int64_t wait_ms = 600000;      /* how long a request waits for its model */
     int     retry_after_s = 1;
     int64_t idle_timeout_ms = 0;   /* idle time after which an active model is deactivated; 0: never */
+    static constexpr int64_t kDefaultBackoffMs = 1000, kDefaultBackoffMaxMs = 60000;
+    int64_t backoff_ms = 0;        /* wait after the first failed activation of a model; 0: 1 s */
+    int64_t backoff_max_ms = 0;    /* the doubling stops here; 0: 60 s */
 };
 
 class ModelRouter {
@@ -74,6 +88,9 @@ public:
         : default_id_(std::move(default_id)), n_models_(n_models), registry_(registry),
           act_(act) {
         if (act_.max_queued <= 0) act_.max_queued = ActivationOptions::kDefaultMaxQueued;
+        if (act_.backoff_ms <= 0) act_.backoff_ms = ActivationOptions::kDefaultBackoffMs;
+        if (act_.backoff_max_ms <= 0) act_.backoff_max_ms = ActivationOptions::kDefaultBackoffMaxMs;
+        act_.backoff_max_ms = std::max(act_.backoff_max_ms, act_.backoff_ms);
         router_.get("/radiance/models", [this](const HttpRequest&) {
             return HttpResponse::json_body(200, status_json());
         });
@@ -99,6 +116,8 @@ public:
     std::string status_json() const;
     /* Prometheus text (radiance:model_*), appended to the default model's /metrics. */
     std::string metrics_text() const;
+    /* Whether a device error has made the GPU group unhealthy (see above). */
+    bool unhealthy() const;
 
     /* The process's routes: those of the first attached Server (every Server registers the same
      * table), each resolving the request's model first. Complete once n_models are attached. */
@@ -133,6 +152,9 @@ private:
         int64_t       waiters = 0;
         int64_t       users = 0;        /* requests between the route lookup and their dispatch's end */
         uint64_t      attempt = 0, failed_attempt = 0;
+        int64_t       failures = 0;     /* in a row: the backoff's exponent; reset by an activation */
+        int64_t       failures_total = 0;
+        Clock::time_point retry_at;     /* a failed model is not tried again before this */
         std::string   error;
         Clock::time_point began;        /* of the activation or deactivation under way */
         Clock::time_point busy_at;      /* the last time the model was seen in use */
@@ -152,6 +174,11 @@ private:
      * router answers itself, so they never activate a model. */
     HttpResponse answer_unattached(const HttpRequest& q) const;
     std::string status_json_locked() const;
+    /* What a request gets while the group is unhealthy: the probes and the scrape are answered,
+     * everything else is refused. Under m_ for the reason only. */
+    HttpResponse answer_unhealthy(const HttpRequest& q) const;
+    /* Whole seconds (at least 1) until `c` may be tried again. */
+    static int retry_in_s(const Cold& c);
 
     const std::string default_id_;
     const size_t      n_models_;
@@ -165,6 +192,8 @@ private:
     std::map<std::string, Server*> servers_;
     std::map<std::string, Cold>    cold_;
     bool stopped_ = false, stop_done_ = false, serving_ = false, routes_added_ = false;
+    bool unhealthy_ = false;
+    std::string unhealthy_reason_;
     std::thread idle_thread_;
 };
 

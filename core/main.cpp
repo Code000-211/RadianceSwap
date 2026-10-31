@@ -28,6 +28,9 @@ std::atomic<bool> g_signalled{false};   /* set by the SIGINT/SIGTERM handler, re
  * (server/model_router.h). Only the default model is started here; the others are cold and the
  * router starts them on their first request, each on its own activation thread. A model idle for
  * `cache.idle_timeout_ms` is deactivated (0: never), the default one too, and its Engine destroyed.
+ * An activation that fails returns from its Launcher with the Engine destroyed (every partial
+ * allocation released); the router backs the model off and, for a device error, marks the whole
+ * group unhealthy.
  * The registry and the router belong to the process; an Engine belongs to the thread that serves
  * it and is destroyed when that thread returns.
  *
@@ -119,6 +122,8 @@ static int serve_manifest(rad::ModelRegistry& registry) {
     rad::server::ActivationOptions act;
     act.max_queued = registry.cache.max_queued_requests;
     act.idle_timeout_ms = registry.cache.idle_timeout_ms;
+    act.backoff_ms = registry.cache.activation_backoff_ms;
+    act.backoff_max_ms = registry.cache.activation_backoff_max_ms;
     rad::server::ModelRouter router(default_id, 1, &registry, act);
     router_ptr = &router;
 
@@ -136,7 +141,16 @@ static int serve_manifest(rad::ModelRegistry& registry) {
             const bool startup = is_default && !default_started.exchange(true);
             std::unique_ptr<rad::Engine> e;
             int dump_rc = 0;
+            const int64_t free_before = free_mib(models[i].config.tp);
             const int s = build(i, startup, &e, &dump_rc);
+            if (s < 0) {
+                /* build() has destroyed the Engine, and with it every partial allocation. */
+                const int64_t free_after = free_mib(models[i].config.tp);
+                if (free_before >= 0 && free_after >= 0)
+                    RAD_INFO("model '%s': the failed activation is rolled back; the group's tightest "
+                             "card has %lld MiB free (%lld MiB before it began)", id.c_str(),
+                             (long long)free_after, (long long)free_before);
+            }
             if (s != 0) {
                 if (startup) {
                     if (s < 0) serve_failed = true;

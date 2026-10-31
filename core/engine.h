@@ -154,6 +154,9 @@ private:
      * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    /* start() ran to its end, so every rank is fully built; start_execution refuses otherwise. A
+     * failed start() leaves ranks_ part built, for ~Engine to release. */
+    bool started_ = false;
     /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
      * cannot reach each rank's manager. */
     std::vector<std::vector<const RadKVStream*>> rank_stream_views_;

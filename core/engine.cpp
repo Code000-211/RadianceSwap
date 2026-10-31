@@ -107,6 +107,9 @@ Engine::~Engine() {
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
+    /* The scheduler's step staging (slab per rank, pinned ring, events): start_execution made it,
+     * and nothing else frees it. After the contexts, whose streams read it. */
+    sched_.fini();
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */
     for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
@@ -1792,10 +1795,12 @@ void Engine::clear_fresh_states() {
 
 int Engine::start_execution() {
     if (execution_running_.load(std::memory_order_acquire)) return RAD_OK;
-    if (ranks_.empty()) {
-        RAD_ERR("start_execution: start() has not run, or stopped at --debug-graph");
+    if (!started_) {
+        RAD_ERR("start_execution: start() has not run, failed, or stopped at --debug-graph");
         return RAD_E_STATE;
     }
+    /* A restart: the staging of the run before is released, not leaked under the new one. */
+    sched_.fini();
 
     /* If Ctx was shut down by a previous stop_execution(), re-initialise instances and Ctx */
     if (!ranks_[0]->ctx.program()) {
