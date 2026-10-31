@@ -70,6 +70,11 @@ aktiv; `a_failed_start_releases_every_partial_allocation_at_every_step`: ein Hos
 `a` bleibt aktiv, keine Druck-Deaktivierung). GPU-Nachweis (`a` MoE aktiv + `b` MoE streamend, kein Exit 137):
 `scripts/swap-acceptance/host_budget_stream.py`.
 
+GPU-Nachweis (2× R9700, 170 GiB RAM, siehe `gpu-acceptance.md` §13): `a` = MoE mit 73 GiB Pool + 67 GiB Store-Kopie,
+`b` = dasselbe MoE, streamt 56 %. Ohne Budget: `b` wird zugelassen (200), nachdem die Store-Kopie des aktiven `a`
+verdrängt wurde; Spitze 154,6 GiB belegt, MemAvailable nie unter 16 GiB. Mit Budget = Pools von `a` + 256 MiB:
+503 `not enough host memory`, `b` `failed`, `a` antwortet unverändert. Kein Exit 137.
+
 ## Page-Cache ist kein RAM-Backing
 
 Nur anonymer Speicher des Prozesses wird gebucht. Mapped-Tier, File-Tier und Container-Reads über den
