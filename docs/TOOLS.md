@@ -945,6 +945,38 @@ scripts/cardclock.py --compare before.json after.json
 | `mctrace.sh` | a MiniCPM5-2B decode trace under `rocprofv3`, formatted for `libr4d/isa/tsum.sh` |
 | `oracle.sh` | every op compared against libref on the operands the model issued. Read it for MISMATCH lines and for the NOT CHECKED lines that name what cannot be compared. `OPS` `MAXN` `FROM`/`TO` `TOL` `M` |
 
+### Measuring several models in one process
+
+`scripts/swap-acceptance/` is the harness of the multi-model acceptance (GUIDE §4.12,
+[swap/gpu-acceptance.md](swap/gpu-acceptance.md)): it drives a server started with `--manifest`.
+It expects the build under the source tree's `build/` (with `build/radiance_home`) and a scratch
+directory `$T21` (default `/tmp/swap-acceptance`, which must exist). The manifests (`m_*.json`) hold the paths of the machine they were
+measured on (`/root/models/...`, `/home/orca/models/...`); edit them before use. The port is 18080.
+
+| | |
+|---|---|
+| `start.sh LOG TIMEOUT args…` | starts `build/bin/radiance --port 18080 args…` in the background under `timeout`, waits up to 10 minutes for `/health` and prints the pid. Refuses when any `radiance` is already running |
+| `stop.sh PID` | SIGTERM, waits for the process to end, prints the VRAM left (`rocm-smi`) |
+| `m_dd.json`, `m_dm.json`, `m_mm.json`, `m_cyc.json`, `m_rb.json`, `m_pr.json` | manifests: dense + dense, dense + MoE, two MoE, 120 cycles, rollback (a model that cannot fit, one with a bad container), VRAM pressure (`max_active_models` 2 of 3) |
+| `mk_heat.py BUDGET` | writes `m_heat<BUDGET>.json`, one MoE with `cache.warmup_budget_mib` BUDGET |
+| `gen.py PORT MODEL OUT` | greedy completions over six fixed prompts into a JSON file: text and token ids, to compare a manifest run with a `--model` run |
+| `feat.py PORT MODEL OUT` | seeded sampling, streaming, a long prompt and a client that drops mid-stream |
+| `bench.py PORT MODEL[,MODEL2] [PREFILL_TOKENS]` | one sequence, eight sequences (aggregate) and a prefill; with two models the same loads run on both at once |
+| `cycles.py N PID [MODE]` | N activate/deactivate cycles; `MODE` is a string of model ids, one letter each, taken in turn (default `ab`); after each, waits until all are deactivated and samples VRAM (`rocm-smi`), host RSS, threads, file descriptors and the activation time. A leak shows as a series that rises |
+| `grp.py MODEL SECONDS` | eight clients on one model for SECONDS, then the expert counters from `/stats` (does the other model's mover move?) |
+| `heat.py PHASE` | the topic workload on model `moe`, then `early_hit` from `/stats` |
+
+```sh
+export T21=/tmp/swap-acceptance; mkdir -p $T21
+scripts/swap-acceptance/start.sh $T21/dd.log 900 --manifest scripts/swap-acceptance/m_dd.json --tp 2
+python3 scripts/swap-acceptance/bench.py 18080 a,b
+curl -s localhost:18080/radiance/models | jq '.data[] | {id, state, activation_seconds, last_weight_load}'
+scripts/swap-acceptance/stop.sh $(cat $T21/pid)
+```
+
+`start.sh` needs the cards free and stops at once if a `radiance` runs. `cycles.py`, `grp.py` and `heat.py`
+assume port 18080; `gen.py`, `feat.py` and `bench.py` take the port.
+
 ### Regression checks against a live server
 
 These cover what `tests/chat_test.cpp` cannot: the server, the wire format and a real model's
