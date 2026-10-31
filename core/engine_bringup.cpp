@@ -22,6 +22,7 @@
 #include "format/table_share.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "model/weight_store.h"
 #include "place/group_planner.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
@@ -2137,6 +2138,11 @@ struct StagedWeight {
     /* A checkpoint weight has no sweep: the worker fills its input from the mapped tensors
      * itself, so reads run on all workers in parallel. */
     std::function<int(uint8_t* in)> fill;
+    /* A prepared weight (PreparedWeightStore): its stored form, uploaded as it is. It has no input
+     * and no sweep, and is queued at once. */
+    const uint8_t* warm = nullptr;
+    /* A weight the store does not hold yet: the stored form is also copied here, for the store. */
+    uint8_t* cap = nullptr;
 };
 
 class RelayoutPool {
@@ -2372,7 +2378,7 @@ private:
                 continue;
             }
             StagedWeight& s = items_[(size_t)i];
-            if (!failed_) input(i);
+            if (!failed_ && !s.warm) input(i);
             const int st = failed_ ? RAD_E_STATE : run(s, b);
             if (s.own) { delete[] s.in; s.in = nullptr; s.own = false; }
             std::lock_guard<std::mutex> lk(mu_);
@@ -2445,6 +2451,14 @@ private:
 
     int run(StagedWeight& s, Bounce& b) {
         const WeightInfo& w = s.prog->weights[s.wi];
+        if (s.warm) {
+            const int64_t n = w.stored_bytes;
+            if (!s.dev) { std::memcpy(s.dst, s.warm, (size_t)n); return RAD_OK; }
+            const int us = b.upload(s.dst, s.warm, n, s.device);
+            if (us < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
+                                s.device, rad_strerror(us));
+            return us;
+        }
         if (s.fill) {
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
@@ -2452,6 +2466,7 @@ private:
         /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
         if (w.identity && !w.widen && !w.narrow) {
             const int64_t n = w.stored_bytes;
+            if (s.cap) std::memcpy(s.cap, s.in, (size_t)n);
             if (!s.dev) { std::memcpy(s.dst, s.in, (size_t)n); return RAD_OK; }
             const int us = b.upload(s.dst, s.in, n, s.device);
             if (us < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
@@ -2502,6 +2517,7 @@ private:
                     w.layout_tag.empty() ? "widened" : w.layout_tag.c_str(), e, rad_strerror(st));
             return st;
         }
+        if (s.cap) std::memcpy(s.cap, out, (size_t)n);
         if (s.dev) {
             st = in_slot ? b.send(s.dst, n, s.device) : b.upload(s.dst, out, n, s.device);
             if (st < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
@@ -2796,7 +2812,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
  * A reshaped whole plane has the same bytes, so it is read in the checkpoint's rows. */
 static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneShare>& shares,
                                 const std::vector<int>& sel, const std::vector<int64_t>& offs,
-                                const std::string& name, uint8_t* in) {
+                                const std::string& name, std::atomic<int64_t>* read_bytes,
+                                uint8_t* in) {
     std::vector<uint8_t> rows;
     std::string why;
     for (size_t k = 0; k < shares.size(); ++k) {
@@ -2819,6 +2836,7 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
                     RAD_ERR("load: '%s': %s", name.c_str(), why.c_str());
                     return RAD_E_FORMAT;
                 }
+                read_bytes->fetch_add(n, std::memory_order_relaxed);
                 at += n;
                 continue;
             }
@@ -2830,6 +2848,7 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
                     RAD_ERR("load: '%s': %s", name.c_str(), why.c_str());
                     return RAD_E_FORMAT;
                 }
+                read_bytes->fetch_add(nr * crb, std::memory_order_relaxed);
                 for (int64_t r = 0; r < nr; ++r) {
                     std::memcpy(at, rows.data() + r * crb + q.byte0, (size_t)q.bytes);
                     at += q.bytes;
@@ -2840,8 +2859,72 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* The key every prepared weight of this load lives under (PreparedWeightStore): the artifact, the
+ * build and the config that shapes the stored bytes. The placement settings only decide which
+ * weights are copied, and the per-weight fingerprint covers the rest; they are in the key so a
+ * changed one reloads from the source rather than trusting a store built under another. */
+static std::string weight_store_key(const Config& cfg) {
+    std::string k = "artifact=" + weight_artifact_identity(cfg.model) + "|build=" RAD_VERSION "|kernels=";
+    for (const std::string& h : cfg.kernel_hierarchy) k += h + ",";
+    return k + "|tp=" + std::to_string(cfg.tp) + "|placement=" + cfg.placement +
+           "|disk_tier=" + (cfg.weights_disk_tier ? "1" : "0");
+}
+
+/* One weight's entry in the store: its rank, its name and its stored form, so a layout, an
+ * encoding or a share that differs is a different entry. */
+static std::string weight_store_entry(int rank, const WeightInfo& w) {
+    char enc[256];
+    rad_enc_format(&w.enc, enc, sizeof enc);
+    return std::to_string(rank) + "|" + w.name + "|src=" + w.source + "|enc=" + enc +
+           "|layout=" + w.layout_tag + "|id=" + (w.identity ? "1" : "0") + (w.widen ? "w" : "") +
+           (w.narrow ? "n" : "") + "|dt=" + std::to_string(w.stored_dtype) +
+           "|bytes=" + std::to_string(w.stored_bytes) + "|shard=" + std::to_string(w.decl.shard) +
+           ":" + std::to_string(w.shard_lo) + ":" + std::to_string(w.shard_hi);
+}
+
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
+    /* The prepared weights (set_weight_store). */
+    PreparedWeightStore* const store = weight_store_;
+    const std::string model_id = cfg_.served_model_name.empty() ? cfg_.model : cfg_.served_model_name;
+    WeightLoadReport rep;
+    const auto load_t0 = std::chrono::steady_clock::now();
+    const int64_t io0 = proc_io_read_bytes();
+    std::atomic<int64_t> ckpt_read{0};   /* checkpoint bytes the workers read */
+    int64_t n_cold = 0;
+    bool capture = store != nullptr, capture_checked = false;
+    struct AbortCapture {
+        PreparedWeightStore* s; const std::string& id; bool done = false;
+        ~AbortCapture() { if (s && !done) s->abort(id); }
+    } abort_capture{ store, model_id };
+    if (store) store->begin(model_id, weight_store_key(cfg_));
+    /* A buffer for the weight's stored form, if this load fills the store: only while the host has
+     * room for the whole model beside the --host-headroom-mib it keeps free. */
+    auto reserve_capture = [&](int rank, const WeightInfo& w) -> uint8_t* {
+        if (!capture) return nullptr;
+        if (!capture_checked) {
+            capture_checked = true;
+            int64_t need = 0;
+            for (auto& r : ranks_)
+                for (size_t i = 1; i < r->program.weights.size(); ++i)
+                    need += r->program.weights[i].stored_bytes;
+            std::string why;
+            if (!lockable_room(need, 0, host_headroom_bytes(), false, &why)) {
+                RAD_WARN("load: the model's %s of weights do not fit the host memory beside "
+                         "--host-headroom-mib (%s); they are not kept for a warm activation",
+                         humanb(need).c_str(), why.c_str());
+                capture = false;
+                return nullptr;
+            }
+        }
+        uint8_t* p = store->reserve(model_id, weight_store_entry(rank, w), w.stored_bytes);
+        if (!p) {
+            RAD_WARN("load: no host memory to keep '%s' (%s) for a warm activation; the model "
+                     "stays cold", w.name.c_str(), humanb(w.stored_bytes).c_str());
+            capture = false;
+        }
+        return p;
+    };
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
 
@@ -3043,6 +3126,29 @@ int Engine::load_weights() {
             const bool dev = w.tier == Tier::VRAM;
             if (dev && !dst_fits(slot->ptr, w.stored_bytes, w.name.c_str())) return RAD_E_STATE;
 
+            /* A prepared weight is uploaded as stored: no share, no read, no relayout. */
+            if (store) {
+                if (const uint8_t* hit =
+                        store->find(model_id, weight_store_entry(r->index, w), w.stored_bytes)) {
+                    StagedWeight sw;
+                    sw.prog = &r->program;
+                    sw.wi = i;
+                    sw.device = r->device;
+                    sw.dst = (uint8_t*)slot->ptr;
+                    sw.dev = dev;
+                    sw.warm = hit;
+                    staged.push_back(std::move(sw));
+                    ++n_loaded;
+                    ++rep.weights_from_store;
+                    rep.bytes_from_store += w.stored_bytes;
+                    rep.bytes += w.stored_bytes;
+                    continue;
+                }
+            }
+            ++n_cold;
+            rep.bytes += w.stored_bytes;
+            uint8_t* const cap = reserve_capture(r->index, w);
+
             /* This rank's share of the selected planes (format/share.h). */
             PlaneShare sh[RAD_ENC_MAX_PLANES];
             std::string why;
@@ -3081,8 +3187,9 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                sw.cap = cap;
+                sw.fill = [cw, shares, sel, offs, name, &ckpt_read](uint8_t* in) -> int {
+                    return fill_from_checkpoint(*cw, shares, sel, offs, name, &ckpt_read, in);
                 };
                 staged.push_back(std::move(sw));
                 ++n_loaded;
@@ -3102,6 +3209,7 @@ int Engine::load_weights() {
                 sw.device = r->device;
                 sw.dst = (uint8_t*)slot->ptr;
                 sw.dev = dev;
+                sw.cap = cap;
                 for (int k = 0; k < w.n_sel; ++k) {
                     sw.plane_off[k] = in_bytes;
                     in_bytes += align_up(sh[k].dense_bytes(), 64);
@@ -3140,6 +3248,13 @@ int Engine::load_weights() {
                     else
                         runs.push_back(LoadRun{ foff, len, dst, q.bytes, sh[k].row_bytes, q.rows,
                                                 r->index, stage >= 0 ? 0 : (dev ? 1 : 0), stage });
+                    /* The same bytes again into the store's buffer: a host copy by the pool. */
+                    if (cap && stage < 0) {
+                        LoadRun dup = runs.back();
+                        dup.dst = cap + doff;
+                        dup.dev = 0;
+                        runs.push_back(dup);
+                    }
                     total += q.rows * q.bytes;
                     doff += q.rows * q.bytes;
                 }
@@ -3164,11 +3279,17 @@ int Engine::load_weights() {
     RelayoutPool pool(staged);
     const unsigned hw = std::thread::hardware_concurrency();
     /* Started even with nothing staged: the same workers fill host pool slots. */
-    const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+    int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
+    /* Prepared weights only cross the staging ring (8 pinned slots a worker, 4 MiB each) and one
+     * copy saturates the link, so a warm load pins a fraction of what a relayout load does. */
+    if (n_cold == 0) workers = std::min(workers, 4);
     pool.start(workers, 4ll << 30);
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
+        /* No sweep delivers a prepared weight: queue it now. */
+        for (size_t k = 0; k < staged.size(); ++k)
+            if (staged[k].warm) pool.arrived((int)k, 0);
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
@@ -3182,6 +3303,26 @@ int Engine::load_weights() {
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
+    /* The load is whole: what it read from the source is now the store's. */
+    if (store) {
+        store->commit(model_id);
+        abort_capture.done = true;
+    }
+    rep.weights = n_loaded;
+    rep.warm = n_loaded > 0 && n_cold == 0;
+    rep.captured = store && n_cold > 0 && store->prepared(model_id);
+    rep.mapped_bytes = mapped_bytes;
+    rep.source_read_bytes = file_ ? read_bytes : ckpt_read.load();
+    const int64_t io1 = proc_io_read_bytes();
+    rep.disk_read_bytes = io0 >= 0 && io1 >= 0 ? io1 - io0 : -1;
+    rep.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count();
+    weight_load_ = rep;
+    RAD_INFO("load: %s activation: %lld weights, %s (%s from the prepared store), %s read from the "
+             "source, %s read from disk by the process, %.2f s%s",
+             rep.warm ? "warm" : "cold", (long long)rep.weights, humanb(rep.bytes).c_str(),
+             humanb(rep.bytes_from_store).c_str(), humanb(rep.source_read_bytes).c_str(),
+             rep.disk_read_bytes >= 0 ? humanb(rep.disk_read_bytes).c_str() : "?", rep.seconds,
+             rep.captured ? "; kept in the prepared store" : "");
     if (!staged.empty() && file_)
         RAD_INFO("load: %zu weight(s), %s of planes, rearranged for their kernels by %d worker(s) "
                  "behind the read, %s held at most; done %.1f s after the read began",

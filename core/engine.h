@@ -36,6 +36,7 @@
 #include "format/table_share.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
+#include "model/weight_store.h"
 
 #include <atomic>
 #include <chrono>
@@ -117,6 +118,15 @@ public:
      * grants, never more. The destructor leaves the group. The planner outlives the Engine. Null:
      * the resolved budget stands, as without a manifest. */
     void set_group_planner(GroupPlanner* g) { group_ = g; }
+    /* Manifest mode: the process's PreparedWeightStore (model/weight_store.h). The first load puts
+     * the weights, in the form the kernels read, in host memory under the model's name
+     * (served_model_name, else the path); a later load of the same artifact and config uploads
+     * them without reading the checkpoint. The store outlives the Engine. Null: every load reads
+     * the source, as without a manifest. */
+    void set_weight_store(PreparedWeightStore* s) { weight_store_ = s; }
+    /* What start() did to load the weights: from the store (warm) or from the source (cold), the
+     * bytes, the time and the bytes actually read. Valid after a successful start(). */
+    const WeightLoadReport& weight_load_report() const { return weight_load_; }
 
     /* The startup report (core/diag/diag.h): every option with its value and source, the
      * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
@@ -176,6 +186,8 @@ private:
     Config cfg_;
     const ModelRegistry* registry_ = nullptr;
     GroupPlanner* group_ = nullptr;
+    PreparedWeightStore* weight_store_ = nullptr;
+    WeightLoadReport weight_load_;
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in

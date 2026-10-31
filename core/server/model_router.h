@@ -37,6 +37,12 @@
  * deactivated model, the Launcher drains and destroys its Engine, and the model is cold again.
  * Every model with a Launcher can be deactivated, the default model too.
  *
+ * Warm activation (ticket #12): a model whose weights the Launcher left in the PreparedWeightStore is
+ * VORBEREITET, not cold, after its deactivation (`note_prepared`), and its next activation uploads
+ * them from host memory instead of reading the source. The Launcher reports each activation's
+ * WeightLoadReport (`note_weight_load`); status and metrics tell warm from cold activations with
+ * their bytes, durations and disk reads.
+ *
  * Lifetime: a Server is attached from its Engine's thread and must stay alive until serve_model
  * returns, which it does only after the listener has stopped and every attached Server was told to
  * stop, or after the model was deactivated (no handler can reach it then: see above), so no
@@ -45,6 +51,7 @@
 #pragma once
 
 #include "http.h"
+#include "model/weight_store.h"
 
 #include <algorithm>
 #include <chrono>
@@ -112,6 +119,12 @@ public:
     /* The VRAM the Launcher saw freed by the last deactivation of `id`, in MiB (status and
      * metrics report it); -1 where the cards report no capacity. */
     void note_vram_released(const std::string& id, int64_t mib);
+    /* The weight load of the activation `id` is making now (its Engine's report), counted as warm or
+     * cold; call it once the Engine has started. */
+    void note_weight_load(const std::string& id, const WeightLoadReport& r);
+    /* Whether `id` leaves the Launcher with its weights in host memory (and how many bytes): then its
+     * state after a deactivation is VORBEREITET. Called as the Launcher returns, on any path. */
+    void note_prepared(const std::string& id, bool prepared, int64_t ram_bytes);
     /* GET /radiance/models: each model's state and activation and deactivation counts. */
     std::string status_json() const;
     /* Prometheus text (radiance:model_*), appended to the default model's /metrics. */
@@ -161,6 +174,14 @@ private:
         int64_t       activations = 0, deactivations = 0;
         double        activation_s = 0, deactivation_s = 0;
         int64_t       vram_released_mib = -1;
+        bool          prepared = false;       /* its weights are in host memory */
+        int64_t       prepared_bytes = 0;
+        /* Weight loads of the activations that began loading, by kind: [0] cold, [1] warm. */
+        int64_t       loads[2] = {0, 0}, load_bytes[2] = {0, 0}, load_disk_bytes[2] = {0, 0};
+        int64_t       load_source_bytes[2] = {0, 0};
+        double        load_s[2] = {0, 0};
+        bool          has_load = false;
+        WeightLoadReport last_load;
     };
 
     HttpResponse route(const HttpRequest& q);
@@ -177,6 +198,8 @@ private:
     /* What a request gets while the group is unhealthy: the probes and the scrape are answered,
      * everything else is refused. Under m_ for the reason only. */
     HttpResponse answer_unhealthy(const HttpRequest& q) const;
+    /* "active", "deactivating", "activating", "failed", "prepared" or "cold". Under m_. */
+    const char* state_locked(const std::string& id, const Cold& c) const;
     /* Whole seconds (at least 1) until `c` may be tried again. */
     static int retry_in_s(const Cold& c);
 
