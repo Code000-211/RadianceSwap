@@ -41,8 +41,10 @@ Er kommt aus der Statik, die die Karte nicht hält: zwei Schichten mal ihr gestr
 Die Einheit, die der Planner zuletzt streamt, ist eine ganze Unit, daher liegt der echte Anteil bis
 zu einer Unit über dem, den der Split meldet; ein Ring, der für eine Schicht zu klein ist, stagt,
 was passt, und liest den Rest an Ort und Stelle (wie bei Experts). Unter `--deterministic` gibt es
-keinen Stager (der Plan ist dort statisch): der Prefill liest direkt, was ADR 0002 für den
-Normalfall ausschließt.
+keinen Stager (der Plan ist dort statisch): der Prefill läse direkt über PCIe, was ADR 0002
+ausschließt. Deshalb lehnt `Engine::plan` dort ein Streaming statischer Gewichte ab (Startfehler
+„--deterministic: N of the static weights do not fit … has no prefill stager“, Exit 1; Test
+`deterministic_refuses_streaming_statics`). Passt die Statik neben den Cache, ändert sich nichts.
 
 ## Host-Pool
 
@@ -69,7 +71,7 @@ das Host-Budget (#13) zählt die Vergrößerung als Pool.
 
 ## GPU-Abnahme
 
-`scripts/swap-acceptance/static_streaming.py MODEL_DIR [--pct 50] [--tp 2] [--phases ref,stream,status,full]`
+`scripts/swap-acceptance/static_streaming.py MODEL_DIR [--pct 50] [--tp 2] [--phases ref,stream,status,full] [--seqs 8] [--extra "ARGS"] [--hog PATH --hog-extra "ARGS"]`
 (Port 18080, braucht die GPUs für sich). Phasen: `ref` (Basis: Tokens und Durchsatz mit allem auf
 der Karte, daraus die Zahlen des Budgets), `stream` (Headroom so, dass `pct` % der Statik
 streamen, Tokens müssen gleich sein, `bench.py` zeigt die Kosten), `status` (Manifest, Status und
@@ -79,3 +81,34 @@ Die Herleitung der Headrooms steht im Skript; `m_ss.json` ist das Manifest der P
 Von-Hand-Start (`HA` ersetzen). Für `b` im Zustand `full`: `claimable_b = claimable_0 - used_a` mit
 `used_a = F - 16 MiB - H_a` (F die freien MiB der Basis), also `H_a = F - 16 - claimable_0 + K + (1-pct)·S`
 (K der Cache einer Sequenz, S die Statik, alles in MiB aus dem Startbericht der Basis).
+
+## GPU-Messung (2× R9700, TP=2, PCIe 4.0 ×16)
+
+`static_streaming.py … --seqs 8 --pct 25|50|100` (4096 Token, 8 Sequenzen; die Statik, die nicht
+neben einen Cache für eine Sequenz passt, streamt). Anteil = `static_streamed_fraction` aus
+`/radiance/models`; der Anteil ist eine Treppe (ganze Units), der Zielwert wird auf ±15 Punkte
+getroffen. Greedy-Ausgabe (sechs Prompts, Text und Token) in allen Läufen **bit-identisch** zur
+Referenz: `stream`, `status` (Manifest), `full` (Aktivierung bei vollem VRAM). Vollständige Tabellen,
+Fehler und Fixes: `gpu-acceptance.md` §10.
+
+| Model | Anteil gestreamt | C1 tok/s | C8 tok/s | Prefill tok/s (TTFT ms), 3,6k Token |
+|---|---|---|---|---|
+| Qwen3.5-0.8B (dicht) | 0 % (Referenz) | 323–330 | 1970–2001 | 67 500–68 600 (53) |
+| | 25,6 % | 198–199 | 1337–1345 | 60 800–61 700 (59–61) |
+| | 50,8 % | 62,6–62,9 | 474–476 | 42 200–43 200 (84–86) |
+| | 85,5 % (Obergrenze mit 8 Sequenzen) | 32,4–32,5 | 226–247 | 31 500–34 500 (105–115) |
+| | 99,998 % (1 Sequenz) | 25,6 | 23,5–25,5 (1 Seq.) | 26 000–26 700 (136–140) |
+| Flash-Next-MoE | 0 % (Referenz, Experts teils im Pool) | 139–181 | 569–656 | 5715–6279 (579–631) |
+| | 15,4 % | 36,5–37,4 | 61–74 | 2713–2846 (1273–1327) |
+| | 42,7 % | 23,5–25,0 | 48–70 | 2245–2485 (1447–1590) |
+| | 96,5 % | 11,2–11,5 | 42–65 | 2067–2212 (1665–1755) |
+
+Decode wird um die gelesenen Bytes langsamer (dicht, 50 %: +12,9 ms je Token bei 969 MB
+gestreamter Statik über beide Ranks; aus den Messungen nicht auf eine Link-Bandbreite zurückgerechnet).
+Der Prefill kostet über den Ring viel weniger als Decode (0,8B, 85 %: −50 %
+gegen −90 % im Decode). Beim MoE kommt zum Streaming der Statik dazu, dass die Karte keinen Platz
+mehr für Experts hat: sie liegen alle im Pool, die Kosten sind also beides, nicht allein die Statik.
+
+Aktivierung bei vollem VRAM (Model `a` hält die Karten, `b` aktiviert sich): dicht 2,1–2,3 s
+Aktivierung, 2,2–2,6 s bis zur ersten Antwort; MoE 35,5–37,0 s, 36,2–37,7 s (Gewichte aus der
+Platte, `--ngram-placement disk`). `a` läuft danach unverändert weiter.

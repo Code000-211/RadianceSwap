@@ -1893,6 +1893,16 @@ int Engine::plan() {
         {
             VramBudget trial;
             if (vram_budget_trial(cfg_, facts, &trial) == RAD_OK && trial.statics_streamed > 0) {
+                /* --deterministic has no stager, so a prefill would read the streamed statics over
+                 * the link in place; ADR 0002 allows that only through the ring. */
+                if (cfg_.deterministic) {
+                    RAD_ERR("--deterministic: %s of the static weights do not fit the card beside one "
+                            "sequence of cache and would stream from the pinned host pool, but a "
+                            "deterministic plan has no prefill stager to copy them ahead; drop "
+                            "--deterministic, or free VRAM (--gpu-headroom-mib, --max-model-len, "
+                            "another model)", humanb(trial.statics_streamed).c_str());
+                    return RAD_E_NOMEM;
+                }
                 const int64_t MiB = (int64_t)1 << 20;
                 int64_t experts = 0, unit = 0;
                 for (const WeightFootprint& wf : wfs) {

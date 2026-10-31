@@ -1405,6 +1405,25 @@ TEST(streamed_statics_record_what_resident_statics_record_on_libref) {
     check_streamed_recording_matches(world().g31, world().corpus, { "--kernels", "libref" });
 }
 
+/* --deterministic has no stager: a prefill would read the streamed statics over the link in place,
+ * which ADR 0002 excludes, so the same device that streams without it is refused with it. */
+TEST(deterministic_refuses_streaming_statics) {
+    World& w = world();
+    REQUIRE(w.ok);
+    std::string why;
+    const std::vector<std::string> kernels = { "--kernels", "libref" };
+    const int mib = streaming_device_mib(w.g31, kernels, &why);
+    if (!mib) fprintf(stderr, "    %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    const Ran r = radiance(w.g31, { "--deterministic", "--kernels", "libref", "--max-num-batched-tokens",
+                                    "512", "--max-num-seqs", "1", "--gpu-headroom-mib", "0",
+                                    "--kld-record", tiny::TempDir("e2e_det_stream") / "rec",
+                                    "--kld-corpus", w.corpus }, device_env(mib));
+    CHECK(r.status != 0);
+    CHECK(r.log.find("--deterministic: ") != std::string::npos);
+    CHECK(r.log.find("no prefill stager") != std::string::npos);
+}
+
 TEST(streamed_statics_record_what_resident_statics_record_on_libavx) {
 #if defined(__x86_64__)
     NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");

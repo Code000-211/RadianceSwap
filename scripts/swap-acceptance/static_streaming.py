@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""static_streaming.py MODEL_DIR [--pct 50] [--tp 2] [--out DIR] [--phases ref,stream,status,full]
+"""static_streaming.py MODEL_DIR [--pct 50] [--tp 2] [--seqs 1] [--extra ARGS] [--hog PATH] [--out DIR] [--phases ref,stream,status,full]
 
 GPU acceptance of ticket #18 (RAM-Streaming of static weights, docs/swap/static-streaming.md).
 Needs the GPUs to itself (start.sh refuses when a radiance runs) and a build in ./build.
@@ -31,7 +31,12 @@ ap.add_argument("--tp", type=int, default=2)
 ap.add_argument("--out", default="/tmp/swap-acceptance/ss")
 ap.add_argument("--phases", default="ref,stream,status,full")
 ap.add_argument("--maxlen", type=int, default=4096)
+ap.add_argument("--seqs", type=int, default=1, help="--max-num-seqs of the measured model (8 makes bench.py's C8 a real batch)")
 ap.add_argument("--a-headroom-mib", type=int, default=0, help="phase full: override a's headroom")
+ap.add_argument("--extra", default="", help="more engine arguments for every measured model (a MoE: e.g. '--ngram-placement disk')")
+ap.add_argument("--hog", default="", help="phase full: model path of `a`, the one that takes the VRAM (default: the model itself; "
+                "a large MoE needs a small one here, two of it do not fit the host RAM)")
+ap.add_argument("--hog-extra", default="", help="phase full: more engine arguments for `a`")
 ap.add_argument("--prefill", type=int, default=3000, help="bench.py prefill tokens")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
@@ -111,7 +116,7 @@ def same(a, b):
     return len(A) == len(B) and all(x["text"] == y["text"] and x["tokens"] == y["tokens"] for x, y in zip(A, B))
 
 
-ENGINE = ["--max-model-len", str(args.maxlen), "--max-num-seqs", "1"]
+ENGINE = ["--max-model-len", str(args.maxlen), "--max-num-seqs", str(args.seqs)] + args.extra.split()
 BASE = ["--model", args.model, "--tp", str(args.tp)] + ENGINE
 ref_json = os.path.join(args.out, "ref.json")
 state_f = os.path.join(args.out, "numbers.json")
@@ -200,13 +205,16 @@ if "status" in phases:
 # ------------------------------------------------------------------------------------------ full
 if "full" in phases:
     print("== full: b activates while a holds the cards' VRAM")
-    T = target_card
+    # 64 MiB above the target: b's fixed costs (arena, staging, queues) are checked before any pool is
+    # sized, and a's drift moves what it leaves; at 100 % the exact target fails by ~20 MiB and the
+    # pressure path deactivates a instead (which is correct, but not what this phase checks).
+    T = target_card + 64
     # a leaves F - 16 - H_a free (drift), b's claimable is then claimable0 - used_a (derivation in
     # docs/swap/static-streaming.md); we want it at T.
     Ha = args.a_headroom_mib or int(num["free"] - 16 - num["claimable"] + T)
     print(f"   a: --gpu-headroom-mib {Ha} (leaves b about {T:.0f} MiB claimable); b: default headroom")
-    big = ["--max-model-len", "262144", "--max-num-seqs", "64"]
-    m = manifest([{"id": "a", "path": args.model, "default": True,
+    big = ["--max-model-len", "262144", "--max-num-seqs", "64"] + args.hog_extra.split()
+    m = manifest([{"id": "a", "path": args.hog or args.model, "default": True,
                    "engine": big + ["--gpu-headroom-mib", str(Ha)]},
                   {"id": "b", "path": args.model, "engine": ENGINE + ["--gpu-headroom-mib", "96"]}])
     pid = start(os.path.join(args.out, "full.log"), ["--manifest", m])
