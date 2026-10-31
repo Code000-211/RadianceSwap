@@ -462,13 +462,17 @@ struct Server {
     int port = 0;
     bool quiet = false;   /* a start that fails is expected: print nothing */
     bool serving = false; /* serving_argv: no reference library unless the arguments name one */
+    std::string manifest; /* --manifest FILE instead of --model; the arguments are given whole */
 
     bool start(const std::string& model, const std::vector<std::string>& args,
                const std::vector<std::string>& env = {}) {
         std::vector<std::string> a = { "--host", "127.0.0.1", "--port", "0",
                                        "--http-threads", "4" };
         a.insert(a.end(), args.begin(), args.end());
-        if (!child.start(serving ? serving_argv(model, a) : engine_argv(model, a), engine_env(env)))
+        if (!manifest.empty()) a.insert(a.begin(), { RAD_E2E_SERVER, "--manifest", manifest });
+        if (!child.start(!manifest.empty() ? a
+                         : serving        ? serving_argv(model, a) : engine_argv(model, a),
+                         engine_env(env)))
             return false;
         drain = std::thread([this] {
             char buf[4096];
@@ -3078,6 +3082,68 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
     }
+}
+
+/* ================================================================== warm activation */
+
+/* Manifest mode through the real binary: a model idle past the timeout is deactivated and is then
+ * VORBEREITET; its next request activates it from the prepared store and generates the tokens of
+ * its first activation, without reading the checkpoint (a container, and a checkpoint directory). */
+TEST(manifest_mode_reactivates_a_deactivated_model_from_the_prepared_store) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir dir("e2e_warm");
+    REQUIRE(dir.ok());
+    const json manifest = {
+        { "cache", { { "idle_timeout_ms", 700 } } },
+        { "models", json::array({ { { "id", "rad" }, { "path", w.llama_rad }, { "default", true } },
+                                  { { "id", "ckpt" }, { "path", w.llama } } }) } };
+    REQUIRE(tiny::write_text(dir / "manifest.json", manifest.dump()));
+    Server s;
+    s.manifest = dir / "manifest.json";
+    REQUIRE(s.start("", { "--kernels", "libref", "--debug-accept-reference-kernels" }));
+
+    auto model_status = [&](const std::string& id) {
+        Call c;
+        std::string out;
+        if (!c.send(s.port, "GET", "/radiance/models", "") || c.read(&out) != 200) return json();
+        const json all = json::parse(out, nullptr, false);
+        if (!all.is_object() || !all.contains("data")) return json();
+        for (const json& m : all["data"])
+            if (m["id"] == id) return m;
+        return json();
+    };
+    auto wait_state = [&](const std::string& id, const char* state) {
+        for (int i = 0; i < 400; ++i) {
+            if (model_status(id)["state"] == state) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    json req = completion(prompt_ids(5, 40), 6);
+    for (const char* id : { "rad", "ckpt" }) {
+        req["model"] = id;
+        const std::vector<int32_t> first = tokens_of(post(s.port, "/completion", req));
+        CHECK_EQ(first.size(), (size_t)6);
+        if (!wait_state(id, "prepared"))
+            fprintf(stderr, "    %s never became prepared; status %s\n%s\n", id,
+                    model_status(id).dump().c_str(), tail(s.output(), 20).c_str());
+        REQUIRE(model_status(id)["state"] == "prepared");
+        CHECK(model_status(id)["prepared_bytes"].get<int64_t>() > 0);
+        CHECK_EQ(model_status(id)["cold_activations"].get<int>(), 1);
+        CHECK_EQ(model_status(id)["last_weight_load"]["kind"].get<std::string>(), std::string("cold"));
+
+        const std::vector<int32_t> second = tokens_of(post(s.port, "/completion", req));
+        CHECK(first == second);
+        const json st = model_status(id);
+        CHECK_EQ(st["warm_activations"].get<int>(), 1);
+        CHECK_EQ(st["last_weight_load"]["kind"].get<std::string>(), std::string("warm"));
+        CHECK_EQ(st["last_weight_load"]["source_read_bytes"].get<int64_t>(), (int64_t)0);
+        CHECK_EQ(st["last_weight_load"]["bytes_from_store"].get<int64_t>(),
+                 st["last_weight_load"]["bytes"].get<int64_t>());
+    }
+    CHECK_EQ(s.stop(), 0);
+    CHECK(s.output().find("warm activation") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

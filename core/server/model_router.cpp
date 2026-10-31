@@ -97,6 +97,37 @@ void ModelRouter::note_vram_released(const std::string& id, int64_t mib) {
     if (const auto c = cold_.find(id); c != cold_.end()) c->second.vram_released_mib = mib;
 }
 
+void ModelRouter::note_weight_load(const std::string& id, const WeightLoadReport& r) {
+    std::lock_guard<std::mutex> lk(m_);
+    const auto c = cold_.find(id);
+    if (c == cold_.end()) return;
+    Cold& m = c->second;
+    const int k = r.warm ? 1 : 0;
+    ++m.loads[k];
+    m.load_bytes[k] += r.bytes;
+    m.load_source_bytes[k] += r.source_read_bytes;
+    m.load_disk_bytes[k] += std::max<int64_t>(r.disk_read_bytes, 0);
+    m.load_s[k] += r.seconds;
+    m.last_load = r;
+    m.has_load = true;
+}
+
+void ModelRouter::note_prepared(const std::string& id, bool prepared, int64_t ram_bytes) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (const auto c = cold_.find(id); c != cold_.end()) {
+        c->second.prepared = prepared;
+        c->second.prepared_bytes = prepared ? ram_bytes : 0;
+    }
+}
+
+const char* ModelRouter::state_locked(const std::string& id, const Cold& c) const {
+    return servers_.count(id)  ? "active"
+         : c.deactivating      ? "deactivating"
+         : c.running           ? "activating"
+         : c.attempt && c.failed_attempt == c.attempt ? "failed"
+         : c.prepared          ? "prepared" : "cold";
+}
+
 int64_t ModelRouter::queued(const std::string& id) const {
     std::lock_guard<std::mutex> lk(m_);
     const auto c = cold_.find(id);
@@ -464,8 +495,9 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
             c.attached = false;
             ++c.deactivations;
             c.deactivation_s += std::chrono::duration<double>(now - c.began).count();
-            if (registry_) registry_->set_state(id, ModelState::Cold);
-            RAD_INFO("model '%s' is deactivated (cold) after %.3f s%s", id.c_str(),
+            if (registry_) registry_->set_state(id, c.prepared ? ModelState::Prepared : ModelState::Cold);
+            RAD_INFO("model '%s' is deactivated (%s) after %.3f s%s", id.c_str(),
+                     c.prepared ? "prepared" : "cold",
                      std::chrono::duration<double>(now - c.began).count(),
                      rc < 0 ? "; its runtime reported an error on the way out" : "");
         } else if (!c.attached && !stopped_) {
@@ -501,10 +533,7 @@ std::string ModelRouter::status_json() const {
 std::string ModelRouter::status_json_locked() const {
     nlohmann::json models = nlohmann::json::array();
     for (const auto& [id, c] : cold_) {
-        const char* state = servers_.count(id)  ? "active"
-                          : c.deactivating      ? "deactivating"
-                          : c.running           ? "activating"
-                          : c.attempt && c.failed_attempt == c.attempt ? "failed" : "cold";
+        const char* state = state_locked(id, c);
         nlohmann::json m = { { "id", id }, { "state", state },
                              { "default", id == default_id_ },
                              { "activations", c.activations },
@@ -518,6 +547,17 @@ std::string ModelRouter::status_json_locked() const {
             if (Clock::now() < c.retry_at) m["retry_after_seconds"] = retry_in_s(c);
         }
         if (c.vram_released_mib >= 0) m["vram_released_mib"] = c.vram_released_mib;
+        m["prepared_bytes"] = c.prepared_bytes;
+        m["warm_activations"] = c.loads[1];
+        m["cold_activations"] = c.loads[0];
+        if (c.has_load)
+            m["last_weight_load"] = { { "kind", c.last_load.warm ? "warm" : "cold" },
+                                      { "bytes", c.last_load.bytes },
+                                      { "bytes_from_store", c.last_load.bytes_from_store },
+                                      { "seconds", c.last_load.seconds },
+                                      { "source_read_bytes", c.last_load.source_read_bytes },
+                                      { "disk_read_bytes", c.last_load.disk_read_bytes },
+                                      { "mapped_bytes", c.last_load.mapped_bytes } };
         models.push_back(std::move(m));
     }
     nlohmann::json out = { { "object", "list" }, { "idle_timeout_ms", act_.idle_timeout_ms },
@@ -537,10 +577,7 @@ std::string ModelRouter::metrics_text() const {
     o += "# HELP radiance:model_state 1 for the state each configured model is in\n"
          "# TYPE radiance:model_state gauge\n";
     for (const auto& [id, c] : cold_) {
-        const char* state = servers_.count(id)  ? "active"
-                          : c.deactivating      ? "deactivating"
-                          : c.running           ? "activating"
-                          : c.attempt && c.failed_attempt == c.attempt ? "failed" : "cold";
+        const char* state = state_locked(id, c);
         line("radiance:model_state", id, std::string(",state=\"") + state + "\"", 1);
     }
     o += "# HELP radiance:model_activations_total Activations that completed\n"
@@ -565,6 +602,29 @@ std::string ModelRouter::metrics_text() const {
          "# TYPE radiance:model_vram_released_mib gauge\n";
     for (const auto& [id, c] : cold_)
         if (c.vram_released_mib >= 0) line("radiance:model_vram_released_mib", id, "", (double)c.vram_released_mib);
+    o += "# HELP radiance:model_prepared_bytes Host-RAM bytes of the model's prepared weights\n"
+         "# TYPE radiance:model_prepared_bytes gauge\n";
+    for (const auto& [id, c] : cold_) line("radiance:model_prepared_bytes", id, "", (double)c.prepared_bytes);
+    static const char* const kinds[2] = { "cold", "warm" };
+    o += "# HELP radiance:model_weight_loads_total Weight loads, warm (from the prepared store) or cold\n"
+         "# TYPE radiance:model_weight_loads_total counter\n"
+         "# HELP radiance:model_weight_load_bytes_total Stored weight bytes placed by those loads\n"
+         "# TYPE radiance:model_weight_load_bytes_total counter\n"
+         "# HELP radiance:model_weight_load_seconds_total Time spent in those loads\n"
+         "# TYPE radiance:model_weight_load_seconds_total counter\n"
+         "# HELP radiance:model_weight_source_read_bytes_total Checkpoint or container bytes the loader read\n"
+         "# TYPE radiance:model_weight_source_read_bytes_total counter\n"
+         "# HELP radiance:model_weight_disk_read_bytes_total Bytes the process read from disk during those loads\n"
+         "# TYPE radiance:model_weight_disk_read_bytes_total counter\n";
+    for (const auto& [id, c] : cold_)
+        for (int k = 0; k < 2; ++k) {
+            const std::string kind = std::string(",kind=\"") + kinds[k] + "\"";
+            line("radiance:model_weight_loads_total", id, kind, (double)c.loads[k]);
+            line("radiance:model_weight_load_bytes_total", id, kind, (double)c.load_bytes[k]);
+            line("radiance:model_weight_load_seconds_total", id, kind, c.load_s[k]);
+            line("radiance:model_weight_source_read_bytes_total", id, kind, (double)c.load_source_bytes[k]);
+            line("radiance:model_weight_disk_read_bytes_total", id, kind, (double)c.load_disk_bytes[k]);
+        }
     return o;
 }
 

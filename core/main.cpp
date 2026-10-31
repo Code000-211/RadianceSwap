@@ -5,6 +5,7 @@
 #include "build/startup.h"
 #include "hf_model.h"
 #include "manifest.h"
+#include "model/weight_store.h"
 #include "place/group_planner.h"
 #include "server/model_router.h"
 #include "util/stallwatch.h"
@@ -44,6 +45,10 @@ static int serve_manifest(rad::ModelRegistry& registry) {
     /* Shares are fixed, so no model reserves pool for one not started (to_start 0). Declared before
      * the engines and the router: both end before it. */
     rad::GroupPlanner group(0);
+    /* The host-RAM weights of deactivated models (model/weight_store.h): what makes a model
+     * vorbereitet. Declared before the engines for the same reason; its memory is released when
+     * the process ends. */
+    rad::PreparedWeightStore weights;
 
     /* The free VRAM of the group's tightest card, in MiB; -1 where no card reports a capacity. */
     auto free_mib = [](int tp) {
@@ -82,6 +87,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         auto engine = std::make_unique<rad::Engine>(std::move(cfg));
         engine->set_registry(&registry);
         engine->set_group_planner(&group);
+        engine->set_weight_store(&weights);
 
         /* A startup that stops logging reports where it waits (util/stallwatch.h). */
         rad::StallWatch watch(("startup " + models[i].id).c_str(), 120000);
@@ -139,6 +145,12 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         const bool is_default = models[i].id == default_id;
         router.add_cold(models[i].id, [&, i, is_default](const std::string& id) {
             const bool startup = is_default && !default_started.exchange(true);
+            /* However the Launcher ends, the router learns whether the model's weights stay in host
+             * memory (its state is then VORBEREITET rather than KALT). Last to be destroyed. */
+            struct ReportPrepared {
+                rad::server::ModelRouter*& router; rad::PreparedWeightStore& store; const std::string& id;
+                ~ReportPrepared() { router->note_prepared(id, store.prepared(id), store.ram_bytes(id)); }
+            } report_prepared{ router_ptr, weights, id };
             std::unique_ptr<rad::Engine> e;
             int dump_rc = 0;
             const int64_t free_before = free_mib(models[i].config.tp);
@@ -159,6 +171,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
                 }
                 return s < 0 ? s : 0;
             }
+            router_ptr->note_weight_load(id, e->weight_load_report());
             const int64_t before = free_mib(models[i].config.tp);
             const int st = serve_engine(*e, id, startup);
             const bool deactivated = router_ptr->deactivating(id);

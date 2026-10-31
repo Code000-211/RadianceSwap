@@ -11,6 +11,7 @@
 #include "engine.h"
 #include "tiny_model.h"
 #include "build/startup.h"
+#include "model/weight_store.h"
 #include "place/group_planner.h"
 #include "runtime/collective_sequencer.h"
 
@@ -1147,6 +1148,152 @@ TEST(a_host_engine_in_a_group_generates_the_tokens_of_one_outside_it) {
     const std::vector<int32_t> grouped = generate(&group);
     CHECK(alone == grouped);
     CHECK(group.target("tiny").empty());    /* the engine left when it was destroyed */
+}
+
+/* ================================================================== prepared weights */
+
+/* The store's keys: a load under another model key finds nothing, a failed load leaves nothing,
+ * and an artifact's identity moves with its files. */
+TEST(the_prepared_store_keeps_only_committed_weights_of_its_key) {
+    rad::PreparedWeightStore store;
+    store.begin("m", "k1");
+    uint8_t* w = store.reserve("m", "0|w", 64);
+    REQUIRE(w != nullptr);
+    std::memset(w, 5, 64);
+    CHECK(store.find("m", "0|w", 64) == nullptr);   /* not visible before the commit */
+    CHECK(!store.prepared("m"));
+    store.abort("m");
+    store.commit("m");
+    CHECK(!store.prepared("m"));
+
+    store.begin("m", "k1");
+    std::memset(store.reserve("m", "0|w", 64), 5, 64);
+    store.commit("m");
+    CHECK(store.prepared("m"));
+    CHECK_EQ(store.ram_bytes("m"), (int64_t)64);
+    CHECK(store.find("m", "0|w", 64) != nullptr);
+    CHECK(store.find("m", "0|w", 32) == nullptr);     /* another size is another weight */
+    CHECK(store.find("m", "1|w", 64) == nullptr);     /* another rank */
+    CHECK(store.find("other", "0|w", 64) == nullptr);
+
+    store.begin("m", "k1");                            /* the same key keeps them */
+    CHECK(store.find("m", "0|w", 64) != nullptr);
+    store.begin("m", "k2");                            /* another key: cold */
+    CHECK(store.find("m", "0|w", 64) == nullptr);
+    CHECK(!store.prepared("m"));
+    CHECK_EQ(store.ram_bytes(), (int64_t)0);
+
+    tiny::TempDir dir("artifact_identity");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+    const std::string a = rad::weight_artifact_identity(dir.path);
+    CHECK(!a.empty());
+    CHECK_EQ(rad::weight_artifact_identity(dir.path), a);
+    const std::string file = dir.path + "/model.safetensors";
+    std::filesystem::last_write_time(file, std::filesystem::last_write_time(file) +
+                                               std::chrono::seconds(5));
+    CHECK(rad::weight_artifact_identity(dir.path) != a);
+    CHECK(rad::weight_artifact_identity(dir.path + "/absent").empty() ||
+          rad::weight_artifact_identity(dir.path + "/absent") != a);
+}
+
+namespace {
+
+/* One Engine over the tiny checkpoint, started with `store`: its weight load report and its first
+ * four greedy tokens. */
+std::vector<int32_t> activate_tiny(rad::Config cfg, rad::PreparedWeightStore& store,
+                                   rad::WeightLoadReport* rep) {
+    cfg.served_model_name = "tiny";
+    rad::Engine engine(std::move(cfg));
+    engine.set_weight_store(&store);
+    CHECK_EQ(engine.start(), RAD_OK);
+    *rep = engine.weight_load_report();
+    CHECK_EQ(engine.start_execution(), RAD_OK);
+    rad::server::Sink sink;
+    auto r = std::make_unique<rad::Request>();
+    r->id = 1;
+    r->prompt = { 1, 2, 3 };
+    r->max_tokens = 4;
+    r->ignore_eos = true;
+    r->sp.temp = 0.0f;
+    r->sink = &sink;
+    CHECK_EQ(engine.scheduler().add(std::move(r)), RAD_OK);
+    while (!sink.done()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::vector<int32_t> out;
+    rad::server::SinkToken tokens[16];
+    const size_t n = sink.read(tokens, 16);
+    for (size_t i = 0; i < n; ++i) out.push_back(tokens[i].token);
+    engine.scheduler().reap(1);
+    CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+    return out;
+}
+
+}  /* namespace */
+
+/* The first load fills the store while it places the weights; the Engine is destroyed (the model is
+ * deactivated); the second Engine takes every weight from the store, reads no checkpoint byte and
+ * generates the same tokens. A changed artifact or config is a different key and loads cold. */
+TEST(a_second_activation_from_the_prepared_store_reads_no_checkpoint_bytes) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_warm");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    rad::PreparedWeightStore store;
+    const rad::Config cfg = tiny_config(dir.path, home);
+
+    rad::WeightLoadReport cold, warm, again;
+    const std::vector<int32_t> t1 = activate_tiny(cfg, store, &cold);
+    CHECK_EQ(t1.size(), (size_t)4);
+    CHECK(!cold.warm);
+    CHECK(cold.captured);
+    CHECK(cold.weights > 0);
+    CHECK(cold.source_read_bytes > 0);
+    CHECK_EQ(cold.weights_from_store, (int64_t)0);
+    CHECK(store.prepared("tiny"));
+    CHECK_EQ(store.ram_bytes("tiny"), cold.bytes);   /* a copy of what was placed, once */
+
+    const std::vector<int32_t> t2 = activate_tiny(cfg, store, &warm);
+    CHECK(warm.warm);
+    CHECK(!warm.captured);
+    CHECK_EQ(warm.weights, cold.weights);
+    CHECK_EQ(warm.weights_from_store, cold.weights);
+    CHECK_EQ(warm.bytes_from_store, cold.bytes);
+    CHECK_EQ(warm.source_read_bytes, (int64_t)0);    /* the loader's own counter */
+    CHECK(t1 == t2);
+    CHECK_EQ(store.ram_bytes("tiny"), cold.bytes);
+
+    const std::vector<int32_t> t3 = activate_tiny(cfg, store, &again);   /* and again */
+    CHECK(again.warm);
+    CHECK_EQ(again.source_read_bytes, (int64_t)0);
+    CHECK(t1 == t3);
+
+    /* The files changed (mtime): another artifact, so the prepared bytes are not trusted. */
+    const std::string file = dir.path + "/model.safetensors";
+    std::filesystem::last_write_time(file, std::filesystem::last_write_time(file) +
+                                               std::chrono::seconds(5));
+    rad::WeightLoadReport changed;
+    const std::vector<int32_t> t4 = activate_tiny(cfg, store, &changed);
+    CHECK(!changed.warm);
+    CHECK(changed.captured);
+    CHECK(changed.source_read_bytes > 0);
+    CHECK(t1 == t4);
+
+    /* Another config that shapes the key (the placement): cold again. */
+    rad::Config other = cfg;
+    other.placement = "layer_offload";
+    rad::WeightLoadReport placed;
+    (void)activate_tiny(other, store, &placed);
+    CHECK(!placed.warm);
+    CHECK(placed.source_read_bytes > 0);
+
+    /* A model freed from the store loads cold. */
+    store.release("tiny");
+    rad::WeightLoadReport released;
+    (void)activate_tiny(cfg, store, &released);
+    CHECK(!released.warm);
+    CHECK(released.source_read_bytes > 0);
 }
 
 RAD_TEST_MAIN()

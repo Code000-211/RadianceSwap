@@ -9,8 +9,11 @@
 #include "server_fakes.h"
 
 #include "manifest.h"
+#include "model/weight_store.h"
 #include "server/model_router.h"
 #include "text/token_view.h"
+
+#include <cstring>
 
 namespace {
 
@@ -108,9 +111,14 @@ struct Fleet {
     std::map<std::string, FakeEngine*> live;
     std::unique_ptr<ModelRouter> mr;
     std::thread listener;   /* run(): the idle monitor starts with the listener */
+    /* With a store the launcher plays the Engine's weight load: the first one fills it (a cold
+     * load that reads 4096 source bytes), later ones find it (warm, nothing read), and the router
+     * is told, as main.cpp does. */
+    PreparedWeightStore* const store;
 
-    explicit Fleet(int64_t idle_ms, bool manual_sched = false, Gate* slow_teardown = nullptr)
-        : teardown(slow_teardown), manual(manual_sched) {
+    explicit Fleet(int64_t idle_ms, bool manual_sched = false, Gate* slow_teardown = nullptr,
+                   PreparedWeightStore* weights = nullptr)
+        : teardown(slow_teardown), manual(manual_sched), store(weights) {
         REQUIRE_EQ(Counted::alive.load(), 0);
         for (const char* id : { "a", "b", "c" }) {
             ModelRecord r;
@@ -127,6 +135,22 @@ struct Fleet {
                 FakeEngine e(model, model == "a" ? "alpha" : model == "b" ? "beta" : "gamma",
                              destroyed);
                 e.sched.manual = manual;   /* before the Server can be reached */
+                if (store) {
+                    WeightLoadReport rep;
+                    store->begin(model, "key");
+                    if (store->prepared(model)) {
+                        rep.warm = true;
+                        rep.bytes = rep.bytes_from_store = store->ram_bytes(model);
+                        rep.disk_read_bytes = 0;
+                    } else {
+                        std::memset(store->reserve(model, "w0", 4096), 7, 4096);
+                        store->commit(model);
+                        rep.captured = true;
+                        rep.bytes = rep.source_read_bytes = rep.disk_read_bytes = 4096;
+                    }
+                    rep.seconds = 0.25;
+                    mr->note_weight_load(model, rep);
+                }
                 {
                     std::lock_guard<std::mutex> lk(m);
                     live[model] = &e;
@@ -139,6 +163,7 @@ struct Fleet {
                     std::lock_guard<std::mutex> lk(m);
                     live.erase(model);
                 }
+                if (store) mr->note_prepared(model, store->prepared(model), store->ram_bytes(model));
                 return rc;
             });
         mr->activate("a");
@@ -191,6 +216,50 @@ TEST(an_idle_model_is_deactivated_and_its_engine_destroyed) {
     CHECK_EQ(f.launches.load(), 1);
     CHECK_EQ(f.status("a")["state"].get<std::string>(), std::string("cold"));
     CHECK_EQ(f.status("a")["deactivations"].get<int>(), 1);
+}
+
+/* A model whose weights stay in the PreparedWeightStore is VORBEREITET after its deactivation,
+ * its next activation is warm, and status and metrics tell the two kinds apart. */
+TEST(a_deactivated_model_with_prepared_weights_is_prepared_and_reactivates_warm) {
+    PreparedWeightStore store;
+    Fleet f(100, false, nullptr, &store);
+    CHECK_EQ(f.status("b")["state"].get<std::string>(), std::string("cold"));
+    CHECK(f.state("b") == ModelState::Cold);
+
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    CHECK_EQ(f.status("a")["cold_activations"].get<int>(), 1);
+    CHECK_EQ(f.status("a")["warm_activations"].get<int>(), 0);
+    CHECK_EQ(f.status("a")["last_weight_load"]["kind"].get<std::string>(), std::string("cold"));
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
+    CHECK_EQ(f.status("a")["state"].get<std::string>(), std::string("prepared"));
+    CHECK_EQ(f.status("a")["prepared_bytes"].get<int64_t>(), (int64_t)4096);
+    CHECK(f.state("b") == ModelState::Cold);
+
+    /* The request that finds it prepared activates it warm. */
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    const json st = f.status("a");
+    CHECK_EQ(st["cold_activations"].get<int>(), 1);
+    CHECK_EQ(st["warm_activations"].get<int>(), 1);
+    CHECK_EQ(st["last_weight_load"]["kind"].get<std::string>(), std::string("warm"));
+    CHECK_EQ(st["last_weight_load"]["bytes_from_store"].get<int64_t>(), (int64_t)4096);
+    CHECK_EQ(st["last_weight_load"]["source_read_bytes"].get<int64_t>(), (int64_t)0);
+    CHECK_EQ(st["last_weight_load"]["disk_read_bytes"].get<int64_t>(), (int64_t)0);
+    const std::string m = f.mr->metrics_text();
+    CHECK(m.find("radiance:model_weight_loads_total{model=\"a\",kind=\"warm\"} 1") != std::string::npos);
+    CHECK(m.find("radiance:model_weight_loads_total{model=\"a\",kind=\"cold\"} 1") != std::string::npos);
+    CHECK(m.find("radiance:model_weight_source_read_bytes_total{model=\"a\",kind=\"cold\"} 4096") !=
+          std::string::npos);
+    CHECK(m.find("radiance:model_weight_source_read_bytes_total{model=\"a\",kind=\"warm\"} 0") !=
+          std::string::npos);
+    CHECK(m.find("radiance:model_weight_load_bytes_total{model=\"a\",kind=\"warm\"} 4096") !=
+          std::string::npos);
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
+
+    /* Once the store gives its memory up the model is cold again, and loads cold. */
+    store.release("a");
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    CHECK_EQ(f.status("a")["cold_activations"].get<int>(), 2);
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
 }
 
 TEST(a_model_that_keeps_getting_requests_stays_active) {
