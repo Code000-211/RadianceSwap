@@ -53,7 +53,9 @@ static const Flag g_flags[] = {
                                         "`model`; a model idle for cache.idle_timeout_ms is deactivated\n"
                                         "and its VRAM freed (0: never). A failed activation is rolled back and\n"
                                         "retried after cache.activation_backoff_ms (doubling to\n"
-                                        "activation_backoff_max_ms); a device error marks the group unhealthy\n"
+                                        "activation_backoff_max_ms); a model that finds the VRAM taken deactivates\n"
+                                        "the longest idle one (cache.max_active_models sets the share); a\n"
+                                        "device error marks the group unhealthy\n"
                                         "(503 gpu_group_unhealthy, /health 503). Text only; excludes --model\n"
                                         "and LoRA" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"

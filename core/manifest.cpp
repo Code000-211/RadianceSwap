@@ -116,7 +116,7 @@ bool read_cache(const json& j, ManifestCache* c) {
     if (!j.is_object()) { RAD_ERR("manifest: cache must be an object"); return false; }
     if (!only_keys(j, { "host_budget_mib", "staging_budget_mib", "idle_timeout_ms",
                         "max_queued_requests", "warmup_budget_mib", "activation_backoff_ms",
-                        "activation_backoff_max_ms" }, "cache"))
+                        "activation_backoff_max_ms", "max_active_models" }, "cache"))
         return false;
     struct { const char* key; int64_t* field; } const fields[] = {
         { "host_budget_mib", &c->host_budget_mib }, { "staging_budget_mib", &c->staging_budget_mib },
@@ -124,6 +124,7 @@ bool read_cache(const json& j, ManifestCache* c) {
         { "warmup_budget_mib", &c->warmup_budget_mib },
         { "activation_backoff_ms", &c->activation_backoff_ms },
         { "activation_backoff_max_ms", &c->activation_backoff_max_ms },
+        { "max_active_models", &c->max_active_models },
     };
     for (const auto& f : fields) {
         if (!j.contains(f.key)) continue;
@@ -216,6 +217,16 @@ bool read_model(const json& m, size_t n, const Config& base, int group_tp, Model
 
 int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_mib) {
     return std::max(base_mib, free_mib - share_mib);
+}
+
+int64_t manifest_share_mib(int64_t free_mib, int64_t base_mib, size_t n_models, int64_t max_active_models) {
+    const int64_t active = std::clamp<int64_t>(max_active_models > 0 ? max_active_models : (int64_t)n_models,
+                                               1, std::max<int64_t>((int64_t)n_models, 1));
+    return std::max<int64_t>(free_mib - base_mib, 0) / active;
+}
+
+bool manifest_has_room(int64_t free_mib, int64_t share_mib, int64_t base_mib) {
+    return free_mib - base_mib >= share_mib - share_mib / 16;
 }
 
 int manifest_parse(const std::string& text, const Config& base, ModelRegistry* out) {

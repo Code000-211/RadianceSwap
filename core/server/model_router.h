@@ -37,6 +37,20 @@
  * deactivated model, the Launcher drains and destroys its Engine, and the model is cold again.
  * Every model with a Launcher can be deactivated, the default model too.
  *
+ * Deactivation under VRAM pressure (ticket #16): a Launcher that returns RAD_E_NOMEM (thrown
+ * exceptions excepted) before attaching reports that the cards had no room for the model: the
+ * Engine's budget did not fit, or main.cpp saw beforehand that the tightest card has less free than
+ * the model's share. The failure is backed off like any other, but each request waiting for the model bypasses the
+ * backoff to make room: it then
+ * deactivates the model that has been idle longest (`busy_at`: the last time it was seen in use),
+ * waits until its Launcher has destroyed the Engine, and starts the activation again. Only a
+ * model with no request between lookup and dispatch's end, no waiter and nothing admitted in its
+ * Server (the idle test above) is a candidate, so a running generation is never cut, and a model
+ * that is itself activating is left alone. While every other model is in use the request keeps
+ * waiting, up to its deadline (503); when no other model is active, activating or going away
+ * there is nothing to free and it fails at once, naming the VRAM. A waiter makes at most one
+ * round per configured model, so the loop ends.
+ *
  * Warm activation (ticket #12): a model whose weights the Launcher left in the PreparedWeightStore is
  * VORBEREITET, not cold, after its deactivation (`note_prepared`), and its next activation uploads
  * them from host memory instead of reading the source. The Launcher reports each activation's
@@ -174,6 +188,9 @@ private:
         int64_t       activations = 0, deactivations = 0;
         double        activation_s = 0, deactivation_s = 0;
         int64_t       vram_released_mib = -1;
+        bool          vram_short = false;     /* the failed attempt found no room in VRAM */
+        int64_t       short_mark = 0;         /* deactivated_total_ when it failed */
+        int64_t       pressure_deactivations = 0;   /* made to give room to another model */
         bool          prepared = false;       /* its weights are in host memory */
         int64_t       prepared_bytes = 0;
         /* Weight loads of the activations that began loading, by kind: [0] cold, [1] warm. */
@@ -191,6 +208,11 @@ private:
     /* Starts `c`'s Launcher on its thread; the attempt number. Under m_. */
     uint64_t start_locked(const std::string& id, Cold& c);
     void monitor_idle();
+    /* Takes `id`'s Server out of the route table and starts its drain. Under m_. */
+    void deactivate_locked(const std::string& id, Cold& c, Clock::time_point now);
+    /* The active model other than `except` that has been idle longest and may be deactivated now, or
+     * null; stamps the others as busy. Under m_. */
+    const std::string* idle_victim_locked(const std::string& except, Clock::time_point now);
     /* A request that names no model while the default one is not attached: probes and scrapes the
      * router answers itself, so they never activate a model. */
     HttpResponse answer_unattached(const HttpRequest& q) const;
@@ -216,6 +238,7 @@ private:
     std::map<std::string, Cold>    cold_;
     bool stopped_ = false, stop_done_ = false, serving_ = false, routes_added_ = false;
     bool unhealthy_ = false;
+    int64_t deactivated_total_ = 0;   /* deactivations that completed: VRAM was freed */
     std::string unhealthy_reason_;
     std::thread idle_thread_;
 };

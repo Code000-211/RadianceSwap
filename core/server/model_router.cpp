@@ -153,14 +153,37 @@ void ModelRouter::monitor_idle() {
             if (now - c.busy_at < idle) continue;
             RAD_INFO("model '%s' has been idle for %lld ms: deactivating it", id.c_str(),
                      (long long)act_.idle_timeout_ms);
-            servers_.erase(it);
-            c.deactivating = true;
-            c.began = now;
-            if (registry_) registry_->set_state(id, ModelState::Deactivating);
+            deactivate_locked(id, c, now);
         }
         cv_.notify_all();
         cv_.wait_for(lk, poll, [&] { return stopped_; });
     }
+}
+
+void ModelRouter::deactivate_locked(const std::string& id, Cold& c, Clock::time_point now) {
+    servers_.erase(id);
+    c.deactivating = true;
+    c.began = now;
+    if (registry_) registry_->set_state(id, ModelState::Deactivating);
+    cv_.notify_all();
+}
+
+const std::string* ModelRouter::idle_victim_locked(const std::string& except, Clock::time_point now) {
+    const std::string* victim = nullptr;
+    Cold* oldest = nullptr;
+    for (auto& [id, c] : cold_) {
+        const auto it = servers_.find(id);
+        if (id == except || it == servers_.end() || !c.running || c.deactivating) continue;
+        if (c.users > 0 || c.waiters > 0 || it->second->in_flight() > 0) {
+            c.busy_at = now;
+            continue;
+        }
+        if (!oldest || c.busy_at < oldest->busy_at) {
+            oldest = &c;
+            victim = &id;
+        }
+    }
+    return victim;
 }
 
 void ModelRouter::attach(const std::string& id, Server* s) {
@@ -420,30 +443,77 @@ Server* ModelRouter::await_model(const std::string& id, const HttpRequest& q,
     } leave{ c };
 
     uint64_t attempt = 0;   /* the activation this request waits on; 0: none yet */
+    int rounds = 0;         /* activations repeated after a deactivation made room */
     for (;;) {
         if (const auto it = servers_.find(id); it != servers_.end()) return take(it->second);
         if (stopped_) return fail(err_unavailable("the server is shutting down"), "server_stopping");
         if (unhealthy_) return unhealthy_refusal();
-        if (attempt && c.failed_attempt >= attempt)
-            return fail(err_unavailable(c.error), "model_activation_failed", retry_in_s(c));
+        bool own_failure = false;   /* the activation this request waited on has just failed */
+        if (attempt && c.failed_attempt >= attempt) {
+            if (!c.vram_short)
+                return fail(err_unavailable(c.error), "model_activation_failed", retry_in_s(c));
+            own_failure = true;
+            attempt = 0;   /* no room in VRAM: make some below, then try again */
+        }
         /* The attempt ended without failing: the model was active and is deactivated again. */
         if (attempt && !c.running) attempt = 0;
+        bool room_wait = false;   /* this request waits for VRAM, not for the activation */
         if (!attempt) {
             if (!c.running) {
-                /* A model that failed is not tried again before its backoff has passed. */
-                if (c.attempt && c.failed_attempt == c.attempt && Clock::now() < c.retry_at)
-                    return fail(err_unavailable(c.error + "; it is not tried again for another " +
-                                                std::to_string(retry_in_s(c)) + " s"),
-                                "model_activation_backoff", retry_in_s(c));
-                RAD_INFO("model '%s' is cold: activating it for a request", id.c_str());
-                attempt = start_locked(id, c);
+                bool handled = false;
+                if (c.attempt && c.failed_attempt == c.attempt && c.vram_short) {
+                    bool going = false, held = false;   /* another model deactivating, or in use */
+                    for (const auto& [oid, o] : cold_) {
+                        if (oid == id) continue;
+                        going = going || o.deactivating;
+                        held = held || servers_.count(oid) || o.running;
+                    }
+                    handled = true;
+                    if (going) {
+                        room_wait = true;
+                    } else if (deactivated_total_ > c.short_mark) {
+                        if (rounds++ >= (int)cold_.size())
+                            return fail(err_unavailable(c.error + "; still no room after deactivating "
+                                                        "other models " + std::to_string(rounds - 1) +
+                                                        " times"),
+                                        "model_activation_failed");
+                        RAD_INFO("model '%s': VRAM was freed, activating it again", id.c_str());
+                        attempt = start_locked(id, c);
+                    } else if (const std::string* v = idle_victim_locked(id, Clock::now())) {
+                        RAD_INFO("model '%s' found no room in VRAM: deactivating '%s', idle the "
+                                 "longest", id.c_str(), v->c_str());
+                        Cold& vc = cold_.at(*v);
+                        ++vc.pressure_deactivations;
+                        deactivate_locked(*v, vc, Clock::now());
+                        room_wait = true;
+                    } else if (held) {
+                        room_wait = true;   /* every other model is in use: wait for one to be idle */
+                    } else if (own_failure) {
+                        return fail(err_unavailable(c.error + "; no other model is active, so none "
+                                                    "can be deactivated to make room"),
+                                    "model_activation_failed", retry_in_s(c));
+                    } else {
+                        handled = false;   /* a later request: the backoff of the failure applies */
+                    }
+                }
+                if (!handled) {
+                    /* A model that failed is not tried again before its backoff has passed. */
+                    if (c.attempt && c.failed_attempt == c.attempt && Clock::now() < c.retry_at)
+                        return fail(err_unavailable(c.error + "; it is not tried again for another " +
+                                                    std::to_string(retry_in_s(c)) + " s"),
+                                    "model_activation_backoff", retry_in_s(c));
+                    RAD_INFO("model '%s' is cold: activating it for a request", id.c_str());
+                    attempt = start_locked(id, c);
+                }
             } else if (!c.deactivating) {
                 attempt = c.attempt;
             }   /* else: wait for the deactivation to finish, then activate */
         }
         if (Clock::now() >= deadline)
             return fail(err_unavailable("model " + id + " was not active within " +
-                                        std::to_string(act_.wait_ms) + " ms"),
+                                        std::to_string(act_.wait_ms) + " ms" +
+                                        (room_wait ? ": it needs VRAM and every other active model "
+                                                     "is in use" : "")),
                         "model_activation_timeout");
         lk.unlock();
         const bool gone = q.peer_gone();
@@ -461,6 +531,7 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
     c.running = true;
     c.attached = false;
     c.error.clear();
+    c.vram_short = false;
     c.began = Clock::now();
     ++c.attempt;
     if (registry_) registry_->set_state(id, ModelState::Activating);
@@ -494,6 +565,7 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
             c.deactivating = false;
             c.attached = false;
             ++c.deactivations;
+            ++deactivated_total_;
             c.deactivation_s += std::chrono::duration<double>(now - c.began).count();
             if (registry_) registry_->set_state(id, c.prepared ? ModelState::Prepared : ModelState::Cold);
             RAD_INFO("model '%s' is deactivated (%s) after %.3f s%s", id.c_str(),
@@ -502,6 +574,9 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
                      rc < 0 ? "; its runtime reported an error on the way out" : "");
         } else if (!c.attached && !stopped_) {
             /* The Engine is destroyed, every partial allocation with it. */
+            /* RAD_E_NOMEM from a Launcher that returned (not threw) is the cards' lack of room. */
+            c.vram_short = !threw && rc == RAD_E_NOMEM;
+            c.short_mark = deactivated_total_;
             int64_t wait_ms = act_.backoff_ms;   /* doubles per failure before this one */
             for (int64_t i = 0; i < c.failures && wait_ms < act_.backoff_max_ms; ++i) wait_ms *= 2;
             wait_ms = std::min(wait_ms, act_.backoff_max_ms);
@@ -509,7 +584,9 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
             ++c.failures_total;
             c.retry_at = Clock::now() + std::chrono::milliseconds(wait_ms);
             c.failed_attempt = c.attempt;
-            c.error = "activation of model " + id + " failed: " + rad_strerror(rc < 0 ? rc : RAD_E_STATE);
+            c.error = "activation of model " + id + " failed: " +
+                      (c.vram_short ? "not enough VRAM (" + std::string(rad_strerror(rc)) + ")"
+                                    : std::string(rad_strerror(rc < 0 ? rc : RAD_E_STATE)));
             if (registry_) registry_->set_state(id, ModelState::Failed);
             RAD_ERR("%s (rolled back; next attempt in %lld ms at the earliest)", c.error.c_str(),
                     (long long)wait_ms);
@@ -541,7 +618,8 @@ std::string ModelRouter::status_json_locked() const {
                              { "deactivations", c.deactivations },
                              { "deactivation_seconds", c.deactivation_s },
                              { "queued_requests", c.waiters },
-                             { "activation_failures", c.failures_total } };
+                             { "activation_failures", c.failures_total },
+                             { "pressure_deactivations", c.pressure_deactivations } };
         if (std::string(state) == "failed") {
             m["error"] = c.error;
             if (Clock::now() < c.retry_at) m["retry_after_seconds"] = retry_in_s(c);
@@ -598,6 +676,10 @@ std::string ModelRouter::metrics_text() const {
     o += "# HELP radiance:model_deactivation_seconds_total Time spent deactivating\n"
          "# TYPE radiance:model_deactivation_seconds_total counter\n";
     for (const auto& [id, c] : cold_) line("radiance:model_deactivation_seconds_total", id, "", c.deactivation_s);
+    o += "# HELP radiance:model_pressure_deactivations_total Deactivations made to give another model room in VRAM\n"
+         "# TYPE radiance:model_pressure_deactivations_total counter\n";
+    for (const auto& [id, c] : cold_)
+        line("radiance:model_pressure_deactivations_total", id, "", (double)c.pressure_deactivations);
     o += "# HELP radiance:model_vram_released_mib VRAM the last deactivation freed (MiB)\n"
          "# TYPE radiance:model_vram_released_mib gauge\n";
     for (const auto& [id, c] : cold_)
