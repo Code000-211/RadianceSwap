@@ -38,7 +38,7 @@ Was fehlt, damit abgegebene Bytes wirklich genutzt werden:
 2. Das aufnehmende Model muss beim Aktivieren bzw. beim Regrow gegen den freien Kartenplatz
    committen können (`Pool::commit`), nicht gegen einen beim Start fest zugeschnittenen Pool
    (`cfg_.vram_weights_mib -= cut_mib` in `Engine::plan`).
-3. Eine modellübergreifende Leihe (Ticket #16/#17), alternativ: der Slab des einen Models leiht
+3. Eine modellübergreifende Leihe (Ticket #17, Analyse und Planner-Schicht in `docs/swap/kv-lend.md`), alternativ: der Slab des einen Models leiht
    dem des anderen Adressen (`Mover::lend_from`), wie heute der KV-Cache.
 
 Solange diese Punkte fehlen, ist die Abgabe eine Umverteilung der Residency innerhalb der
