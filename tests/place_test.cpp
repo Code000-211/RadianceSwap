@@ -433,6 +433,10 @@ TEST(the_card_keeps_the_statics_a_step_reads_most_and_fills_what_a_big_unit_leav
     CHECK(p.weight[small].tier == Tier::HostPinned);    /* 1 + 3 filled the card: no room left */
     CHECK(p.weight[tower].tier == Tier::HostPinned);    /* read once a request: off the card */
     CHECK_EQ(p.totals.bytes[(int)Tier::VRAM], 4 * MiB);
+    /* The same order is what the mover promotes in (Mover::promote_statics). */
+    std::vector<rad_weight> keep;
+    for (int32_t u : static_keep_order(f.prog, p)) keep.push_back(p.units[(size_t)u].weights.front());
+    CHECK((keep == std::vector<rad_weight>{ mtp, big, small, tower }));
 
     /* A unit that does not fit is skipped: with 3.5 MiB the 3 MiB unit stays and the 1 MiB ones
      * wait, but the drafter's still goes first. */
@@ -589,6 +593,139 @@ TEST(the_stager_copies_streamed_static_layers_ahead_and_gives_them_back) {
     CHECK(m.residency()->lookup(head)->ptr == home[head]);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
+}
+
+/* ================================================================== promoting streamed statics (#19) */
+
+namespace {
+/* The dense model of the stager test above: a head and four 2 MiB layers, 5 MiB of weights budget,
+ * so the last two layers stream. The weights pool is elastic when `va_extra` > 0 (a model in a
+ * group, docs/swap/elastic-slab.md). */
+struct PromoteRig {
+    Fixture     f;
+    Config      cfg = base_config();
+    Plan        plan;
+    Pools       pools;      /* before the mover: it lives in the weights pool */
+    Mover       m;
+    rad_weight  head = 0;
+    std::vector<rad_weight> layer, streamed;
+    std::vector<int32_t>    unit;       /* of the streamed layers, in execution order */
+    int64_t     grow_floor = 0;
+
+    int build(int64_t va_extra) {
+        head = f.weight("output.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        for (int l = 0; l < 4; ++l)
+            layer.push_back(f.weight("blk." + std::to_string(l) + ".ffn_down.weight", 2 * MiB,
+                                     RAD_ACCESS_PER_TOKEN, l, -1));
+        for (rad_weight w : layer) f.op("gemm", {w}, false);
+        f.op("head", {head}, false);
+        cfg.vram_weights_mib = 5;
+        cfg.vram_kv_mib = 16;
+        cfg.gpu_headroom_mib = 1;
+        cfg.host_pool_mib = 64;
+        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+        RAD_TRY(Planner(in).plan(&plan));
+        if (plan.strategy != Strategy::StaticStream) return RAD_E_STATE;
+        RAD_TRY(pools.configure(cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator(), va_extra));
+        MoverConfig mc;
+        mc.shrinkable = true;
+        mc.grow_floor = grow_floor;
+        RAD_TRY(m.init(f.prog, plan, mc, &pools));
+        for (rad_weight w : layer)
+            if (plan.weight[w].tier == Tier::HostPinned) {
+                streamed.push_back(w);
+                unit.push_back(plan.weight[w].unit);
+                /* The loader's job: the bytes the pool slot holds. */
+                std::memset(const_cast<void*>(m.residency()->lookup(w)->ptr), 0x40 + (int)streamed.size(),
+                            (size_t)(2 * MiB));
+            }
+        return RAD_OK;
+    }
+    const char* at(rad_weight w) { return (const char*)m.residency()->lookup(w)->ptr; }
+    /* promote_statics until `streamed` weight bytes are left (a copy lands on a later call), or
+     * four calls when nothing is to land. */
+    int promote(int64_t cap, int64_t streamed = -1) {
+        for (int i = 0; i < 2000; ++i) {
+            RAD_TRY(m.promote_statics(cap));
+            if (streamed >= 0 ? m.static_streamed_bytes() == streamed : ++calls >= 4) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        calls = 0;
+        return RAD_OK;
+    }
+    int calls = 0;
+};
+}  /* namespace */
+
+/* A streamed static unit is copied into fresh address space of the weights pool's arena, past the
+ * budget, and published there: the bytes are the pool's, the address is new, and the units go in
+ * keep order (the earlier layer first) and within the cap (a unit that does not fit waits). */
+TEST(a_promoted_static_unit_is_copied_to_fresh_arena_address_in_keep_order_within_the_cap) {
+    if (!VMem::supported()) return;
+    PromoteRig r;
+    CHECK_OK(r.build(256 * MiB));
+    REQUIRE_EQ(r.streamed.size(), (size_t)2);
+    REQUIRE(r.m.statics_promotable());
+    const int64_t one = r.m.static_remaining_cost() / 2;
+    CHECK(one >= 2 * MiB);
+    CHECK_EQ(r.m.static_streamed_bytes(), 4 * MiB);
+    CHECK_EQ(r.m.static_total_bytes(), 9 * MiB);
+    const char* home0 = r.at(r.streamed[0]);
+    const char* home1 = r.at(r.streamed[1]);
+
+    /* No room granted: nothing moves. */
+    CHECK_OK(r.promote(0));
+    CHECK(r.at(r.streamed[0]) == home0);
+    CHECK_EQ(r.m.static_promoted_cost(), (int64_t)0);
+
+    /* Room for one unit: the earlier layer, the one a step reads first. */
+    CHECK_OK(r.promote(one, 2 * MiB));
+    CHECK(r.at(r.streamed[0]) != home0);
+    CHECK(r.at(r.streamed[1]) == home1);
+    CHECK_EQ(r.m.static_promoted_cost(), one);
+    CHECK_EQ(r.m.static_streamed_bytes(), 2 * MiB);
+    const char* lo = (const char*)r.pools.weights().base() + r.pools.weights().bytes();
+    const char* hi = (const char*)r.pools.weights().base() + r.pools.weights().va_bytes();
+    CHECK(r.at(r.streamed[0]) >= lo && r.at(r.streamed[0]) < hi);     /* the arena, not the budget */
+    for (int64_t i = 0; i < 2 * MiB; i += 4096) CHECK_EQ((int)r.at(r.streamed[0])[i], 0x41);
+    /* The stager no longer copies it: only the unit still in the pool is staged. */
+    CHECK_EQ(r.m.stage_need({ r.unit[0] }), (int64_t)0);
+    CHECK_EQ(r.m.stage_need({ r.unit[1] }), align_up(2 * MiB, RAD_ALIGN_UNIT));
+
+    /* Room for both: the second goes to an address no earlier promotion used. */
+    const char* first = r.at(r.streamed[0]);
+    CHECK_OK(r.promote(2 * one, 0));
+    CHECK(r.at(r.streamed[1]) != home1);
+    CHECK(r.at(r.streamed[1]) >= first + one);              /* fresh, beyond the first's span */
+    for (int64_t i = 0; i < 2 * MiB; i += 4096) CHECK_EQ((int)r.at(r.streamed[1])[i], 0x42);
+    CHECK_EQ(r.m.static_promoted_cost(), 2 * one);
+    CHECK_EQ(r.m.static_remaining_cost(), (int64_t)0);
+    CHECK_EQ(r.m.static_streamed_bytes(), (int64_t)0);
+    CHECK_EQ(r.m.stats().static_promotions, (uint64_t)2);
+    CHECK_EQ(r.m.stage_need({ r.unit[0], r.unit[1] }), (int64_t)0);
+    /* The head and the first layers stayed where the plan put them. */
+    CHECK(r.plan.weight[r.head].tier == Tier::VRAM);
+    /* A grant that already holds everything promotes nothing more. */
+    CHECK_OK(r.promote(100 * MiB));
+    CHECK_EQ(r.m.stats().static_promotions, (uint64_t)2);
+}
+
+/* A card with no room (less than the floor free) refuses the burst and the units wait; and a
+ * weights pool that is not elastic (a model alone) promotes nothing at all. */
+TEST(a_promotion_waits_for_the_card_and_needs_an_elastic_weights_pool) {
+    if (!VMem::supported()) return;
+    PromoteRig r;
+    r.grow_floor = (int64_t)1 << 60;                       /* never that much free */
+    CHECK_OK(r.build(256 * MiB));
+    CHECK_OK(r.promote(100 * MiB));
+    CHECK_EQ(r.m.static_promoted_cost(), (int64_t)0);
+    CHECK_EQ(r.m.static_streamed_bytes(), 4 * MiB);
+
+    PromoteRig plain;
+    CHECK_OK(plain.build(0));
+    CHECK(!plain.m.statics_promotable());
+    CHECK_OK(plain.promote(100 * MiB));
+    CHECK_EQ(plain.m.static_streamed_bytes(), 4 * MiB);
 }
 
 /* A re-split rank's Config reaches both readers of the pool sizes. Engine::plan gives a rank whose

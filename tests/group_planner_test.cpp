@@ -13,6 +13,8 @@
  *   KV claims   a partition that needs room takes it from the experts of any model (ticket #17)
  *   Elastic     a model with an elastic slab may hold more than its offer, and is granted the
  *               bytes only after the giver physically released them (ticket #35)
+ *   Statics     a model that streams static weights is granted the card's free bytes ahead of any
+ *               expert growth, the busiest first, and no byte twice (ticket #19)
  *
  * Pure host arithmetic: no device, no model.
  */
@@ -655,4 +657,128 @@ TEST(an_elastic_models_classes_move_together_whatever_their_heat) {
     CHECK(a >= 1);
     CHECK(std::abs(a - b) <= 1);
     CHECK_EQ(got[0][0].bytes, a * 2 * MiB + b * MiB);
+}
+
+/* ================================================================== streamed statics (#19) */
+
+namespace {
+/* A member that streams `left` MiB of statics, holds `held` MiB of promoted ones and is `heat` busy. */
+GroupMember streamer(const std::string& id, int64_t left, int64_t held, float heat) {
+    GroupMember m{ id, GroupFacts(1) };
+    m.facts[0].statics.left = left * MiB;
+    m.facts[0].statics.held = held * MiB;
+    m.facts[0].statics.heat = heat;
+    return m;
+}
+int64_t cap_mib(const std::vector<GroupBudget>& b, size_t i) { return b[i][0].statics_cap / MiB; }
+}  /* namespace */
+
+TEST(free_bytes_go_to_the_busiest_streaming_model_first_and_never_past_what_it_streams) {
+    std::vector<GroupMember> m = { streamer("a", 80, 0, 0.5f), streamer("b", 60, 0, 1.0f) };
+    std::vector<GroupBudget> got;
+    const std::vector<int64_t> pending = group_statics({ 100 * MiB }, m, {}, &got);
+    CHECK_EQ(cap_mib(got, 1), 60);          /* the busy model streams less than the card has free */
+    CHECK_EQ(cap_mib(got, 0), 40);          /* the idle one takes what is left */
+    CHECK_EQ(pending[0], 100 * MiB);
+    /* Nothing free, nothing granted; more free than anyone wants, no more than they stream. */
+    got.clear();
+    (void)group_statics({ 0 }, m, {}, &got);
+    CHECK_EQ(cap_mib(got, 0) + cap_mib(got, 1), 0);
+    got.clear();
+    (void)group_statics({ 500 * MiB }, m, {}, &got);
+    CHECK_EQ(cap_mib(got, 0), 80);
+    CHECK_EQ(cap_mib(got, 1), 60);
+    /* Ties go in member order. */
+    m = { streamer("a", 80, 0, 1.0f), streamer("b", 80, 0, 1.0f) };
+    got.clear();
+    (void)group_statics({ 100 * MiB }, m, {}, &got);
+    CHECK_EQ(cap_mib(got, 0), 80);
+    CHECK_EQ(cap_mib(got, 1), 20);
+}
+
+TEST(a_static_grant_not_yet_used_is_reserved_and_what_a_model_holds_is_never_taken_back) {
+    std::vector<GroupMember> m = { streamer("a", 80, 0, 1.0f), streamer("b", 80, 0, 0.5f) };
+    std::vector<GroupBudget> first;
+    (void)group_statics({ 100 * MiB }, m, {}, &first);
+    CHECK_EQ(cap_mib(first, 0), 80);
+    CHECK_EQ(cap_mib(first, 1), 20);
+    /* The next look finds the same 100 MiB free (a has promoted nothing yet): the grants stay
+     * reserved, so b does not get a's bytes, and a's grant does not grow past what it streams. */
+    std::vector<GroupBudget> again;
+    (void)group_statics({ 100 * MiB }, m, first, &again);
+    CHECK_EQ(cap_mib(again, 0), 80);
+    CHECK_EQ(cap_mib(again, 1), 20);
+    /* a promotes 30 and the card shows 30 less free: the reservation shrinks by what it holds. */
+    m[0].facts[0].statics.held = 30 * MiB;
+    m[0].facts[0].statics.left = 50 * MiB;
+    std::vector<GroupBudget> later;
+    (void)group_statics({ 70 * MiB }, m, again, &later);
+    CHECK_EQ(cap_mib(later, 0), 80);        /* 30 held + 50 still granted */
+    CHECK_EQ(cap_mib(later, 1), 20);
+    CHECK(cap_mib(later, 0) - 30 + cap_mib(later, 1) <= 70);
+    /* The card gets tighter (something else took bytes): nobody is told to give back what it holds. */
+    std::vector<GroupBudget> tight;
+    (void)group_statics({ 0 }, m, later, &tight);
+    CHECK(cap_mib(tight, 0) >= 30);
+}
+
+TEST(statics_take_the_free_bytes_before_an_expert_may_grow_into_them) {
+    /* a (elastic) was granted growth and holds less: 10 MiB are free in the pool. The statics' claim
+     * on the same bytes is subtracted before group_gate grants them to an expert. */
+    std::vector<GroupMember> m = { { "a", elastic_rank(20, { bin(30, 2, 0.0f) }) },
+                                   { "b", elastic_rank(20, { bin(30, 2, 0.0f) }) } };
+    m[0].facts[0].held = 20 * MiB;
+    m[1].facts[0].held = 10 * MiB;           /* b gave 10 back */
+    std::vector<GroupBudget> want = group_allocate({ 40 * MiB }, m, 0, 0.5);
+    m[0].facts[0].bins = { bin(30, 2, 9.0f) };
+    want = group_allocate({ 40 * MiB }, m, 0, 0.5);
+    CHECK_EQ(mib(group_gate({ 40 * MiB }, m, want, {})[0]) , 30);       /* no static claim: a grows by 10 */
+    CHECK_EQ(mib(group_gate({ 40 * MiB }, m, want, {}, { 4 * MiB })[0]), 26);   /* 4 MiB are spoken for */
+    CHECK_EQ(mib(group_gate({ 40 * MiB }, m, want, {}, { 10 * MiB })[0]), 20);
+}
+
+TEST(the_planner_grants_statics_from_the_cards_free_bytes_and_keeps_experts_out_of_them) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    /* b streams 8 MiB of statics and the card has 8 MiB free: they are b's. */
+    StaticFacts s;
+    s.left = 8 * MiB;
+    s.heat = 1.0f;
+    g.update_statics("b", 0, s);
+    g.update_free(0, 8 * MiB);
+    CHECK_EQ(g.target("b")[0].statics_cap, 8 * MiB);
+    /* b's slab then releases 10 MiB, which a's experts are entitled to; the 8 MiB promised to the
+     * statics are not a's to take before b has used them. */
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 22);         /* 20 + the 10 free in the pool less the 8 promised */
+    CHECK_EQ(g.target("b")[0].statics_cap, 8 * MiB);
+    /* b promotes: held rises, nothing is left to promote, and the card's free bytes fell to 0. */
+    s.left = 0;
+    s.held = 8 * MiB;
+    g.update_statics("b", 0, s);
+    g.update_free(0, 0);
+    CHECK_EQ(g.target("b")[0].statics_cap, 8 * MiB);
+    CHECK_EQ(g.view("b")[0].statics.held, 8 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    /* b leaving drops its claim; a sole engine has no statics grant. */
+    g.leave("b");
+    CHECK_EQ(g.target("a")[0].statics_cap, (int64_t)0);
+}
+
+TEST(static_grants_are_decided_per_rank_at_world_size_2) {
+    GroupPlanner g(0);
+    GroupFacts f(2);
+    (void)g.join("b", f);
+    StaticFacts s;
+    s.left = 10 * MiB;
+    s.heat = 1.0f;
+    g.update_statics("b", 0, s);
+    g.update_statics("b", 1, s);
+    g.update_free(0, 4 * MiB);
+    g.update_free(1, 64 * MiB);
+    const GroupBudget t = g.target("b");
+    CHECK_EQ(t[0].statics_cap, 4 * MiB);
+    CHECK_EQ(t[1].statics_cap, 10 * MiB);
 }
