@@ -1296,4 +1296,45 @@ TEST(a_second_activation_from_the_prepared_store_reads_no_checkpoint_bytes) {
     CHECK(released.source_read_bytes > 0);
 }
 
+/* A host budget the model's weights do not fit under: the activation still succeeds and generates
+ * (the budget never fails an activation), but the store keeps no copy, so the model is kalt after
+ * it. With room for the weights the copy is made and counted, and the engine's staging is released
+ * when the load ends. */
+TEST(a_host_budget_that_the_weights_do_not_fit_leaves_the_model_cold_but_activatable) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_budget");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+    const rad::Config cfg = tiny_config(dir.path, home);
+
+    rad::PreparedWeightStore roomy;
+    rad::WeightLoadReport first;
+    const std::vector<int32_t> t1 = activate_tiny(cfg, roomy, &first);
+    CHECK(first.captured);
+    const int64_t weights = roomy.ram_bytes("tiny");
+    CHECK(weights > 0);
+
+    rad::PreparedWeightStore tight;
+    tight.set_budget(weights / 2);
+    rad::WeightLoadReport cold, again;
+    const std::vector<int32_t> t2 = activate_tiny(cfg, tight, &cold);
+    CHECK(!cold.captured);
+    CHECK(!tight.prepared("tiny"));
+    CHECK(t1 == t2);
+    CHECK_EQ(tight.stats().staging_bytes, (int64_t)0);
+    CHECK_EQ(tight.stats().pool_bytes, (int64_t)0);   /* the engine is gone */
+    (void)activate_tiny(cfg, tight, &again);          /* kalt, and activatable again */
+    CHECK(!again.warm);
+
+    rad::PreparedWeightStore fits;
+    fits.set_budget(2 * weights + ((int64_t)1 << 30));   /* the copy and the load's staging beside it */
+    rad::WeightLoadReport copy;
+    (void)activate_tiny(cfg, fits, &copy);
+    CHECK(copy.captured);
+    CHECK_EQ(fits.stats().store_bytes, weights);
+    CHECK_EQ(fits.stats().over_budget_claims, (int64_t)0);
+    CHECK_EQ(fits.stats().staging_bytes, (int64_t)0);
+}
+
 RAD_TEST_MAIN()

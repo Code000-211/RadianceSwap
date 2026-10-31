@@ -151,6 +151,13 @@ static int serve_manifest(rad::ModelRegistry& registry) {
     act.backoff_max_ms = registry.cache.activation_backoff_max_ms;
     rad::server::ModelRouter router(default_id, 1, &registry, act);
     router_ptr = &router;
+    /* cache.host_budget_mib covers the store, the active models' host pools and the loads' staging
+     * (0: the Engine's host checks decide). A model the budget evicts is cold for the router. */
+    weights.set_budget(registry.cache.host_budget_mib << 20);
+    weights.set_state_listener([&](const std::string& id, bool prepared, int64_t bytes) {
+        router_ptr->note_prepared(id, prepared, bytes);
+    });
+    router.set_weight_store(&weights);
 
     /* --debug-graph: the default model's first start dumps its graph instead of serving. */
     std::atomic<bool> dumped{false};
@@ -167,9 +174,9 @@ static int serve_manifest(rad::ModelRegistry& registry) {
             /* However the Launcher ends, the router learns whether the model's weights stay in host
              * memory (its state is then VORBEREITET rather than KALT). Last to be destroyed. */
             struct ReportPrepared {
-                rad::server::ModelRouter*& router; rad::PreparedWeightStore& store; const std::string& id;
-                ~ReportPrepared() { router->note_prepared(id, store.prepared(id), store.ram_bytes(id)); }
-            } report_prepared{ router_ptr, weights, id };
+                rad::PreparedWeightStore& store; const std::string& id;
+                ~ReportPrepared() { store.publish_state(id); }
+            } report_prepared{ weights, id };
             std::unique_ptr<rad::Engine> e;
             int dump_rc = 0;
             const int64_t free_before = free_mib(models[i].config.tp);

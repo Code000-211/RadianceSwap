@@ -25,10 +25,21 @@
  * miss, never a wrong buffer.
  *
  * The store belongs to the process and outlives every Engine; its memory is released when it is
- * destroyed. There is no budget or eviction yet (ticket #13). */
+ * destroyed.
+ *
+ * Host budget (ticket #13, docs/swap/host-budget.md). The store is also the process's ledger of
+ * host RAM: its entries, the host pools of the active models (`claim` Pools) and the loads' staging
+ * (`claim` Staging) are `used()`. With a budget (`cache.host_budget_mib`) the three together never
+ * pass it by the store's doing: a copy that would not fit evicts the vorbereitete Model idle the
+ * longest (LRU), which is then kalt, and if all of those are gone the copy is not made. A model
+ * the Engine marks `activate`d is never evicted as a model; only its copy can be dropped, and only
+ * when a mandatory claim (pools, or a host check of the Engine) cannot be met otherwise, after which
+ * the model is kalt once deactivated. Without a budget the Engine's host checks (lockable_room)
+ * decide, and evict through `evict_one` the same way when they refuse. */
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -58,8 +69,31 @@ std::string weight_artifact_identity(const std::string& path);
  * misses and mmap faults included); -1 if unreadable. */
 int64_t proc_io_read_bytes();
 
+/* Host RAM in use, by kind, and what the budget did (PreparedWeightStore::stats). */
+struct HostMemoryStats {
+    int64_t budget_bytes = 0;          /* cache.host_budget_mib; 0: derived from the host's limits */
+    int64_t store_bytes = 0;           /* entries and loads in progress, prepared and active models */
+    int64_t pool_bytes = 0;            /* host pools, prefix-cache tier, pinned tables of active models */
+    int64_t staging_bytes = 0;         /* the loads' pinned staging ring and relayout window */
+    int64_t evicted_prepared = 0;      /* vorbereitete Models made kalt */
+    int64_t evicted_active_copies = 0; /* copies of active models dropped (kalt once deactivated) */
+    int64_t evicted_bytes = 0;
+    int64_t over_budget_claims = 0;    /* mandatory claims that stayed over the budget after eviction */
+    int64_t used() const { return store_bytes + pool_bytes + staging_bytes; }
+};
+
+enum class HostUse { Pools, Staging };
+
+/* A store buffer is an anonymous mmap: freeing it returns the memory to the host at once, which an
+ * evicted model's room depends on (a malloc arena may keep it). */
+struct WeightBufferUnmap {
+    size_t bytes = 0;
+    void operator()(uint8_t* p) const;
+};
+
 class PreparedWeightStore {
 public:
+    ~PreparedWeightStore();
     /* Starts a load of `model` under `key`: entries held under another key are dropped. */
     void begin(const std::string& model, const std::string& key);
     /* The prepared bytes of the weight `entry` (rank, name, fingerprint) of exactly `bytes`, or null. */
@@ -78,18 +112,55 @@ public:
     /* Frees the model's entries (it becomes cold). */
     void release(const std::string& model);
 
+    /* ---- host budget (ticket #13) ---- */
+    /* The explicit budget in bytes; 0: none, the Engine's host checks decide. */
+    void set_budget(int64_t bytes);
+    /* Called, under the store's lock (it must not call back), when a vorbereitetes Model is made
+     * kalt by eviction, and by publish_state(). */
+    using StateListener = std::function<void(const std::string& model, bool prepared, int64_t bytes)>;
+    void set_state_listener(StateListener l);
+    /* Reports the model's state to the listener (after its Engine is gone). */
+    void publish_state(const std::string& model);
+    /* The model has an Engine: it is not vorbereitet, its copy is evicted last. deactivate()
+     * ends that, drops its claims, and stamps the model as used now (LRU). */
+    void activate(const std::string& model);
+    void deactivate(const std::string& model);
+    /* The model's Engine takes `bytes` more host RAM of `kind`. Mandatory: it is recorded whatever
+     * the budget says, after evicting copies (prepared models first, then active ones, the
+     * model's own last) while a budget is exceeded. False if it still exceeds it. */
+    bool claim(const std::string& model, HostUse kind, int64_t bytes);
+    void unclaim(const std::string& model, HostUse kind, int64_t bytes);
+    /* Room for `bytes` more of the model's copy under the budget, evicting prepared models LRU;
+     * false if there is none (no budget: always true). */
+    bool make_room(const std::string& model, int64_t bytes);
+    /* Frees one copy that is not `requester`'s, for a host check that refused: the prepared model
+     * idle longest; with `include_active`, then the active model's copy that was activated
+     * longest ago, then the requester's own. False if nothing could be freed. */
+    bool evict_one(const std::string& requester, bool include_active);
+    HostMemoryStats stats() const;
+
 private:
     struct Buffer {
-        std::unique_ptr<uint8_t[]> data;
+        std::unique_ptr<uint8_t, WeightBufferUnmap> data;
         int64_t bytes = 0;
     };
     struct Model {
         std::string key;
         std::unordered_map<std::string, Buffer> entries, pending;
-        int64_t bytes = 0;
+        int64_t bytes = 0, pending_bytes = 0;
+        int64_t pools = 0, staging = 0;
+        bool active = false, loading = false;
+        uint64_t used_at = 0;
     };
+    void drop_entries_locked(Model& m);
+    int64_t used_locked() const;
+    bool evict_locked(const std::string& requester, bool include_active);
     mutable std::mutex m_;
     std::unordered_map<std::string, Model> models_;
+    int64_t budget_ = 0;
+    uint64_t clock_ = 0;
+    HostMemoryStats stats_;
+    StateListener listener_;
 };
 
 }  /* namespace rad */

@@ -129,6 +129,13 @@ struct Fleet {
         ActivationOptions act;
         act.idle_timeout_ms = idle_ms;
         mr = std::make_unique<ModelRouter>("a", 1, &reg, act);
+        if (store) {
+            /* As main.cpp wires it: an eviction makes the model cold for the router. */
+            store->set_state_listener([this](const std::string& id, bool prepared, int64_t bytes) {
+                mr->note_prepared(id, prepared, bytes);
+            });
+            mr->set_weight_store(store);
+        }
         for (const char* id : { "a", "b", "c" })
             mr->add_cold(id, [this](const std::string& model) {
                 ++launches;
@@ -137,15 +144,19 @@ struct Fleet {
                 e.sched.manual = manual;   /* before the Server can be reached */
                 if (store) {
                     WeightLoadReport rep;
+                    store->activate(model);   /* the Engine does it in set_weight_store */
                     store->begin(model, "key");
                     if (store->prepared(model)) {
                         rep.warm = true;
                         rep.bytes = rep.bytes_from_store = store->ram_bytes(model);
                         rep.disk_read_bytes = 0;
                     } else {
-                        std::memset(store->reserve(model, "w0", 4096), 7, 4096);
+                        /* A budget may refuse the copy: the model then stays cold. */
+                        if (uint8_t* p = store->reserve(model, "w0", 4096)) {
+                            std::memset(p, 7, 4096);
+                            rep.captured = true;
+                        }
                         store->commit(model);
-                        rep.captured = true;
                         rep.bytes = rep.source_read_bytes = rep.disk_read_bytes = 4096;
                     }
                     rep.seconds = 0.25;
@@ -163,7 +174,10 @@ struct Fleet {
                     std::lock_guard<std::mutex> lk(m);
                     live.erase(model);
                 }
-                if (store) mr->note_prepared(model, store->prepared(model), store->ram_bytes(model));
+                if (store) {
+                    store->deactivate(model);   /* ~Engine */
+                    store->publish_state(model);
+                }
                 return rc;
             });
         mr->activate("a");
@@ -174,6 +188,7 @@ struct Fleet {
     ~Fleet() {
         mr->stop();
         if (listener.joinable()) listener.join();
+        if (store) store->set_state_listener(nullptr);
         mr.reset();
     }
 
@@ -260,6 +275,47 @@ TEST(a_deactivated_model_with_prepared_weights_is_prepared_and_reactivates_warm)
     CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
     CHECK_EQ(f.status("a")["cold_activations"].get<int>(), 2);
     REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
+}
+
+/* With a host budget of two models' weights, the third activation makes the prepared model idle the
+ * longest cold (state, status and metrics say so); that model is still activatable, cold, and
+ * evicts the next one in turn. The budget is never exceeded. */
+TEST(the_host_budget_makes_the_least_recently_used_prepared_model_cold) {
+    PreparedWeightStore store;
+    store.set_budget(8192);
+    Fleet f(100, false, nullptr, &store);
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
+    CHECK_EQ(reply_of(f.post("b")), std::string("beta"));
+    REQUIRE(eventually([&] { return f.state("b") == ModelState::Prepared; }));
+    CHECK(f.state("a") == ModelState::Prepared);
+    CHECK_EQ(store.stats().used(), (int64_t)8192);
+
+    CHECK_EQ(reply_of(f.post("c")), std::string("gamma"));
+    REQUIRE(eventually([&] { return f.state("c") == ModelState::Prepared; }));
+    CHECK(f.state("a") == ModelState::Cold);
+    CHECK(f.state("b") == ModelState::Prepared);
+    json st = f.status("a");
+    CHECK_EQ(st["state"].get<std::string>(), std::string("cold"));
+    CHECK_EQ(st["prepared_bytes"].get<int64_t>(), (int64_t)0);
+    const json host = json::parse(f.mr->status_json())["host_memory"];
+    CHECK_EQ(host["budget_bytes"].get<int64_t>(), (int64_t)8192);
+    CHECK_EQ(host["store_bytes"].get<int64_t>(), (int64_t)8192);
+    CHECK_EQ(host["evicted_prepared"].get<int64_t>(), (int64_t)1);
+    const std::string m = f.mr->metrics_text();
+    CHECK(m.find("radiance:host_budget_bytes 8192") != std::string::npos);
+    CHECK(m.find("radiance:host_used_bytes{kind=\"store\"} 8192") != std::string::npos);
+    CHECK(m.find("radiance:host_used_bytes{kind=\"pools\"} 0") != std::string::npos);
+    CHECK(m.find("radiance:host_evictions_total{kind=\"prepared\"} 1") != std::string::npos);
+
+    /* The cold model activates (a cold load) and b, now the oldest, gives way for it. */
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    st = f.status("a");
+    CHECK_EQ(st["cold_activations"].get<int>(), 2);
+    CHECK_EQ(st["last_weight_load"]["kind"].get<std::string>(), std::string("cold"));
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Prepared; }));
+    CHECK(f.state("b") == ModelState::Cold);
+    CHECK(f.state("c") == ModelState::Prepared);
+    CHECK(store.stats().used() <= 8192);
 }
 
 TEST(a_model_that_keeps_getting_requests_stays_active) {

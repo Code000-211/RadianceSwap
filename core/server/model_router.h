@@ -55,7 +55,8 @@
  * VORBEREITET, not cold, after its deactivation (`note_prepared`), and its next activation uploads
  * them from host memory instead of reading the source. The Launcher reports each activation's
  * WeightLoadReport (`note_weight_load`); status and metrics tell warm from cold activations with
- * their bytes, durations and disk reads.
+ * their bytes, durations and disk reads. The host budget (#13, docs/swap/host-budget.md) can make a
+ * prepared model cold while it is idle: the store tells the router through `note_prepared`.
  *
  * Lifetime: a Server is attached from its Engine's thread and must stay alive until serve_model
  * returns, which it does only after the listener has stopped and every attached Server was told to
@@ -139,6 +140,9 @@ public:
     /* Whether `id` leaves the Launcher with its weights in host memory (and how many bytes): then its
      * state after a deactivation is VORBEREITET. Called as the Launcher returns, on any path. */
     void note_prepared(const std::string& id, bool prepared, int64_t ram_bytes);
+    /* The process's PreparedWeightStore, whose host-memory figures (budget, use by kind, evictions)
+     * status and metrics report. Set before run(). */
+    void set_weight_store(const PreparedWeightStore* s) { weights_ = s; }
     /* GET /radiance/models: each model's state and activation and deactivation counts. */
     std::string status_json() const;
     /* Prometheus text (radiance:model_*), appended to the default model's /metrics. */
@@ -216,7 +220,7 @@ private:
     /* A request that names no model while the default one is not attached: probes and scrapes the
      * router answers itself, so they never activate a model. */
     HttpResponse answer_unattached(const HttpRequest& q) const;
-    std::string status_json_locked() const;
+    std::string status_json_locked(const HostMemoryStats& host) const;
     /* What a request gets while the group is unhealthy: the probes and the scrape are answered,
      * everything else is refused. Under m_ for the reason only. */
     HttpResponse answer_unhealthy(const HttpRequest& q) const;
@@ -228,6 +232,7 @@ private:
     const std::string default_id_;
     const size_t      n_models_;
     ModelRegistry* const registry_;
+    const PreparedWeightStore* weights_ = nullptr;
     ActivationOptions act_;
     Router            router_;
     HttpTransport     transport_;
