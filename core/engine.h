@@ -290,8 +290,15 @@ private:
     bool host_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why,
                    bool mandatory = true);
     /* Records `bytes` of host RAM this activation takes (host pools, pinned tables) in the store's
-     * ledger and, under an explicit budget, makes room for it. */
-    void claim_host(int64_t bytes, HostUse kind = HostUse::Pools);
+     * ledger and, under an explicit budget, makes room for it. False: over the budget although
+     * every copy that could go has gone (the claim is booked either way). */
+    bool claim_host(int64_t bytes, HostUse kind = HostUse::Pools);
+    /* Engine::plan's last word on its host pools, before any is allocated: `bytes` (everything
+     * plan claimed) must pass host_room (MemAvailable, every memory cgroup, --host-headroom-mib;
+     * the store's copies go first) and `within_budget` (every claim met cache.host_budget_mib).
+     * RAD_E_NOHOST with the reason logged otherwise. Other models are never touched but for the
+     * store copies host_room drops. */
+    int admit_host_pools(bool within_budget, int64_t bytes);
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup

@@ -409,14 +409,36 @@ bool Engine::host_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     return true;
 }
 
-void Engine::claim_host(int64_t bytes, HostUse kind) {
-    if (!weight_store_ || bytes <= 0) return;
-    if (!weight_store_->claim(weight_model_id(), kind, bytes))
+bool Engine::claim_host(int64_t bytes, HostUse kind) {
+    if (!weight_store_ || bytes <= 0) return true;
+    const bool within = weight_store_->claim(weight_model_id(), kind, bytes);
+    if (!within)
         RAD_WARN("host budget: '%s' takes %s of host memory (%s) and the budget of %s is exceeded "
                  "although no other model's copy is left to drop; the pools of active models are "
                  "not evictable", weight_model_id().c_str(), humanb(bytes).c_str(),
                  kind == HostUse::Pools ? "pools" : "staging",
                  humanb(weight_store_->stats().budget_bytes).c_str());
+    return within;
+}
+
+int Engine::admit_host_pools(bool within_budget, int64_t bytes) {
+    std::string why;
+    if (!host_room(bytes, 0, host_headroom_bytes(), false, &why)) {
+        RAD_ERR("host memory: this model's host pools (%s: the pinned host pool with what it grows "
+                "by for streamed static weights, experts and the drafter, the prefix cache's host "
+                "tier, the activation arenas and pinned tables) do not fit: %s. Nothing running is "
+                "touched; free host memory, lower --host-pool-mib, or deactivate a model",
+                humanb(bytes).c_str(), why.c_str());
+        return RAD_E_NOHOST;
+    }
+    if (!within_budget) {
+        RAD_ERR("host budget: this model's host pools (%s) do not fit cache.host_budget_mib (%s) "
+                "after every prepared model and every store copy was dropped. Nothing running is "
+                "touched; raise cache.host_budget_mib or lower --host-pool-mib",
+                humanb(bytes).c_str(), humanb(weight_store_->stats().budget_bytes).c_str());
+        return RAD_E_NOHOST;
+    }
+    return RAD_OK;
 }
 
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
@@ -1840,8 +1862,8 @@ int Engine::plan() {
          * (configure_kv). */
         const int64_t host_MiB = (int64_t)1 << 20;
         const int64_t pool_mib_claimed = cfg_.host_pool_mib;
-        claim_host((int64_t)cfg_.tp * pool_mib_claimed * host_MiB +
-                   cfg_.prefix_cache_mib * host_MiB + host_arenas);
+        bool within_budget = claim_host((int64_t)cfg_.tp * pool_mib_claimed * host_MiB +
+                                        cfg_.prefix_cache_mib * host_MiB + host_arenas);
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
         /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
@@ -1876,8 +1898,10 @@ int Engine::plan() {
                          humanb(draft_max).c_str(), (long long)add);
             }
         }
-        claim_host((int64_t)cfg_.tp * (cfg_.host_pool_total_mib() - pool_mib_claimed) * host_MiB +
-                   (cfg_.ngram_resolved == TablePlacement::Ram ? align_up(ngram_bytes, (int64_t)2 << 20) : 0));
+        const int64_t ngram_ram =
+            cfg_.ngram_resolved == TablePlacement::Ram ? align_up(ngram_bytes, (int64_t)2 << 20) : 0;
+        within_budget &= claim_host((int64_t)cfg_.tp * (cfg_.host_pool_total_mib() - pool_mib_claimed) *
+                                    host_MiB + ngram_ram);
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
@@ -1921,7 +1945,7 @@ int Engine::plan() {
                 const int64_t add = want > pool ? align_up(want - pool, MiB) / MiB : 0;
                 if (add > 0) {
                     cfg_.host_pool_mib += add;
-                    claim_host((int64_t)cfg_.tp * add * host_MiB);
+                    within_budget &= claim_host((int64_t)cfg_.tp * add * host_MiB);
                     RAD_INFO("placement: %s of the static weights do not fit the card beside one "
                              "sequence of cache and stream from the pinned host pool; "
                              "--host-pool-mib grows by %lld to hold them%s",
@@ -1930,6 +1954,13 @@ int Engine::plan() {
                 }
             }
         }
+        /* Every host pool of this activation is final and none is allocated yet: the whole of it
+         * goes through the host checks (and the budget, claimed above) before the first byte is
+         * pinned, so a pool that does not fit refuses the activation instead of the kernel's OOM
+         * killer taking the process, and the models serving stay as they are. */
+        RAD_TRY(admit_host_pools(within_budget,
+                                 (int64_t)cfg_.tp * cfg_.host_pool_total_mib() * host_MiB +
+                                 cfg_.prefix_cache_mib * host_MiB + host_arenas + ngram_ram));
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());

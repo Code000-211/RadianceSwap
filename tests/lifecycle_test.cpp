@@ -1299,6 +1299,67 @@ TEST(a_second_activation_from_the_prepared_store_reads_no_checkpoint_bytes) {
     CHECK(released.source_read_bytes > 0);
 }
 
+/* Ticket #46: the host pool an activation plans goes through the host checks and the budget before
+ * it is allocated. The tiny model asks for a 64 MiB pool. (1) A --host-headroom-mib no host has
+ * (the stand-in for a MemAvailable or cgroup bound) refuses the activation with RAD_E_NOHOST.
+ * (2) So does a budget that cannot hold both pools, after dropping the active model's store copy
+ * (LRU) and finding that not enough. Either way the model serving keeps its pools and runs on.
+ * (3) A budget with room for both pools admits the activation. */
+TEST(a_host_pool_that_does_not_fit_refuses_the_activation_and_leaves_the_active_model) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+    tiny::TempDir dir("engine_host_pool");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+    const int64_t MiB = (int64_t)1 << 20;
+
+    rad::Config cfg = tiny_config(dir.path, home);
+    cfg.host_pool_mib = 64;
+    cfg.served_model_name = "a";
+
+    rad::PreparedWeightStore store;
+    rad::Engine a(cfg);
+    a.set_weight_store(&store);
+    REQUIRE_EQ(a.start(), RAD_OK);
+    REQUIRE_EQ(a.start_execution(), RAD_OK);
+    const rad::HostMemoryStats held = store.stats();
+    CHECK(held.pool_bytes >= 64 * MiB);
+
+    {   /* No host has this much to spare: the MemAvailable and cgroup checks refuse. */
+        rad::Config big = cfg;
+        big.served_model_name = "b";
+        big.host_headroom_mib = INT64_MAX / MiB / 2;
+        rad::Engine b(std::move(big));
+        b.set_weight_store(&store);
+        CHECK_EQ(b.start(), RAD_E_NOHOST);
+    }
+    CHECK_EQ(store.stats().pool_bytes, held.pool_bytes);   /* b's claims ended with b */
+
+    {   /* A budget that cannot hold b's pool beside a's. */
+        store.set_budget(held.pool_bytes + 32 * MiB);
+        rad::Config over = cfg;
+        over.served_model_name = "b";
+        rad::Engine b(std::move(over));
+        b.set_weight_store(&store);
+        CHECK_EQ(b.start(), RAD_E_NOHOST);
+    }
+    CHECK_EQ(store.stats().pool_bytes, held.pool_bytes);
+    CHECK(store.stats().over_budget_claims > 0);
+    CHECK(store.stats().evicted_active_copies > 0);   /* a's copy went first; a runs on */
+
+    {   /* Room for both pools. */
+        store.set_budget(2 * held.pool_bytes + 1 * MiB);
+        rad::Config fits = cfg;
+        fits.served_model_name = "b";
+        rad::Engine b(std::move(fits));
+        b.set_weight_store(&store);
+        CHECK_EQ(b.start(), RAD_OK);
+        CHECK(store.stats().used() <= store.stats().budget_bytes);
+    }
+    CHECK(a.execution_running());
+    CHECK_EQ(a.stop_execution(rad::StopMode::Drain), RAD_OK);
+}
+
 /* Heat warmup (ticket #20) on a model with nothing to warm: a dense model has no routed experts,
  * so its deactivation saves no heat; a saved heat that names experts it does not have, under a
  * warmup budget, changes nothing -- the tokens are those of the activation without one. Without a
@@ -1348,8 +1409,20 @@ TEST(a_host_budget_that_the_weights_do_not_fit_leaves_the_model_cold_but_activat
     const int64_t weights = roomy.ram_bytes("tiny");
     CHECK(weights > 0);
 
+    /* The budget must hold the model's pools (a pool over the budget refuses the activation, ticket
+     * #46); the weights' copy is what it cannot hold. */
+    int64_t pools = 0;
+    {
+        rad::PreparedWeightStore probe;
+        rad::Config c = cfg;
+        c.served_model_name = "tiny";
+        rad::Engine e(std::move(c));
+        e.set_weight_store(&probe);
+        CHECK_EQ(e.start(), RAD_OK);
+        pools = probe.stats().pool_bytes;
+    }
     rad::PreparedWeightStore tight;
-    tight.set_budget(weights / 2);
+    tight.set_budget(pools + weights / 2);
     rad::WeightLoadReport cold, again;
     const std::vector<int32_t> t2 = activate_tiny(cfg, tight, &cold);
     CHECK(!cold.captured);
