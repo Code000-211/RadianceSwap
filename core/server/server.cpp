@@ -402,9 +402,11 @@ std::optional<HttpResponse> Server::admit(int64_t n, const std::string& peer, Ap
     return std::nullopt;
 }
 
+/* The decrement is the last touch of the Server: a response that releases its places is over, and
+ * a ModelRouter that sees in_flight() at 0 may deactivate the model and destroy this object. */
 void Server::release(int64_t n) {
-    int64_t cur = in_flight_.fetch_sub(n, std::memory_order_acq_rel) - n;
-    metrics_.set_queue_depth(cur);
+    metrics_.set_queue_depth(in_flight_.load(std::memory_order_relaxed) - n);
+    in_flight_.fetch_sub(n, std::memory_order_acq_rel);
 }
 
 void Server::sweep_abandoned() {
