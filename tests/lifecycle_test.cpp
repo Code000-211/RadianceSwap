@@ -1096,4 +1096,57 @@ TEST(teardown_after_a_complete_start_is_complete_and_repeatable) {
     CHECK_EQ(DeviceLedger::now().str(), before.str());
 }
 
+/* Manifest mode, host backend: an engine that joined a group planner (its mover shrinkable, the
+ * group tick running between steps and while idle) generates the tokens an engine outside any
+ * group does. A dense model has no expert class, so nothing is capped; this holds the wiring, not
+ * the shrink (place_test covers that on the mover). */
+TEST(a_host_engine_in_a_group_generates_the_tokens_of_one_outside_it) {
+    std::string home = find_radiance_home();
+    REQUIRE(!home.empty());
+
+    tiny::TempDir dir("engine_group_gen");
+    REQUIRE(dir.ok());
+    REQUIRE(tiny::write_qwen35(dir.path, {}));
+
+    auto generate = [&](rad::GroupPlanner* group) {
+        rad::Config cfg;
+        cfg.model = dir.path;
+        cfg.radiance_home = home;
+        cfg.kernel_hierarchy = { "libavx" };
+        cfg.served_model_name = "tiny";
+        rad::Engine engine(cfg);
+        if (group) engine.set_group_planner(group);
+        CHECK_EQ(engine.start(), RAD_OK);
+        if (group) CHECK(!group->target("tiny").empty());    /* planned inside the group */
+        CHECK_EQ(engine.start_execution(), RAD_OK);
+
+        rad::server::Sink sink;
+        auto r = std::make_unique<rad::Request>();
+        r->id = 1;
+        r->prompt = { 1, 2, 3 };
+        r->max_tokens = 4;
+        r->ignore_eos = true;
+        r->sp.temp = 0.0f;
+        r->sink = &sink;
+        CHECK_EQ(engine.scheduler().add(std::move(r)), RAD_OK);
+        while (!sink.done()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::vector<int32_t> out;
+        rad::server::SinkToken tokens[16];
+        const size_t n = sink.read(tokens, 16);
+        for (size_t i = 0; i < n; ++i) out.push_back(tokens[i].token);
+        engine.scheduler().reap(1);
+        /* Idle ticks run the group tick as well. */
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        CHECK_EQ(engine.stop_execution(rad::StopMode::Drain), RAD_OK);
+        return out;
+    };
+
+    const std::vector<int32_t> alone = generate(nullptr);
+    CHECK_EQ(alone.size(), (size_t)4);
+    rad::GroupPlanner group(0);
+    const std::vector<int32_t> grouped = generate(&group);
+    CHECK(alone == grouped);
+    CHECK(group.target("tiny").empty());    /* the engine left when it was destroyed */
+}
+
 RAD_TEST_MAIN()

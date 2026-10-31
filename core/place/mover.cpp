@@ -132,6 +132,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     /* ---- how many slots each class needs, counted before anything is allocated ------------- */
     std::vector<int64_t> n_slab(plan.classes.size(), 0), n_pool(plan.classes.size(), 0);
+    std::vector<int64_t> n_resident(plan.classes.size(), 0), n_movable(plan.classes.size(), 0);
     int64_t static_need = 0, pageable_need = 0;
     for (size_t u = 0; u < plan.units.size(); ++u) {
         const MoveUnit& mu = plan.units[u];
@@ -144,6 +145,8 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         if (mu.tier == Tier::VRAM && mu.slab_slot >= 0) {
             n_slab[(size_t)mu.slab_class] = std::max(n_slab[(size_t)mu.slab_class],
                                                      (int64_t)mu.slab_slot + 1);
+            ++n_resident[(size_t)mu.slab_class];
+            if (mu.movable) ++n_movable[(size_t)mu.slab_class];
         } else if (mu.tier == Tier::VRAM) {
             us.static_off = align_up(static_need, RAD_ALIGN_UNIT);
             static_need = us.static_off + mu.bytes;
@@ -153,6 +156,26 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         } else if (mu.tier == Tier::HostPageable) {
             us.static_off = align_up(pageable_need, RAD_ALIGN_UNIT);
             pageable_need = us.static_off + mu.bytes;
+        }
+    }
+
+    /* ---- spare pool slots for a shrinking resident set ------------------------------------
+     * Counted before anything is reserved, so the pool's own units and the file tier's reserves
+     * keep their room: what --host-pool-mib has left after them is all a shrink may use. */
+    std::vector<int64_t> n_spare(plan.classes.size(), 0);
+    if (cfg.shrinkable && plan.dynamic) {
+        bool has_file = plan.file_stage_vram > 0;
+        for (const MoveUnit& mu : plan.units) has_file = has_file || mu.tier == Tier::SSD;
+        int64_t room = budget_ ? budget_->host_pinned().avail() : plan.host_budget;
+        if (has_file) room -= plan.file_stage_reserve + (8 << 20);
+        room -= (int64_t)RAD_ALIGN_UNIT * ((int64_t)plan.classes.size() + 8);
+        for (size_t c = 0; c < plan.classes.size(); ++c)
+            room -= n_pool[c] * plan.classes[c].stride;
+        for (size_t c = 0; c < plan.classes.size() && room > 0; ++c) {
+            const int64_t stride = plan.classes[c].stride;
+            if (stride <= 0) continue;
+            n_spare[c] = std::min(n_movable[c], room / stride);
+            room -= n_spare[c] * stride;
         }
     }
 
@@ -176,6 +199,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
+        cp.n_pool0 = n_pool[c];
+        cp.n_resident0 = n_resident[c];
+        cp.n_movable0 = n_movable[c];
         total_slab += slab_slots;
         total_pool += n_pool[c];
         if (slab_slots > 0) {
@@ -193,9 +219,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         for (int64_t s = n_slab[c]; s < slab_slots; ++s) cp.slab.add_free(s);
         total_shadow += shadow + sc.n_stage;
 
-        cp.pool.init(n_pool[c], sc.stride);
-        if (n_pool[c] > 0) {
-            cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
+        cp.pool.init(n_pool[c], sc.stride, n_pool[c] + n_spare[c]);
+        if (n_pool[c] + n_spare[c] > 0) {
+            cp.pool_base = reserve(sc.name.c_str(), (n_pool[c] + n_spare[c]) * sc.stride,
+                                   RAD_MEM_HOST_PINNED);
             if (!cp.pool_base) {
                 RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
                         sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str());
@@ -1410,8 +1437,9 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     return RAD_OK;
 }
 
-int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
+int Mover::fill(size_t klass, int64_t room, HeatEngine* heat, int64_t lo) {
     if (room <= 0) return RAD_OK;
+    if (lo < 0) lo = pools_[klass].n_fixed;
     struct Cand { float h; int32_t layer; int32_t unit; };
     std::vector<Cand> cand;
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
@@ -1449,7 +1477,7 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
             /* A lent slot, never a working one. Shadow and staging slots are what let a swap
              * happen, and a unit filled into one sits in the budgeted range where no loan shrink
              * returns it, so the reserve would be lost. */
-            const int64_t slot = pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
+            const int64_t slot = pools_[klass].slab.take_at_least(lo);
             if (slot < 0) return RAD_OK;
             if (heat) heat->set_busy(u, true);
             if (promote_to(u, slot) < 0) {                   /* no record left: next time */
@@ -1466,13 +1494,91 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
     return RAD_OK;
 }
 
+int Mover::set_resident_cap(size_t klass, int64_t units) {
+    if (klass >= pools_.size()) return RAD_E_INVAL;
+    ClassPools& cp = pools_[klass];
+    if (cp.n_movable0 == 0) return RAD_OK;
+    /* A segment keeps the working slots, the residents that cannot move, and no fewer slots than
+     * the spare pool capacity can host the rest of. */
+    const int64_t spare = cp.pool.capacity() - cp.n_pool0;
+    const int64_t least = std::max(cp.n_work + cp.n_resident0 - cp.n_movable0, cp.n_fixed - spare);
+    const int64_t t = units < 0 ? cp.n_fixed : std::clamp(units + cp.n_work, least, cp.n_fixed);
+    if (t == cp.slab.target(0)) return RAD_OK;
+    cp.slab.set_target(0, t);
+    cp.pool.set_target(cp.n_pool0 + (cp.n_fixed - t));
+    cp.resized = true;
+    return RAD_OK;
+}
+
+/* One step of the resident cap, from the units' own state rather than the slot counts, so a swap
+ * in flight cannot throw it off: the budgeted residents (a promotion on its way counts, a
+ * demotion on its way does not) against the cap the segment's size states. Above it, the coldest
+ * movable residents are demoted, a burst a call; below it, the slots that came back are filled
+ * with the hottest pooled units, never past the working reserve. Units stranded above a shrunk
+ * segment move into the slots below once those are free. */
+bool Mover::resize(size_t c, HeatEngine* heat) {
+    constexpr int64_t kBurst = 16;
+    ClassPools& cp = pools_[c];
+    const int64_t cap = cp.slab.target(0) - cp.n_work;
+    int64_t resident = 0;
+    std::vector<int32_t> stranded;
+    drop_cand_.clear();
+    for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
+        const UnitState& us = unit_[(size_t)u];
+        if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.is_flex(us.slab_slot)) continue;
+        ++resident;
+        if (us.tier != Tier::VRAM || us.site != Site::Device || (heat && heat->busy(u)) ||
+            unit_in_flight(u))
+            continue;
+        if (!cp.slab.covered(us.slab_slot)) { stranded.push_back(u); continue; }
+        if (us.pool_slot >= 0 || (!plan_->units[(size_t)u].movable && !us.hot)) continue;
+        drop_cand_.push_back({ heat ? heat->heat(u) : 0.0f, u });
+    }
+    for (const Move& m : moves_) {
+        if (m.state == Move::State::Free || m.unit < 0 || m.slab_slot < 0) continue;
+        if (unit_[(size_t)m.unit].klass != (int32_t)c || cp.is_flex(m.slab_slot)) continue;
+        if (m.kind == Move::Kind::Demote) --resident;
+        if (m.kind == Move::Kind::Promote) ++resident;
+    }
+    const int64_t excess = resident - cap;
+    bool moved = false;
+
+    /* Stranded units go down into free slots beyond the working reserve. */
+    int64_t spare = cp.slab.n_free_below(cp.n_fixed) - cp.n_work;
+    for (size_t i = 0; i < stranded.size() && spare > 0; ++i)
+        if (migrate(stranded[i], heat)) { --spare; moved = true; }
+
+    if (excess > 0) {
+        auto colder = [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
+            return a.first != b.first ? a.first < b.first : a.second < b.second;
+        };
+        const size_t k = std::min<size_t>(drop_cand_.size(), (size_t)std::min(excess, kBurst));
+        std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
+                          colder);
+        for (size_t i = 0; i < k; ++i) {
+            const int32_t u = drop_cand_[i].second;
+            if (heat) heat->set_busy(u, true);
+            Swap s;
+            s.demote = u;
+            if (issue(s, heat) < 0) break;
+            moved = true;
+        }
+    } else if (excess < 0) {
+        const int64_t room = std::min(-excess, spare);
+        if (room > 0 && fill(c, room, heat, 0) >= 0) moved = true;
+    } else if (stranded.empty() && cp.slab.target(0) == cp.n_fixed) {
+        cp.resized = false;     /* regrown and settled: the class is as the plan placed it */
+    }
+    return moved;
+}
+
 int Mover::balance(HeatEngine* heat, bool turnover) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
     for (size_t c = 0; c < pools_.size(); ++c) {
         ClassPools& cp = pools_[c];
-        if (cp.flex_ptr.empty()) continue;
-        bool drained = false;
+        if (cp.flex_ptr.empty() && !cp.resized) continue;
+        bool drained = cp.resized && resize(c, heat);
 
         /* ---- Empty what the loan no longer covers, all of it, first: drops cost no link
          * traffic and the lender is waiting. A busy unit is still on its way in and goes on a
@@ -1483,6 +1589,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
                 const UnitState& us = unit_[(size_t)u];
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.slab.covered(us.slab_slot)) continue;
+                if (!cp.is_flex(us.slab_slot)) continue;   /* above a shrunk resident cap: resize() */
                 /* Anything else past the loan (an unretired promotion, a staged unit) becomes
                  * droppable later, so the sweep must come back for it. */
                 if (us.tier != Tier::VRAM || us.site != Site::Device || (heat && heat->busy(u))) {
@@ -1524,7 +1631,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             if (unit_[(size_t)m.unit].klass != (int32_t)c || !cp.slab.covered(m.slab_slot)) continue;
             if (m.frees_slab()) ++pending;
         }
-        const int64_t turn = turnover ? cp.n_turn : 0;
+        const int64_t turn = turnover && !cp.flex_ptr.empty() ? cp.n_turn : 0;
         int64_t short_by = cp.n_work + turn - (cp.slab.n_free() + pending);
         if (short_by > 0) {
             drop_cand_.clear();
@@ -1806,7 +1913,9 @@ int Mover::retire(HeatEngine* heat) {
                 continue;
             case Move::Kind::Migrate:
                 us.slab_slot = m.to_slot;
-                --pools_[(size_t)us.klass].n_donated;
+                /* A donor leaving a lent slot; a budgeted unit moved down by a shrink (resize)
+                 * is no donor. */
+                if (pools_[(size_t)us.klass].is_flex(m.slab_slot)) --pools_[(size_t)us.klass].n_donated;
                 ++stats_.relocated;
                 break;
             case Move::Kind::Release:

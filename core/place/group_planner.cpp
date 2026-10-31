@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <set>
 
 namespace rad {
 
@@ -142,14 +143,32 @@ std::vector<GroupBudget> group_allocate(const std::vector<int64_t>& pool,
     return out;
 }
 
+namespace {
+bool counted(const MoveUnit& mu) {
+    return mu.access == RAD_ACCESS_CONDITIONAL && mu.expert >= 0 && mu.slab_class >= 0 &&
+           !mu.preplaced();
+}
+}  /* namespace */
+
+std::vector<int32_t> group_classes(const Plan& plan) {
+    std::set<int32_t> k;
+    for (const MoveUnit& mu : plan.units)
+        if (counted(mu)) k.insert(mu.slab_class);
+    return { k.begin(), k.end() };
+}
+
+int64_t group_resident_cap(const RankBudget& b, int32_t slab_class) {
+    if (b.class_units.empty()) return b.bytes > 0 ? -1 : 0;
+    const auto it = b.class_units.find(slab_class);
+    return it == b.class_units.end() ? 0 : it->second;
+}
+
 std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat) {
     struct Acc { double heat = 0; HeatBin bin; };
     std::map<std::pair<int32_t, int>, Acc> acc;
     for (size_t u = 0; u < plan.units.size(); ++u) {
         const MoveUnit& mu = plan.units[u];
-        if (mu.access != RAD_ACCESS_CONDITIONAL || mu.expert < 0 || mu.slab_class < 0 ||
-            mu.preplaced())
-            continue;
+        if (!counted(mu)) continue;
         const float h = heat.enabled() ? heat.heat((int32_t)u) : 0.0f;
         /* Octaves of heat; bucket 0 is cold. */
         const int bucket = h > 0.0f ? std::clamp(std::ilogb(h) + 24, 1, 63) : 0;
@@ -218,6 +237,13 @@ void GroupPlanner::update(const std::string& id, const std::vector<std::vector<H
     for (GroupMember& m : members_)
         if (m.id == id)
             for (size_t r = 0; r < bins.size() && r < m.facts.size(); ++r) m.facts[r].bins = bins[r];
+    recompute();
+}
+
+void GroupPlanner::update(const std::string& id, size_t rank, std::vector<HeatBin> bins) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (GroupMember& m : members_)
+        if (m.id == id && rank < m.facts.size()) m.facts[rank].bins = std::move(bins);
     recompute();
 }
 

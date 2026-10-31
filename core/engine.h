@@ -596,6 +596,13 @@ private:
      * may only be driven while its rank thread is parked, which this thread knows. `idle` also
      * runs each mover's own fill, which a busy engine gets from the step. */
     void loan_tick(bool idle);
+    /* Manifest mode: at a step boundary (and idle), report each rank's heat to the group planner
+     * every kGroupReportEvery-th tick, read the engine's target and state it to every mover as a
+     * resident cap (Mover::set_resident_cap); an idle rank carries it out itself, a running one
+     * in its next step. Heat-off (static) ranks keep what they were given. */
+    void group_tick(bool idle);
+    uint64_t group_last_ns_ = 0;
+    uint32_t group_ticks_ = 0;
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx

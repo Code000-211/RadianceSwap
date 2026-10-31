@@ -618,6 +618,7 @@ int Engine::step_loop() {
             tier_tick();
             expire_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
+            group_tick(/*idle=*/true);
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -923,6 +924,7 @@ int Engine::step_loop() {
         sched_.step_finished();
         tier_tick();
         loan_tick(/*idle=*/false);
+        group_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
@@ -1546,6 +1548,40 @@ void Engine::loan_tick(bool idle) {
             if (st < 0) RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
                                  rad_strerror(st));
         }
+    }
+    (void)rad_dev_set(ranks_[0]->device);
+}
+
+/* ------------------------------------------------------------------ the group's target
+ *
+ * The group planner (place/group_planner.h) decides how many expert slots this engine keeps; this
+ * is where the engine hears it. It runs between steps, like loan_tick, so a mover is driven only
+ * while its rank thread is parked. The mover does the rest (Mover::set_resident_cap): the table
+ * edits of a shrink or a regrow are published by the next step's table sync, never inside a
+ * step, and a request in flight keeps running on whatever its experts' addresses are. */
+void Engine::group_tick(bool idle) {
+    if (!group_ || ranks_.empty()) return;
+    const uint64_t now = rad_mono_ns();
+    if (now - group_last_ns_ < 100000000ull) return;    /* 100 ms */
+    group_last_ns_ = now;
+
+    const std::string& id = cfg_.served_model_name;
+    constexpr uint32_t kGroupReportEvery = 10;           /* heat summaries once a second */
+    if (group_ticks_++ % kGroupReportEvery == 0)
+        for (size_t i = 0; i < ranks_.size(); ++i)
+            if (ranks_[i]->heat.enabled())
+                group_->update(id, i, group_heat_bins(ranks_[i]->plan, ranks_[i]->heat));
+
+    const GroupBudget want = group_->target(id);
+    for (size_t i = 0; i < ranks_.size() && i < want.size(); ++i) {
+        Rank& r = *ranks_[i];
+        if (!r.heat.enabled()) continue;
+        for (int32_t k : group_classes(r.plan))
+            (void)r.mover.set_resident_cap((size_t)k, group_resident_cap(want[i], k));
+        if (!idle || !r.mover.resizing() || rad_dev_set(r.device) < 0) continue;
+        const int st = r.mover.idle_tick(&r.heat);
+        if (st < 0) RAD_WARN("rank %d: resizing the expert slab while idle: %s", r.index,
+                             rad_strerror(st));
     }
     (void)rad_dev_set(ranks_[0]->device);
 }

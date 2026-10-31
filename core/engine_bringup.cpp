@@ -2864,6 +2864,7 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        mc.shrinkable = group_ != nullptr;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not

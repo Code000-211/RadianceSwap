@@ -11,6 +11,7 @@
 #include "device/directio.h"
 #include "mem/pools.h"
 #include "mem/vram_budget.h"
+#include "place/group_planner.h"
 #include "place/heat.h"
 #include "place/mover.h"
 #include "place/stager.h"
@@ -1577,6 +1578,10 @@ struct LoanRig {
     /* None by default: on a slab this small the production count would leave most of the loan
      * empty. Tests of turnover set their own. */
     int         turnover = 0;
+    /* A group planner may resize the resident set (MoverConfig::shrinkable), and the KV cache may
+     * not lend at all (the resident-cap tests run on a bare slab). */
+    bool        shrinkable = false;
+    bool        lend = true;
 
     explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
 
@@ -1585,10 +1590,11 @@ struct LoanRig {
         RAD_TRY(h.init(hf.plan, hp));
         MoverConfig mc;
         mc.turnover_slots = turnover;
+        mc.shrinkable = shrinkable;
         RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
-        RAD_TRY(m.lend_from(Mover::kLendKV, loan.strips));
+        if (lend) RAD_TRY(m.lend_from(Mover::kLendKV, loan.strips));
         planned = resident_count(h, hf.plan);
         return RAD_OK;
     }
@@ -2107,6 +2113,306 @@ TEST(slot_pool_segments_have_their_own_targets) {
     CHECK_EQ(s.top_held(b), -1);
     CHECK_EQ(s.take(), 3);
     CHECK_EQ(s.take(), -1);
+}
+
+/* ---- the resident cap (ticket #15): a running engine gives slots back to the group at a step
+ * boundary and takes them again. Same rig as the loan, on a bare slab unless a test lends. */
+namespace {
+/* The units heat holds resident (a movable expert in a slab slot), by unit index. */
+std::vector<int32_t> resident_units(LoanRig& r) {
+    std::vector<int32_t> v;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+        if (r.hf.plan.units[(size_t)u].movable && r.h.tier(u) == Tier::VRAM) v.push_back(u);
+    return v;
+}
+/* The slab class the experts live in. */
+size_t expert_class(LoanRig& r) { return (size_t)r.hf.plan.units[(size_t)resident_units(r).front()].slab_class; }
+/* Routes `n` tokens to the unit's expert. */
+void warm(LoanRig& r, int32_t u, int32_t n) {
+    const int32_t id = r.hf.plan.units[(size_t)u].expert;
+    r.h.observe_ids(0, &id, &n, 1);
+}
+/* Dispatches until nothing is in flight, so a cap has been carried out. */
+int settle(LoanRig& r, int extra = 4) {
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+    for (int k = 0; k < extra; ++k) RAD_TRY(r.dispatch());
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+    return RAD_OK;
+}
+}  /* namespace */
+
+/* A cap below the resident set returns the segment's top slots, demotes exactly the coldest
+ * residents (a D2H copy each, into the pool's spare slots), and leaves every unit's bytes where
+ * its table entry says: the evicted experts are read from the host pool like any pooled one. */
+TEST(a_resident_cap_gives_slots_back_and_demotes_the_coldest_residents) {
+    LoanRig r;
+    r.shrinkable = true;
+    r.lend = false;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const std::vector<int32_t> res = resident_units(r);
+    REQUIRE(res.size() >= 3);
+    CHECK_OK(stamp_units(r, false, nullptr));
+
+    /* Two residents stay cold; the rest are warm. */
+    for (size_t i = 2; i < res.size(); ++i) warm(r, res[i], 10);
+    const int64_t before = (int64_t)res.size();
+    CHECK(!r.m.resizing());
+    CHECK_OK(r.m.set_resident_cap(cls, before - 2));
+    CHECK(r.m.resizing());
+    CHECK_EQ(r.m.released_slots(cls), (int64_t)2);
+    CHECK_OK(settle(r));
+
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 2);
+    for (size_t i = 0; i < res.size(); ++i)
+        CHECK_EQ(r.h.tier(res[i]) == Tier::VRAM, i >= 2);
+    CHECK_EQ(r.m.stats().demotions, (uint64_t)2);
+    CHECK_EQ(r.m.stats().promotions, (uint64_t)0);
+    CHECK(r.m.stats().d2h_bytes > 0);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* The cap holds: more dispatches change nothing and the working slots stay free for swaps. */
+    const uint64_t demoted = r.m.stats().demotions;
+    for (int k = 0; k < 8; ++k) CHECK_OK(r.dispatch());
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 2);
+    CHECK_EQ(r.m.stats().demotions, demoted);
+    /* A swap proposed by the heat engine still goes through the working slot: the promoted unit
+     * lands, and the cap then demotes the coldest resident to stay at its size. */
+    int32_t hot = -1, cold = -1;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+        if (!r.hf.plan.units[(size_t)u].movable) continue;
+        if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
+        if (cold < 0 && r.h.tier(u) == Tier::VRAM) cold = u;
+    }
+    REQUIRE(hot >= 0 && cold >= 0);
+    warm(r, hot, 100);
+    Swap sw;
+    sw.promote = hot;
+    sw.demote = cold;
+    r.h.set_busy(hot, true);
+    r.h.set_busy(cold, true);
+    CHECK_OK(r.m.issue(sw, &r.h));
+    CHECK_OK(settle(r, 16));
+    CHECK(r.h.tier(hot) == Tier::VRAM);
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 2);
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* A raised cap regrows the segment and the hottest pooled units fill the slots that came back,
+ * never past the working reserve; a cap above what the plan placed regrows no further. */
+TEST(a_raised_resident_cap_regrows_the_slots_with_the_hottest_pooled_units) {
+    LoanRig r;
+    r.shrinkable = true;
+    r.lend = false;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const std::vector<int32_t> res = resident_units(r);
+    REQUIRE(res.size() >= 3);
+    CHECK_OK(stamp_units(r, false, nullptr));
+    const int64_t before = (int64_t)res.size();
+    CHECK_OK(r.m.set_resident_cap(cls, before - 2));
+    CHECK_OK(settle(r));
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 2);
+
+    /* Two pooled units run hot while shrunk; they take the two slots back. */
+    std::vector<int32_t> pooled;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+        if (r.hf.plan.units[(size_t)u].movable && r.h.tier(u) != Tier::VRAM) pooled.push_back(u);
+    REQUIRE(pooled.size() >= 4);
+    warm(r, pooled[1], 50);
+    warm(r, pooled[3], 40);
+    warm(r, pooled[0], 1);
+    CHECK_OK(r.m.set_resident_cap(cls, before + 100));       /* past the plan: back to as placed */
+    CHECK_EQ(r.m.released_slots(cls), (int64_t)0);
+    CHECK_OK(settle(r));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+    CHECK(r.h.tier(pooled[1]) == Tier::VRAM);
+    CHECK(r.h.tier(pooled[3]) == Tier::VRAM);
+    CHECK_EQ(r.m.stats().promotions, (uint64_t)2);
+    CHECK(!r.m.resizing());                                /* settled: as the plan placed it */
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* Nothing more to give: the working slots are never filled. */
+    for (int k = 0; k < 8; ++k) CHECK_OK(r.dispatch());
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+    CHECK_EQ(r.m.stats().promotions, (uint64_t)2);
+}
+
+/* A cap deeper than the working slots strands residents above the shrunk segment; the hot one is
+ * moved down into a freed slot (a copy within VRAM) rather than demoted, whatever its slot. */
+TEST(a_resident_cap_moves_a_stranded_hot_unit_down_instead_of_demoting_it) {
+    LoanRig r;
+    r.shrinkable = true;
+    r.lend = false;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const std::vector<int32_t> res = resident_units(r);
+    REQUIRE(res.size() >= 3);
+    const SlabClass& sc = r.hf.plan.classes[cls];
+    CHECK_OK(stamp_units(r, false, nullptr));
+
+    /* The resident in the highest slot is the only warm one and must survive a cap of one. */
+    int32_t top = res.front();
+    for (int32_t u : res)
+        if (r.hf.plan.units[(size_t)u].slab_slot > r.hf.plan.units[(size_t)top].slab_slot) top = u;
+    CHECK(r.hf.plan.units[(size_t)top].slab_slot >= 1 + sc.n_shadow + sc.n_stage);   /* stranded */
+    warm(r, top, 10);
+    CHECK_OK(r.m.set_resident_cap(cls, 1));
+    CHECK_OK(settle(r));
+    const std::vector<int32_t> now = resident_units(r);
+    REQUIRE_EQ(now.size(), (size_t)1);
+    CHECK_EQ(now[0], top);
+    CHECK(r.m.stats().relocated >= 1);
+    CHECK_EQ(r.m.stats().demotions, (uint64_t)(res.size() - 1));
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* Lifting the cap brings the set back. */
+    CHECK_OK(r.m.set_resident_cap(cls, -1));
+    CHECK_OK(settle(r));
+    CHECK_EQ(resident_units(r).size(), res.size());
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* The same cap on a mover whose slab also holds lent slots: the loan fills them as before and the
+ * cap counts only the budgeted residents. */
+TEST(a_resident_cap_leaves_the_lent_slots_to_the_loan) {
+    LoanRig r;
+    r.shrinkable = true;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    REQUIRE(before >= 3);
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    CHECK_OK(settle(r));
+    const int64_t with_loan = (int64_t)resident_units(r).size();
+    CHECK(with_loan > before);
+    CHECK_OK(r.m.set_resident_cap(cls, before - 2));
+    CHECK_OK(settle(r));
+    /* Two budgeted residents left; lent ones stay where the loan holds them. */
+    CHECK_EQ((int64_t)resident_units(r).size(), with_loan - 2);
+    CHECK_EQ(r.m.released_slots(cls), (int64_t)2);
+    CHECK_OK(r.m.set_resident_cap(cls, -1));
+    CHECK_OK(settle(r));
+    CHECK(r.m.flex_used_bytes() > 0);
+    CHECK(!r.m.resizing());
+}
+
+/* A mover that was not told it may shrink has no spare pool slots and ignores a cap: single-engine
+ * behaviour is what it was. */
+TEST(a_mover_not_made_shrinkable_ignores_a_resident_cap) {
+    LoanRig r;
+    r.lend = false;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    CHECK_OK(r.m.set_resident_cap(cls, 1));
+    CHECK_EQ(r.m.released_slots(cls), (int64_t)0);
+    CHECK(!r.m.resizing());
+    CHECK_OK(settle(r));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+    CHECK_EQ(r.m.stats().demotions, (uint64_t)0);
+    /* A class that does not exist is refused. */
+    CHECK_EQ(r.m.set_resident_cap(99, 1), RAD_E_INVAL);
+}
+
+/* The same placement sequence gives the same placement: two movers fed the same heat and the same
+ * caps end with the same residents and the same counters. */
+TEST(the_same_cap_sequence_gives_the_same_placement) {
+    auto run = [](std::vector<Tier>* tiers, MoverStats* st) {
+        LoanRig r;
+        r.shrinkable = true;
+        r.lend = false;
+        CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+        const std::vector<int32_t> res = resident_units(r);
+        for (size_t i = 0; i < res.size(); ++i) warm(r, res[i], (int32_t)(i % 3));
+        CHECK_OK(r.m.set_resident_cap(cls, (int64_t)res.size() - 3));
+        CHECK_OK(settle(r));
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+            if (!r.hf.plan.units[(size_t)u].movable || r.h.tier(u) != Tier::VRAM) warm(r, u, 7);
+        CHECK_OK(r.m.set_resident_cap(cls, -1));
+        CHECK_OK(settle(r));
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) tiers->push_back(r.h.tier(u));
+        *st = r.m.stats();
+    };
+    std::vector<Tier> a, b;
+    MoverStats sa, sb;
+    run(&a, &sa);
+    run(&b, &sb);
+    CHECK(a == b);
+    CHECK_EQ(sa.promotions, sb.promotions);
+    CHECK_EQ(sa.demotions, sb.demotions);
+    CHECK_EQ(sa.d2h_bytes, sb.d2h_bytes);
+    CHECK_EQ(sa.h2d_bytes, sb.h2d_bytes);
+}
+
+/* Through the planner: a running engine reports its heat, reads its target, and the cap that
+ * target states moves its residents; the engine that left gives them back. */
+TEST(a_group_target_moves_a_running_movers_residents_and_leaving_gives_them_back) {
+    LoanRig r;
+    r.shrinkable = true;
+    r.lend = false;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const std::vector<int32_t> res = resident_units(r);
+    const int64_t p = (int64_t)res.size();
+    REQUIRE(p >= 3);
+    const int64_t stride = r.hf.plan.classes[cls].stride;
+    auto bin = [&](int64_t units, float heat) {
+        return HeatBin{ heat, units, units * stride, units * stride, (int32_t)cls };
+    };
+    auto facts = [&](int64_t offer_units, int64_t units, float heat) {
+        GroupFacts f(1);
+        f[0].offer = offer_units * stride;
+        f[0].bins = { bin(units, heat) };
+        return f;
+    };
+
+    /* Two models that share a card, `a` first. Each offers p + 1 units of its 2p-unit plane (its
+     * fixed share). `a` is first of two and reserves a minimum for the engine to
+     * come; `m` joins and starts with what its target gave it, p units. */
+    GroupPlanner g(2);
+    g.join("a", facts(p + 1, 2 * p, 0.0f));
+    const GroupBudget got = g.join("m", facts(p + 1, 2 * p, 0.0f));
+    CHECK_EQ(got[0].bytes, p * stride);
+    const int32_t k = (int32_t)cls;
+    CHECK_EQ(group_resident_cap(g.target("m")[0], k), p);   /* what it started with: no change */
+    CHECK_OK(r.m.set_resident_cap(cls, group_resident_cap(g.target("m")[0], k)));
+    CHECK(!r.m.resizing());
+
+    /* `a` heats up while `m`'s own heat comes from its mover (all cold). */
+    g.update("m", 0, group_heat_bins(r.hf.plan, r.h));
+    g.update("a", { { bin(2 * p, 40.0f) } });
+    const RankBudget t = g.target("m")[0];
+    CHECK(t.bytes < p * stride);                            /* it was asked to give slots back */
+    const int64_t cap = group_resident_cap(t, k);
+    CHECK(cap >= 0 && cap < p);
+    CHECK_OK(stamp_units(r, false, nullptr));
+    CHECK_OK(r.m.set_resident_cap(cls, cap));
+    CHECK_OK(settle(r));
+    CHECK_EQ((int64_t)resident_units(r).size(), cap);
+    CHECK_EQ(r.m.released_slots(cls), p - cap);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* `a` ends: m is alone again, owed its whole offer (more than it holds) and takes back every
+     * slot it gave up. */
+    g.leave("a");
+    CHECK(group_resident_cap(g.target("m")[0], k) < 0);
+    CHECK_OK(r.m.set_resident_cap(cls, group_resident_cap(g.target("m")[0], k)));
+    CHECK_OK(settle(r));
+    CHECK_EQ((int64_t)resident_units(r).size(), p);
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
 }
 
 TEST(mover_prefetches_staged_units_against_the_declared_order) {
