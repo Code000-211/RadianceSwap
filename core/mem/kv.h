@@ -183,7 +183,7 @@ struct KVGroupPlan {
      * streams. Every carve and stride goes through here; every allocation and guard uses
      * `n_blocks`. */
     int64_t     pool_blocks() const {
-        return n_slots > 0 ? n_slots : va_blocks > 0 ? va_blocks : n_blocks;
+        return streamed() ? n_slots : va_blocks > 0 ? va_blocks : n_slots > 0 ? n_slots : n_blocks;
     }
     /* The pool holds fewer blocks than the group addresses; a residency map says which. */
     bool        streamed() const { return paged() && n_slots > 0 && n_slots < n_blocks; }

@@ -567,8 +567,9 @@ int KVManager::carve_into(Pool& kv_pool) {
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
     for (auto& p : plans_) {
-        int64_t bytes = p.paged() ? kv_pool_bytes(p)
-                                  : p.n_states * p.bytes_per_state;
+        int64_t bytes = p.growable()  ? p.carve_blocks * p.bytes_per_block
+                      : p.paged()     ? kv_pool_bytes(p)
+                                      : p.n_states * p.bytes_per_state;
         if (p.zero) {
             p.base = nullptr;
             p.pool_offset = 0;
@@ -813,6 +814,7 @@ void KVManager::extend_ids(size_t i, int64_t upto) {
     cached_[i].resize((size_t)upto, 0);
     dead_[i] += upto - p.n_blocks;
     if (live_[i] == p.n_blocks) live_[i] = upto;     /* nothing is lent: the mark follows the top */
+    if (p.n_slots == p.n_blocks) p.n_slots = upto;   /* a group that does not stream keeps them equal */
     p.n_blocks = upto;
     held_hist_[i].resize((size_t)ceil_div(upto, bucket_blocks_[i]), 0);
 }

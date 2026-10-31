@@ -13,6 +13,7 @@
 #include "mem/pools.h"
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
+#include "place/group_planner.h"
 #include "mem/kvtier.h"
 #include "device/device.h"
 #include "plugin/registry.h"
@@ -31,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -8089,4 +8091,385 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(kvstream_op_gated(ctx, "kv_resolve"));
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
+}
+
+/* ================================================================== the cache grows (#17, part 2)
+ *
+ * A partition takes on bytes the experts of the group gave up: chunks of fresh address space, backed
+ * on every rank before rank 0 offers the blocks. An address is mapped once (docs/swap/elastic-slab.md),
+ * so a chunk that goes back is never mapped again and its ids die with it. The host backend's
+ * VMem (mmap) stands in for the card: the same commit/decommit calls, and a decommitted range
+ * reads as zeros.
+ */
+
+struct Grower {
+    Pools     pools;
+    KVManager kv;
+    Config    cfg = small_config();
+    static constexpr int64_t MiB = (int64_t)1 << 20;
+
+    /* An 8 MiB carve (4096 blocks of 2 KiB, 16 tokens each) and `va_mib` of arena. */
+    int build(int64_t va_mib = 8192, int64_t kv_mib = 8) {
+        cfg.vram_kv_mib      = kv_mib;
+        cfg.max_tok          = 256;
+        cfg.max_ctx          = 4096;
+        cfg.checkpoint_slots = 0;
+        int s = pools.configure(cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator(), 0,
+                                va_mib * MiB);
+        if (s < 0) return s;
+        return kv.configure(hybrid_groups(/*with_linear=*/false), cfg, pools.kv());
+    }
+    const KVGroupPlan& p() const { return *kv.plan(G_FULL); }
+    int grow() {
+        const int rc = kv.back_chunk();
+        if (rc >= 0) kv.publish_chunk();
+        return rc;
+    }
+    char* block(int32_t layer, int32_t id) const {
+        return (char*)p().base + layer * p().layer_stride() + (int64_t)id * p().layer_bytes_per_block();
+    }
+};
+
+TEST(a_cache_without_an_arena_does_not_grow) {
+    Grower g;
+    CHECK_OK(g.build(/*va_mib=*/0));
+    CHECK(!g.kv.growth_enabled());
+    CHECK_EQ(g.kv.back_chunk(), RAD_E_STATE);
+    CHECK_EQ(g.p().va_blocks, 0);
+    CHECK_EQ(g.p().pool_blocks(), g.p().n_blocks);
+    CHECK_EQ(g.kv.total_blocks(G_FULL), g.p().carve_blocks);
+}
+
+TEST(a_growing_cache_backs_only_its_carve_and_a_chunk_adds_blocks_in_every_layer) {
+    Grower g;
+    CHECK_OK(g.build());
+    REQUIRE(g.kv.growth_enabled());
+    const int64_t carve = g.p().carve_blocks;
+    CHECK_EQ(g.p().n_blocks, carve);
+    CHECK(g.p().va_blocks > carve + g.p().chunk_blocks);
+    CHECK_EQ(g.p().layer_stride(), g.p().va_blocks * g.p().layer_bytes_per_block());
+    /* Only the carve has pages: 2 layers of 4094 blocks, each stripe on its own granules. */
+    CHECK_EQ(g.pools.kv().committed(), 8 * Grower::MiB);
+    CHECK_EQ(g.kv.chunk_bytes(), 128 * Grower::MiB);
+    CHECK_EQ(g.kv.chunk_tokens(), g.p().chunk_blocks * g.p().block_size);
+
+    CHECK_OK(g.grow());
+    CHECK_EQ(g.kv.chunks(), 1);
+    CHECK_EQ(g.pools.kv().committed(), 8 * Grower::MiB + g.kv.chunk_bytes());
+    CHECK_EQ(g.kv.total_blocks(G_FULL), carve + g.p().chunk_blocks);
+    CHECK_EQ(g.kv.free_blocks(G_FULL), carve + g.p().chunk_blocks);
+    CHECK_EQ(g.kv.held_blocks(G_FULL), 0);
+    /* The new blocks are usable memory in every layer, not only the first. */
+    std::vector<int32_t> ids;
+    CHECK_EQ(g.kv.reserve_blocks(G_FULL, carve + g.p().chunk_blocks, &ids), carve + g.p().chunk_blocks);
+    const int32_t top = *std::max_element(ids.begin(), ids.end());
+    CHECK(top >= carve);
+    for (int32_t l = 0; l < 2; ++l) {
+        std::memset(g.block(l, top), 0x5a + l, (size_t)g.p().layer_bytes_per_block());
+        CHECK_EQ((unsigned char)g.block(l, top)[g.p().layer_bytes_per_block() - 1], 0x5au + l);
+    }
+    CHECK_EQ(g.kv.held_blocks(G_FULL), carve + g.p().chunk_blocks);
+    CHECK_EQ(g.kv.free_blocks(G_FULL), 0);
+}
+
+TEST(a_sequence_fills_the_carve_and_runs_on_into_the_chunk) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t carve_tokens = g.p().carve_blocks * g.p().block_size;
+    CHECK_OK(g.kv.add_sequence(1));
+    CHECK_OK(g.kv.ensure(1, carve_tokens));
+    CHECK_EQ(g.kv.ensure(1, carve_tokens + 1), RAD_E_FULL);     /* full: nothing past the carve yet */
+    CHECK_OK(g.grow());
+    CHECK_OK(g.kv.ensure(1, carve_tokens + 5 * g.p().block_size));
+    CHECK_EQ((int64_t)g.kv.block_table(1, G_FULL).size(), g.p().carve_blocks + 5);
+    /* The ids it got past the carve are the chunk's, in order. */
+    CHECK_EQ(g.kv.block_table(1, G_FULL)[(size_t)g.p().carve_blocks],
+             (int32_t)(((g.p().carve_blocks + g.p().chunk_align - 1) / g.p().chunk_align) * g.p().chunk_align));
+}
+
+TEST(a_chunk_goes_back_only_when_every_block_of_it_is_free_and_loses_no_sequence) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t carve_tokens = g.p().carve_blocks * g.p().block_size;
+    CHECK_OK(g.grow());
+    CHECK_OK(g.kv.add_sequence(1));
+    CHECK_OK(g.kv.ensure(1, carve_tokens + 3 * g.p().block_size));   /* three blocks into the chunk */
+    const std::vector<int32_t> table = g.kv.block_table(1, G_FULL);
+    const int32_t last = table.back();
+    std::memset(g.block(1, last), 0x77, (size_t)g.p().layer_bytes_per_block());
+
+    CHECK(!g.kv.top_chunk_free());
+    CHECK_EQ(g.kv.retire_chunk(), RAD_E_STATE);
+    CHECK_EQ(g.kv.chunks(), 1);
+    /* Nothing moved: the sequence's table and bytes are as they were. */
+    CHECK(table == g.kv.block_table(1, G_FULL));
+    CHECK_EQ((unsigned char)g.block(1, last)[0], 0x77u);
+
+    g.kv.free_sequence(1);
+    CHECK(g.kv.top_chunk_free());
+    CHECK_OK(g.kv.retire_chunk());
+    CHECK_EQ(g.kv.chunks(), 0);
+    CHECK_EQ(g.pools.kv().committed(), 8 * Grower::MiB);          /* the pages went back */
+    CHECK_EQ(g.kv.total_blocks(G_FULL), g.p().carve_blocks);
+    CHECK_EQ(g.kv.free_blocks(G_FULL), g.p().carve_blocks);
+    CHECK_EQ(g.kv.held_blocks(G_FULL), 0);
+}
+
+TEST(a_given_back_chunks_ids_and_addresses_are_never_used_again) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t carve = g.p().carve_blocks, cb = g.p().chunk_blocks;
+    CHECK_OK(g.grow());
+    const int64_t first_end = g.p().n_blocks;
+    CHECK_OK(g.kv.retire_chunk());
+    CHECK_EQ(g.p().n_blocks, first_end);                          /* the ids stay spent */
+    CHECK_EQ(g.kv.total_blocks(G_FULL), carve);
+    /* A second chunk takes ids after the first's, not the same ones. */
+    CHECK_OK(g.grow());
+    CHECK_EQ(g.p().n_blocks, first_end + cb);
+    CHECK_EQ(g.kv.total_blocks(G_FULL), carve + cb);
+    std::vector<int32_t> ids;
+    CHECK_EQ(g.kv.reserve_blocks(G_FULL, carve + cb, &ids), carve + cb);
+    for (int32_t id : ids) CHECK(id < carve || id >= first_end);
+    CHECK_EQ(g.pools.kv().committed(), 8 * Grower::MiB + g.kv.chunk_bytes());
+    /* The address space is finite and says so. */
+    int n = 0;
+    while (g.kv.chunks_left() > 0 && n++ < 200) {
+        std::vector<int32_t> none;
+        CHECK_OK(g.kv.retire_chunk(false));
+        CHECK_OK(g.grow());
+    }
+    CHECK_EQ(g.kv.chunks_left(), 0);
+    CHECK_EQ(g.kv.back_chunk(), RAD_E_NOMEM);
+}
+
+TEST(a_failed_or_abandoned_chunk_is_spent_and_leaves_the_cache_as_it_was) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t carve = g.p().carve_blocks;
+    const int64_t committed = g.pools.kv().committed();
+    CHECK_OK(g.kv.back_chunk());
+    CHECK_EQ(g.kv.back_chunk(), RAD_E_STATE);                     /* one at a time */
+    CHECK_EQ(g.kv.free_blocks(G_FULL), carve);                    /* not offered yet */
+    g.kv.abandon_chunk();
+    CHECK_EQ(g.pools.kv().committed(), committed);
+    CHECK_EQ(g.kv.chunks(), 0);
+    CHECK_EQ(g.kv.total_blocks(G_FULL), carve);
+    CHECK_OK(g.grow());                                           /* the next one starts after it */
+    CHECK_EQ(g.kv.total_blocks(G_FULL), carve + g.p().chunk_blocks);
+    CHECK(g.p().n_blocks >= carve + 2 * g.p().chunk_blocks);
+}
+
+TEST(the_loan_and_growth_exclude_each_other) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t spare = g.kv.spare_tokens();
+    CHECK(spare > 0);
+    CHECK_OK(g.kv.set_loan(spare));
+    CHECK_EQ(g.kv.back_chunk(), RAD_E_STATE);                     /* a loan is out */
+    CHECK_OK(g.kv.set_loan(0));
+    CHECK_OK(g.grow());
+    CHECK_EQ(g.kv.spare_tokens(), 0);                             /* a grown cache lends nothing */
+    CHECK_EQ(g.kv.set_loan(g.p().block_size), RAD_E_STATE);
+    CHECK_OK(g.kv.retire_chunk());
+    /* Back at its carve it lends as before, and the counts agree around the dead ids. */
+    const int64_t again = g.kv.spare_tokens();
+    CHECK(again > 0);
+    CHECK_OK(g.kv.set_loan(again));
+    CHECK_EQ(g.kv.held_blocks(G_FULL), 0);
+    CHECK_EQ(g.kv.free_blocks(G_FULL), g.kv.live_blocks(G_FULL));
+    CHECK_EQ(g.kv.total_blocks(G_FULL), g.p().carve_blocks);
+    std::vector<int32_t> ids;
+    CHECK_EQ(g.kv.reserve_blocks(G_FULL, g.kv.live_blocks(G_FULL), &ids), g.kv.live_blocks(G_FULL));
+    for (int32_t id : ids) CHECK(id < g.p().carve_blocks);
+    CHECK_OK(g.kv.set_loan(0));
+}
+
+TEST(a_follower_rank_ends_with_the_same_ids_as_the_leader) {
+    Grower lead, follow;
+    CHECK_OK(lead.build());
+    CHECK_OK(follow.build());
+    for (int i = 0; i < 2; ++i) {
+        CHECK_OK(follow.kv.back_chunk());
+        CHECK_OK(lead.kv.back_chunk());
+        follow.kv.publish_chunk();
+        lead.kv.publish_chunk();
+    }
+    CHECK_OK(lead.kv.retire_chunk());
+    CHECK_OK(follow.kv.retire_chunk(/*check=*/false));
+    CHECK_OK(lead.grow());
+    CHECK_OK(follow.grow());
+    CHECK_EQ(lead.p().n_blocks, follow.p().n_blocks);
+    CHECK_EQ(lead.kv.total_blocks(G_FULL), follow.kv.total_blocks(G_FULL));
+    CHECK_EQ(lead.kv.chunks(), follow.kv.chunks());
+}
+
+TEST(the_partition_a_planner_sees_is_the_carve_held_and_buffer) {
+    Grower g;
+    CHECK_OK(g.build());
+    int64_t carve = 0;
+    for (const KVGroupPlan& p : g.kv.plans()) carve += g.kv.pool_bytes_carved(p.index);
+    CHECK_EQ(carve, g.p().carve_blocks * g.p().bytes_per_block);
+    CHECK_OK(g.grow());
+    for (const KVGroupPlan& p : g.kv.plans()) CHECK(g.kv.pool_bytes_carved(p.index) <= carve);
+    CHECK(g.kv.buffer_bytes() > 0);
+    CHECK(g.kv.ceiling() > 0);
+    CHECK_EQ(g.kv.pool_bytes(G_FULL), (g.p().carve_blocks + g.p().chunk_blocks) * g.p().bytes_per_block);
+}
+
+TEST(a_hybrid_cache_with_a_linear_state_still_grows_and_keeps_its_states) {
+    Grower g;
+    g.cfg.checkpoint_slots = 0;
+    g.cfg.vram_kv_mib = 8;
+    g.cfg.max_tok = 256;
+    CHECK_OK(g.pools.configure(g.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator(), 0,
+                               (int64_t)8192 << 20));
+    CHECK_OK(g.kv.configure(hybrid_groups(/*with_linear=*/true), g.cfg, g.pools.kv()));
+    REQUIRE(g.kv.growth_enabled());
+    CHECK_OK(g.grow());
+    CHECK_OK(g.kv.add_sequence(1));
+    CHECK_OK(g.kv.ensure(1, g.p().carve_blocks * g.p().block_size + 40));
+    CHECK(g.kv.state_slot(1, G_GDN) >= 0);
+    g.kv.free_sequence(1);
+    CHECK_OK(g.kv.retire_chunk());
+}
+
+TEST(growth_shrink_loan_and_sequences_keep_every_block_accounted_for) {
+    Grower g;
+    CHECK_OK(g.build());
+    std::mt19937_64 rng(17);
+    std::vector<uint64_t> seqs;
+    uint64_t next = 1;
+    int grew = 0, retired = 0, refused = 0;
+    for (int step = 0; step < 400; ++step) {
+        switch (rng() % 8) {
+        case 0: if (seqs.size() < 6) { CHECK_OK(g.kv.add_sequence(next)); seqs.push_back(next++); } break;
+        case 1: case 2: if (!seqs.empty()) {
+            const uint64_t id = seqs[rng() % seqs.size()];
+            const int64_t want = g.kv.seq_tokens(id) + (int64_t)(rng() % 20000) * 16;
+            const int rc = g.kv.ensure(id, want);
+            CHECK(rc == RAD_OK || rc == RAD_E_FULL);
+        } break;
+        case 3: if (!seqs.empty()) {
+            const size_t k = rng() % seqs.size();
+            g.kv.free_sequence(seqs[k]);
+            seqs.erase(seqs.begin() + (long)k);
+        } break;
+        case 4: if (g.kv.chunks_left() > 0) {
+            (void)g.kv.set_loan(0);
+            if (g.grow() >= 0) ++grew;
+        } break;
+        case 5: if (g.kv.top_chunk_free() && g.kv.retire_chunk() >= 0) ++retired; break;
+        case 6: if (g.kv.chunks() == 0) (void)g.kv.set_loan(g.kv.spare_tokens()); break;
+        default: if (g.kv.set_loan(0) < 0) ++refused; break;
+        }
+        const int64_t total = g.kv.total_blocks(G_FULL);
+        const int64_t lent = g.kv.loan_tokens() > 0 ? g.p().carve_blocks - g.kv.live_blocks(G_FULL) : 0;
+        REQUIRE_EQ(g.kv.held_blocks(G_FULL) + g.kv.free_blocks(G_FULL) + lent, total);
+        std::set<int32_t> seen;
+        int64_t held = 0;
+        for (uint64_t id : seqs)
+            for (int32_t b : g.kv.block_table(id, G_FULL)) {
+                REQUIRE(b >= 0 && b < g.p().n_blocks);
+                REQUIRE(seen.insert(b).second);                  /* no block in two tables */
+                REQUIRE_EQ(g.kv.block_refcount(G_FULL, b), 1);   /* never a dead or free one */
+                ++held;
+            }
+        REQUIRE_EQ(held, g.kv.held_blocks(G_FULL));
+        REQUIRE(g.p().n_blocks <= g.p().va_blocks);
+    }
+    CHECK(grew > 3);
+    CHECK(retired > 1);
+    for (uint64_t id : seqs) g.kv.free_sequence(id);
+    while (g.kv.chunks() > 0) CHECK_OK(g.kv.retire_chunk());
+    CHECK_EQ(g.kv.held_blocks(G_FULL), 0);
+    CHECK_EQ(g.pools.kv().committed(), 8 * Grower::MiB);
+}
+
+/* The protocol of Engine::kv_growth_tick against the real planner and a real KVManager, with model
+ * A's expert slab as a number: B's partition claims, A gives the bytes back, B backs a chunk only
+ * then, and the chunk goes back and A regrows only after B reports the pages returned. At no point
+ * do A's slab and B's chunks add up to more than the pool. */
+TEST(a_partition_grows_out_of_the_slab_another_model_gave_back_and_returns_it) {
+    constexpr int64_t MiB = (int64_t)1 << 20;
+    Grower b;
+    CHECK_OK(b.build());
+    const int64_t cb = b.kv.chunk_bytes(), pool = 512 * MiB;
+    REQUIRE(cb > 0 && cb * 3 < pool);
+
+    GroupPlanner gp(0);
+    GroupFacts fa(1), fb(1);
+    fa[0].offer = pool;
+    fa[0].elastic = true;
+    fa[0].bins = { { 0.1f, 256, pool, pool, 0 } };
+    (void)gp.join("a", fa);
+    (void)gp.join("b", fb);                       /* a dense model: no experts, only a cache */
+    int64_t a_held = pool;
+    gp.update_held("a", 0, a_held, pool);
+
+    auto physical = [&] { REQUIRE(a_held + b.kv.chunks() * cb <= pool); };
+    auto b_report = [&] {
+        KvPartition kp;
+        for (const KVGroupPlan& p : b.kv.plans()) {
+            kp.carve += b.kv.pool_bytes_carved(p.index);
+            kp.held += b.kv.pool_bytes_used(p.index);
+        }
+        auto in_chunks = [&](int64_t x) { return x > kp.carve ? kp.carve + (x - kp.carve + cb - 1) / cb * cb : x; };
+        kp.want = in_chunks(kp.held + b.kv.buffer_bytes());
+        kp.cap = in_chunks(64 * 1024 * MiB);
+        kp.grown = b.kv.chunks() * cb;
+        kp.growable = (b.kv.chunks() + b.kv.chunks_left()) * cb;
+        gp.update_kv("b", 0, kp);
+    };
+    auto a_tick = [&] {                            /* A's slab follows its target, then says what it holds */
+        a_held = gp.target("a")[0].bytes;
+        gp.update_held("a", 0, a_held);
+        physical();
+    };
+    auto b_tick = [&] {
+        const int64_t target = gp.target("b")[0].kv_grow / cb;
+        if (target > b.kv.chunks()) {
+            if (b.kv.loan_tokens() == 0) CHECK_OK(b.grow());
+        } else if (target < b.kv.chunks() && b.kv.top_chunk_free()) {
+            CHECK_OK(b.kv.retire_chunk());
+        }
+        physical();
+    };
+
+    /* B runs a sequence that fills its carve. */
+    const int64_t carve_tokens = b.p().carve_blocks * b.p().block_size;
+    CHECK_OK(b.kv.add_sequence(1));
+    CHECK_OK(b.kv.ensure(1, carve_tokens));
+    b_report();
+    b_tick();
+    CHECK_EQ(b.kv.chunks(), 0);                    /* A still holds every byte: B is not granted any */
+    CHECK_EQ(a_held, pool);
+    a_tick();
+    CHECK_EQ(a_held, pool - cb);                   /* A was told to give one chunk back */
+    b_tick();
+    CHECK_EQ(b.kv.chunks(), 1);
+    b_report();
+    physical();
+
+    /* The sequence runs on into the chunk; nothing it held moved. */
+    const std::vector<int32_t> before = b.kv.block_table(1, G_FULL);
+    CHECK_OK(b.kv.ensure(1, carve_tokens + 64 * b.p().block_size));
+    CHECK(std::equal(before.begin(), before.end(), b.kv.block_table(1, G_FULL).begin()));
+    b_report(); a_tick(); b_tick();
+    CHECK_EQ(b.kv.chunks(), 1);
+    CHECK_EQ(a_held, pool - cb);
+
+    /* The sequence ends. The claim ends; A is not given the pages before B reports them returned. */
+    b.kv.free_sequence(1);
+    b_report();
+    a_tick();
+    CHECK_EQ(a_held, pool - cb);
+    b_tick();
+    CHECK_EQ(b.kv.chunks(), 0);
+    CHECK_EQ(b.pools.kv().committed(), 8 * Grower::MiB);   /* the pages are back on the card */
+    a_tick();
+    CHECK_EQ(a_held, pool - cb);                   /* still: B has not reported the return */
+    b_report();
+    a_tick();
+    CHECK_EQ(a_held, pool);
 }

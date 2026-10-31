@@ -1679,7 +1679,14 @@ void Engine::kv_growth_tick(const std::vector<int64_t>& grant, uint64_t now) {
         chunks = lead.chunks();
         left = lead.chunks_left();
     }
-    kp.cap = lead.ceiling();
+    kp.cap = lead.ceiling(cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
+    /* Chunks are what can be backed: what the cache wants beyond its carve, and the most it can
+     * use, are stated in whole chunks, so a claim of a few blocks is not rounded down to nothing. */
+    auto in_chunks = [&](int64_t bytes) {
+        return bytes > kp.carve ? kp.carve + (bytes - kp.carve + cb - 1) / cb * cb : bytes;
+    };
+    kp.want = in_chunks(kp.want);
+    kp.cap = in_chunks(kp.cap);
     kp.grown = chunks * cb;
     kp.growable = (int64_t)(chunks + left) * cb;
     const std::vector<int64_t> key = { kp.carve, kp.grown, kp.growable, kp.cap, kp.held / cb,
