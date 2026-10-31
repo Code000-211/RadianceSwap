@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <new>
 #include <vector>
 
 namespace rad {
@@ -70,7 +71,8 @@ void ModelRouter::add_cold(const std::string& id, ModelLauncher launch) {
 void ModelRouter::activate(const std::string& id) {
     std::lock_guard<std::mutex> lk(m_);
     const auto c = cold_.find(id);
-    if (c != cold_.end() && !c->second.running && !stopped_) start_locked(id, c->second);
+    if (c != cold_.end() && !c->second.running && !stopped_ && !unhealthy_)
+        start_locked(id, c->second);
 }
 
 void ModelRouter::join() {
@@ -137,6 +139,7 @@ void ModelRouter::attach(const std::string& id, Server* s) {
         Cold& m = c->second;
         const auto now = Clock::now();
         m.attached = true;
+        m.failures = 0;
         m.busy_at = now;
         ++m.activations;
         m.activation_s += std::chrono::duration<double>(now - m.began).count();
@@ -215,6 +218,7 @@ void ModelRouter::stop() {
 }
 
 HttpResponse ModelRouter::route(const HttpRequest& q) {
+    if (unhealthy()) return answer_unhealthy(q);
     if (media_endpoint(q.path)) {
         ApiError e = err_not_implemented(
             q.path + " is not served while several models are active: the image, audio and video "
@@ -295,6 +299,36 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
     return r;
 }
 
+bool ModelRouter::unhealthy() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return unhealthy_;
+}
+
+int ModelRouter::retry_in_s(const Cold& c) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(c.retry_at - Clock::now());
+    return (int)std::max<int64_t>(1, (left.count() + 999) / 1000);
+}
+
+HttpResponse ModelRouter::answer_unhealthy(const HttpRequest& q) const {
+    std::string why;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        why = unhealthy_reason_;
+    }
+    if (q.method == "GET" && q.path == "/metrics") {
+        HttpResponse r;
+        r.content_type = "text/plain; version=0.0.4; charset=utf-8";
+        r.body = metrics_text();
+        return r;
+    }
+    if (q.method == "GET" && (q.path == "/health" || q.path == "/ping"))
+        return HttpResponse::text(503, "gpu group unhealthy: " + why + "\n");
+    ApiError e = err_unavailable("the GPU group is unhealthy and serves no request until the "
+                                 "process is restarted: " + why);
+    e.code = "gpu_group_unhealthy";
+    return refuse(q, e);
+}
+
 HttpResponse ModelRouter::answer_unattached(const HttpRequest& q) const {
     if (q.path == "/metrics") {
         HttpResponse r;
@@ -322,10 +356,16 @@ HttpResponse ModelRouter::answer_unattached(const HttpRequest& q) const {
 Server* ModelRouter::await_model(const std::string& id, const HttpRequest& q,
                                  HttpResponse* refusal) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(act_.wait_ms);
-    auto fail = [&](ApiError e, const char* code) {
+    auto fail = [&](ApiError e, const char* code, int retry_after_s = -1) {
         e.code = code;
-        *refusal = refuse(q, e, act_.retry_after_s);
+        *refusal = refuse(q, e, retry_after_s < 0 ? act_.retry_after_s : retry_after_s);
         return nullptr;
+    };
+    /* Under m_. A device error is final: no retry-after to wait for. */
+    auto unhealthy_refusal = [&]() {
+        ApiError e = err_unavailable("the GPU group is unhealthy and serves no request until the "
+                                     "process is restarted: " + unhealthy_reason_);
+        return fail(std::move(e), "gpu_group_unhealthy", 0);
     };
 
     std::unique_lock<std::mutex> lk(m_);
@@ -337,6 +377,7 @@ Server* ModelRouter::await_model(const std::string& id, const HttpRequest& q,
     };
     if (const auto it = servers_.find(id); it != servers_.end()) return take(it->second);
     if (stopped_) return fail(err_unavailable("the server is shutting down"), "server_stopping");
+    if (unhealthy_) return unhealthy_refusal();
     if (c.waiters >= act_.max_queued)
         return fail(err_overloaded("model " + id + " is not active yet and its queue of " +
                                    std::to_string(act_.max_queued) + " waiting requests is full"),
@@ -351,12 +392,18 @@ Server* ModelRouter::await_model(const std::string& id, const HttpRequest& q,
     for (;;) {
         if (const auto it = servers_.find(id); it != servers_.end()) return take(it->second);
         if (stopped_) return fail(err_unavailable("the server is shutting down"), "server_stopping");
+        if (unhealthy_) return unhealthy_refusal();
         if (attempt && c.failed_attempt >= attempt)
-            return fail(err_unavailable(c.error), "model_activation_failed");
+            return fail(err_unavailable(c.error), "model_activation_failed", retry_in_s(c));
         /* The attempt ended without failing: the model was active and is deactivated again. */
         if (attempt && !c.running) attempt = 0;
         if (!attempt) {
             if (!c.running) {
+                /* A model that failed is not tried again before its backoff has passed. */
+                if (c.attempt && c.failed_attempt == c.attempt && Clock::now() < c.retry_at)
+                    return fail(err_unavailable(c.error + "; it is not tried again for another " +
+                                                std::to_string(retry_in_s(c)) + " s"),
+                                "model_activation_backoff", retry_in_s(c));
                 RAD_INFO("model '%s' is cold: activating it for a request", id.c_str());
                 attempt = start_locked(id, c);
             } else if (!c.deactivating) {
@@ -387,9 +434,29 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
     ++c.attempt;
     if (registry_) registry_->set_state(id, ModelState::Activating);
     c.thread = std::thread([this, id, &c] {
-        const int rc = c.launch(id);
+        /* An exception from the Launcher (std::bad_alloc from a host allocation, say) has unwound
+         * its Engine; it must not end the process, which other models are serving from. */
+        int rc;
+        bool threw = false;
+        try {
+            rc = c.launch(id);
+        } catch (const std::bad_alloc&) {
+            rc = RAD_E_NOMEM;
+            threw = true;
+        } catch (const std::exception& e) {
+            RAD_ERR("activation of model %s threw: %s", id.c_str(), e.what());
+            rc = RAD_E_STATE;
+            threw = true;
+        } catch (...) {
+            rc = RAD_E_STATE;
+            threw = true;
+        }
         std::lock_guard<std::mutex> g(m_);
         c.running = false;
+        if (threw) {   /* a Server it had attached is gone with the Engine */
+            servers_.erase(id);
+            c.attached = false;
+        }
         if (c.deactivating) {
             /* The Launcher has destroyed the Engine: the model's VRAM is free. */
             const auto now = Clock::now();
@@ -402,10 +469,24 @@ uint64_t ModelRouter::start_locked(const std::string& id, Cold& c) {
                      std::chrono::duration<double>(now - c.began).count(),
                      rc < 0 ? "; its runtime reported an error on the way out" : "");
         } else if (!c.attached && !stopped_) {
+            /* The Engine is destroyed, every partial allocation with it. */
+            int64_t wait_ms = act_.backoff_ms;   /* doubles per failure before this one */
+            for (int64_t i = 0; i < c.failures && wait_ms < act_.backoff_max_ms; ++i) wait_ms *= 2;
+            wait_ms = std::min(wait_ms, act_.backoff_max_ms);
+            ++c.failures;
+            ++c.failures_total;
+            c.retry_at = Clock::now() + std::chrono::milliseconds(wait_ms);
             c.failed_attempt = c.attempt;
             c.error = "activation of model " + id + " failed: " + rad_strerror(rc < 0 ? rc : RAD_E_STATE);
             if (registry_) registry_->set_state(id, ModelState::Failed);
-            RAD_ERR("%s", c.error.c_str());
+            RAD_ERR("%s (rolled back; next attempt in %lld ms at the earliest)", c.error.c_str(),
+                    (long long)wait_ms);
+            if (rc == RAD_E_DEVICE && !unhealthy_) {
+                unhealthy_ = true;
+                unhealthy_reason_ = c.error;
+                RAD_ERR("the GPU group is unhealthy: %s; no model is activated again and requests "
+                        "are refused until the process is restarted", c.error.c_str());
+            }
         }
         cv_.notify_all();
     });
@@ -430,12 +511,19 @@ std::string ModelRouter::status_json_locked() const {
                              { "activation_seconds", c.activation_s },
                              { "deactivations", c.deactivations },
                              { "deactivation_seconds", c.deactivation_s },
-                             { "queued_requests", c.waiters } };
+                             { "queued_requests", c.waiters },
+                             { "activation_failures", c.failures_total } };
+        if (std::string(state) == "failed") {
+            m["error"] = c.error;
+            if (Clock::now() < c.retry_at) m["retry_after_seconds"] = retry_in_s(c);
+        }
         if (c.vram_released_mib >= 0) m["vram_released_mib"] = c.vram_released_mib;
         models.push_back(std::move(m));
     }
-    return nlohmann::json{ { "object", "list" }, { "idle_timeout_ms", act_.idle_timeout_ms },
-                           { "data", std::move(models) } }.dump();
+    nlohmann::json out = { { "object", "list" }, { "idle_timeout_ms", act_.idle_timeout_ms },
+                           { "healthy", !unhealthy_ }, { "data", std::move(models) } };
+    if (unhealthy_) out["unhealthy_reason"] = unhealthy_reason_;
+    return out.dump();
 }
 
 std::string ModelRouter::metrics_text() const {
@@ -461,6 +549,12 @@ std::string ModelRouter::metrics_text() const {
     o += "# HELP radiance:model_activation_seconds_total Time spent activating\n"
          "# TYPE radiance:model_activation_seconds_total counter\n";
     for (const auto& [id, c] : cold_) line("radiance:model_activation_seconds_total", id, "", c.activation_s);
+    o += "# HELP radiance:model_activation_failures_total Activations that failed and were rolled back\n"
+         "# TYPE radiance:model_activation_failures_total counter\n";
+    for (const auto& [id, c] : cold_) line("radiance:model_activation_failures_total", id, "", (double)c.failures_total);
+    o += "# HELP radiance:gpu_group_healthy 0 once a device error made the GPU group unhealthy\n"
+         "# TYPE radiance:gpu_group_healthy gauge\n"
+         "radiance:gpu_group_healthy " + std::string(unhealthy_ ? "0" : "1") + "\n";
     o += "# HELP radiance:model_deactivations_total Deactivations that completed\n"
          "# TYPE radiance:model_deactivations_total counter\n";
     for (const auto& [id, c] : cold_) line("radiance:model_deactivations_total", id, "", (double)c.deactivations);

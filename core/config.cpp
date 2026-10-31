@@ -51,7 +51,10 @@ static const Flag g_flags[] = {
                                         "its own share of the VRAM (--gpu-headroom-mib per model moves it),\n"
                                         "behind one listener that routes by the request's\n"
                                         "`model`; a model idle for cache.idle_timeout_ms is deactivated\n"
-                                        "and its VRAM freed (0: never). Text only; excludes --model\n"
+                                        "and its VRAM freed (0: never). A failed activation is rolled back and\n"
+                                        "retried after cache.activation_backoff_ms (doubling to\n"
+                                        "activation_backoff_max_ms); a device error marks the group unhealthy\n"
+                                        "(503 gpu_group_unhealthy, /health 503). Text only; excludes --model\n"
                                         "and LoRA" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
