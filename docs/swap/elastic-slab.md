@@ -70,7 +70,7 @@ vram` jede 2 s oder schon ein Programm, das die Render-Nodes `/dev/dri/renderD12
 Reine `cat /sys/class/drm/*/device/mem_info_vram_used`-Abfragen und `rsmi_init` allein nicht.
 
 **Ursache.** `hsa_amd_vmem_map` auf eine Adresse, die schon einmal gemappt und wieder entmappt war, wirkt auf
-diesem ROCr/Kernel (ROCm 7.2.x, amdgpu 7.0.2) nicht: die Adresse zeigt weiter auf die erste physische Seite. Hat
+diesem ROCr (HIP 7.x) und Kernel 7.0.2-6-pve nicht: die Adresse zeigt weiter auf die erste physische Seite. Hat
 diese Seite inzwischen ein anderes Handle bekommen (genau das passiert, wenn ein Model Seiten abgibt und das andere
 sie nimmt), lesen und schreiben zwei Adressen dieselbe Seite; die Daten eines Experts werden von einem anderen
 überschrieben. Belegt ohne die Engine mit `tests/device_test.cpp` (`vmem_stress_*`, `RAD_VMEM_STRESS=<s>`): ein
@@ -78,10 +78,10 @@ Bereich von 256 Granulen wird 45 s lang gemappt, beschrieben, entmappt, mit Zufa
 
 | Variante | Lauf | falsche Granulen im geänderten Bereich |
 |---|---|---|
-| Adressen wiederverwendet | 45 s, 1208 Wechsel | 8665 (und 0 direkt nach dem Schreiben) |
-| Adressen wiederverwendet, mit fremdem Render-Node-Client | 45 s, 1272 Wechsel | 8994 |
-| wie oben, 50 ms Pause zwischen Unmap und Map | 30 s, 401 Wechsel | 1724 |
-| Handle vor dem Unmap freigegeben | 30 s, 1257 Wechsel | 8331 |
+| Adressen wiederverwendet, ohne fremden Client | 45 s, 1264 Wechsel | 8385 (und 0 direkt nach dem Schreiben) |
+| Adressen wiederverwendet, mit fremdem Render-Node-Client | 45 s, 1248 Wechsel | 8256 |
+| Adressen wiederverwendet, 50 ms Pause zwischen Unmap und Map | 30 s, 401 Wechsel | 1724 |
+| Adressen wiederverwendet, Handle vor dem Unmap freigegeben | 30 s, 1257 Wechsel | 8331 |
 | Handles in einem Pool wiederverwendet statt freigegeben | 30 s, 1249 Wechsel | 6117 |
 | jede Adresse freigegeben und neu reserviert (Reserve liefert dieselbe Adresse) | 30 s, 1249 Wechsel | 6377 |
 | Handle nie freigegeben (Speicher leckt, keine Seite wird wiederverwendet) | 30 s, 1217 Wechsel | 0 |
@@ -110,8 +110,7 @@ Anfrage mit `logprobs`, danach je 12 Einzelanfragen an das ruhende Model; Fehler
 | dasselbe, elastischer Pool ohne Größenwechsel (e2) | 4 | 662 | 0 | 0 |
 | dasselbe, 1100 MiB mehr Headroom bei m2 (h1) | 4 | 1404 | 778 | 2 von 4 |
 
-Die Bytes sind dabei dieselben wie bei den Messungen oben; es braucht Größenwechsel (Unmap, Map derselben Adresse)
-plus Anstoß von außen. Ohne Beobachter ist die Rate klein, aber nicht null: die ersten Läufe mit dem alten
+Es braucht Größenwechsel (Unmap, Map derselben Adresse) plus Anstoß von außen. Ohne Beobachter ist die Rate klein, aber nicht null: die ersten Läufe mit dem alten
 Stand (Stufen davor in `gpu-acceptance.md`, Abschnitt 9) hatten bei der einmaligen Prüfung nach den Phasen in
 etwa der Hälfte der Läufe einen Fehler.
 
