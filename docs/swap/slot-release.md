@@ -21,6 +21,7 @@ Ein laufendes Model gibt an Step-Grenzen Expert-Slots ab und nimmt sie zurück. 
 
 ## Wird der VRAM physisch freigegeben?
 
+Seit #35 ja, im Manifest-Betrieb mit mehreren Models: siehe `elastic-slab.md`. Ohne Manifest gilt weiter:
 Nein, nur logisch. Der Slab ist eine Reservierung im Weights-Pool, und der ist ein gewöhnlicher
 `rad_dev_alloc` mit Bump-Allokator (`Pool::init`, `mem/pools.h`). Nur der KV-Pool ist elastisch
 (`init_elastic`, VMem). Ein abgegebener Slot bleibt also im Pool des abgebenden Models und ist für
