@@ -57,7 +57,7 @@ TEST(a_manifest_fills_one_record_per_model_with_the_engine_options_applied) {
         "{\"gpu_group\":{\"devices\":[0,1],\"tp\":2},"
         "\"cache\":{\"host_budget_mib\":1024,\"staging_budget_mib\":64,\"idle_timeout_ms\":30000,"
         "\"max_queued_requests\":16,\"warmup_budget_mib\":256,"
-        "\"activation_backoff_ms\":500,\"activation_backoff_max_ms\":20000},\"models\":[" +
+        "\"activation_backoff_ms\":500,\"activation_backoff_max_ms\":20000,\"max_active_models\":2},\"models\":[" +
         model("alpha", true, "[\"--max-model-len\",\"8192\"]") + "," +
         model("beta", false, "[\"--kv-cache-dtype\",\"fp8\"]") + "]}";
     ModelRegistry r;
@@ -71,6 +71,7 @@ TEST(a_manifest_fills_one_record_per_model_with_the_engine_options_applied) {
     CHECK_EQ(r.cache.warmup_budget_mib, (int64_t)256);
     CHECK_EQ(r.cache.activation_backoff_ms, (int64_t)500);
     CHECK_EQ(r.cache.activation_backoff_max_ms, (int64_t)20000);
+    CHECK_EQ(r.cache.max_active_models, (int64_t)2);
 
     REQUIRE_EQ(r.models().size(), (size_t)2);
     CHECK_EQ(r.default_model().id, std::string("alpha"));

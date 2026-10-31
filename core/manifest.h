@@ -5,7 +5,8 @@
  *   { "gpu_group": { "devices": [0, 1], "tp": 2 },
  *     "cache":     { "host_budget_mib": 0, "staging_budget_mib": 0, "idle_timeout_ms": 0,
  *                    "max_queued_requests": 0, "warmup_budget_mib": 0,
- *                    "activation_backoff_ms": 0, "activation_backoff_max_ms": 0 },
+ *                    "activation_backoff_ms": 0, "activation_backoff_max_ms": 0,
+ *                    "max_active_models": 0 },
  *     "models": [ { "id": "a", "path": "/m/a.rad", "default": true,
  *                   "engine": ["--max-model-len", "8192"] } ] }
  *
@@ -18,7 +19,10 @@
  * requests waiting for one cold model (0: 64), and `cache.idle_timeout_ms` is how long an active
  * model may go without a request before it is deactivated (0: never). A model whose activation
  * failed is not tried again for `cache.activation_backoff_ms` (0: 1000), doubling with each failure
- * in a row up to `cache.activation_backoff_max_ms` (0: 60000). The gpu_group section and
+ * in a row up to `cache.activation_backoff_max_ms` (0: 60000). `cache.max_active_models` is how many
+ * models are meant to be active at once (0: all of them): each gets its share of the VRAM on that
+ * basis (manifest_share_mib), and a model that finds the VRAM taken makes the router deactivate the
+ * longest idle one (docs/swap/pressure-deactivation.md). The gpu_group section and
  * the other cache values are only parsed and checked here.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
@@ -48,6 +52,7 @@ struct ManifestCache {
     int64_t warmup_budget_mib = 0;
     int64_t activation_backoff_ms = 0;
     int64_t activation_backoff_max_ms = 0;
+    int64_t max_active_models = 0;
 };
 
 struct ModelRecord {
@@ -85,6 +90,17 @@ private:
  * below `base_mib` (the --gpu-headroom-mib the model would have had). The last model starts with
  * its own headroom and takes what the others left. */
 int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_mib);
+
+/* The share of each model: what the group's tightest card has free above `base_mib`, divided by the
+ * number of models meant to be active at once, min(n_models, max_active_models), where 0 or less
+ * stands for n_models. With fewer than n_models the shares of all models do not fit together:
+ * activating one beyond the limit finds the VRAM taken and deactivates an idle model. */
+int64_t manifest_share_mib(int64_t free_mib, int64_t base_mib, size_t n_models, int64_t max_active_models);
+
+/* Whether a card with `free_mib` free can still give a model its `share_mib` above `base_mib`.
+ * A sixteenth of the share is allowed to be missing: what an Engine takes beyond its budget
+ * (runtime libraries, staging) is not exact. */
+bool manifest_has_room(int64_t free_mib, int64_t share_mib, int64_t base_mib);
 
 /* Fills `out` from the manifest, each model's Config layered on `base` (the parsed command line).
  * RAD_E_INVAL, after logging what is wrong, for a malformed or inconsistent manifest. */

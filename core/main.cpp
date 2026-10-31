@@ -38,7 +38,12 @@ std::atomic<bool> g_signalled{false};   /* set by the SIGINT/SIGTERM handler, re
  * The fixed share caps a model's KV cache and static weights until the KV partitions can grow
  * (#17, docs/swap/kv-lend.md: needs the elastic expert slab, #35). The group planner (place/group_planner.h) divides only the experts, inside those shares:
  * every engine, the default one and a cold one at its activation, joins it when it plans and
- * leaves it when it is destroyed. */
+ * leaves it when it is destroyed.
+ *
+ * VRAM pressure (docs/swap/pressure-deactivation.md): `cache.max_active_models` below the number of
+ * models makes each share larger than an equal split. A model that then finds the VRAM taken, seen
+ * beforehand in build() or as the Engine's own RAD_E_NOMEM, makes the router deactivate the model
+ * idle the longest and activate it again. */
 static int serve_manifest(rad::ModelRegistry& registry) {
     const std::vector<rad::ModelRecord>& models = registry.models();
     const size_t n = models.size();
@@ -76,7 +81,21 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         if (n > 1 && !cfg.given.count("--gpu-headroom-mib")) {
             const int64_t free = free_mib(cfg.tp);
             if (free > 0) {
-                if (share_mib < 0) share_mib = (free - cfg.gpu_headroom_mib) / (int64_t)n;
+                if (share_mib < 0)
+                    share_mib = rad::manifest_share_mib(free, cfg.gpu_headroom_mib, n,
+                                                        registry.cache.max_active_models);
+                /* Fewer active models than configured: the VRAM may be taken by the others, which
+                 * the router resolves by deactivating one (RAD_E_NOMEM). Otherwise the last model
+                 * takes what is left, as before. */
+                const int64_t max_active = registry.cache.max_active_models;
+                if (max_active > 0 && max_active < (int64_t)n &&
+                    !rad::manifest_has_room(free, share_mib, cfg.gpu_headroom_mib)) {
+                    RAD_INFO("manifest: model '%s' needs about %lld MiB of VRAM and the group's "
+                             "tightest card has %lld MiB free (headroom %lld MiB)",
+                             models[i].id.c_str(), (long long)share_mib, (long long)free,
+                             (long long)cfg.gpu_headroom_mib);
+                    return (int)RAD_E_NOMEM;
+                }
                 cfg.gpu_headroom_mib = rad::manifest_headroom_mib(free, share_mib, cfg.gpu_headroom_mib);
                 RAD_INFO("manifest: model '%s' takes about %lld MiB of the group's VRAM "
                          "(--gpu-headroom-mib %lld)", models[i].id.c_str(), (long long)share_mib,
