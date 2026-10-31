@@ -2034,7 +2034,8 @@ by 0.002-0.003 nats.
 
 | flag | |
 |---|---|
-| `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
+| `--model PATH` | required (or `--manifest`): the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
+| `--manifest FILE` | instead of `--model`: serve the models a JSON file lists, one endpoint, routed by the request's `model`; the default model starts at once, the others at their first request, and an idle one is deactivated. Text only; excludes `--model` and LoRA (§4.12) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
 | `--control-vector off\|on\|disabled` | `disabled` (and no flag at all) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on. Refused at startup when the model's plugin does not apply control vectors or no compatible file is found (§4.10) |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
@@ -2205,6 +2206,386 @@ flags are refused on it, and so are the pixel bands.
 | `--live` | the live terminal view (§6.4) |
 | `-v` / `-vv` | verbose / very verbose |
 
+### 4.12 Several models in one process (`--manifest`)
+
+One radiance process can serve several models behind one endpoint. The models share the cards of one
+GPU group, more than one can be active at once, and a request names its model in the `model` field.
+Without `--manifest` nothing in this section applies and radiance behaves as before.
+
+A model is **active** while it runs on the cards. When nothing has asked for it for a while, or the
+cards are needed for another model, it is **deactivated**; a **prepared** model keeps its weights
+in host RAM in the form the kernels read, so the next **activation** needs no parsing, no relayout and
+no read from the drive. A **cold** model has no copy in RAM (never loaded, or pushed out when RAM was
+full) and is read from the container or the page cache. Running generations are never cut by any of
+this. The design is in `../GLOSSARY.md` and `adr/0001` to `0003`; the measurements behind the numbers
+below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md).
+
+Text models only: image, audio and video endpoints, and image, audio or video parts in a text request, are
+refused with a 501 while a manifest is in use, and LoRA adapters are refused at startup (an adapter
+belongs to one base model).
+
+#### The manifest
+
+`--manifest FILE` replaces `--model` with a JSON file:
+
+```json
+{
+  "gpu_group": { "devices": [0, 1], "tp": 2 },
+  "cache": {
+    "host_budget_mib": 0,
+    "staging_budget_mib": 0,
+    "idle_timeout_ms": 300000,
+    "max_queued_requests": 0,
+    "warmup_budget_mib": 12288,
+    "activation_backoff_ms": 0,
+    "activation_backoff_max_ms": 0,
+    "max_active_models": 0
+  },
+  "models": [
+    { "id": "moe", "path": "/models/flash-next.rad", "default": true,
+      "engine": ["--max-model-len", "8192", "--max-num-seqs", "8", "--placement", "expert_tiered",
+                 "--host-pool-mib", "12288", "--kv-cache-dtype", "fp8"] },
+    { "id": "small", "path": "/models/Qwen3.5-0.8B",
+      "engine": ["--max-model-len", "4096", "--gpu-headroom-mib", "300"] }
+  ]
+}
+```
+
+```sh
+radiance --manifest models.json --port 8000 --tp 2
+```
+
+Every key is optional except `models`. A key the manifest does not know is refused, so a typo is not a
+silent default.
+
+| key | default | meaning |
+|---|---|---|
+| `gpu_group.tp` | the command line's `--tp` | tensor-parallel ranks, shared by every model |
+| `gpu_group.devices` | the visible cards | card numbers; checked (non-empty, whole, non-negative, no repeats, as many as `tp`), but **not yet used to pick cards**: the group is the first `tp` usable cards, as with `--tp` alone |
+| `cache.host_budget_mib` | 0 | host RAM the process may spend on models: prepared copies, the active models' host pools and the loads' staging. 0 takes the existing host limits instead (available RAM, cgroup limits, memlock, `--host-headroom-mib`). See RAM sizing below |
+| `cache.staging_budget_mib` | 0 | **parsed only.** Staging is counted in `host_budget_mib` but not limited by this key |
+| `cache.idle_timeout_ms` | 0 | a model with no request for this long is deactivated; 0: never |
+| `cache.max_queued_requests` | 0 (64) | requests that may wait for one model that is not active yet; more get a 429 |
+| `cache.warmup_budget_mib` | 0 | per rank, how many bytes of a model's hottest experts, by the heat saved at its last deactivation, are ranked first for the card when it is activated again (below); 0: off |
+| `cache.activation_backoff_ms` | 0 (1000) | how long a model whose activation failed is not tried again; doubles with each failure in a row |
+| `cache.activation_backoff_max_ms` | 0 (60000) | where the doubling stops |
+| `cache.max_active_models` | 0 (all) | how many models are meant to be active at once; sets each model's VRAM share (below) |
+| `models[].id` | required | what a request's `model` says, and what `/v1/models` lists. Becomes `--served-model-name` |
+| `models[].path` | required | a `.rad` container or a checkpoint directory that exists on this machine (a Hugging Face repo id is not fetched here) |
+| `models[].default` | false | the model a request without `model` goes to, and the one started at once. Exactly one model sets it |
+| `models[].engine` | none | that model's own options, as command-line words: `--max-model-len`, `--kv-cache-dtype`, `--placement`, `--host-pool-mib`, `--num-speculative-tokens`, `--gpu-headroom-mib`, … |
+
+Each model's options are the command line's, with its `engine` list laid over them, through the same
+parser and the same checks as a single model. Put process-wide options (`--host`, `--port`,
+`--api-key`) on the command line: the one listener is built from the default model's.
+
+**What is refused at startup** (exit status 2, the log says which):
+
+- `--manifest` beside `--model`, beside any `--lora…` or `--max-lora…` option, in KL mode, or with
+  `--served-model-name`;
+- a file that cannot be read or is not a JSON object; an unknown key anywhere; no `models`, or an empty list;
+- `gpu_group.tp` that disagrees with the number of `devices`, or with `--tp` given on the command line;
+- a `cache` value that is not a whole number of 0 or more;
+- a model without a non-empty string `id` or `path`; the same `id` twice; a `path` that does not exist;
+  `default` that is not true or false; no default model, or more than one;
+- an `engine` that is not a list of strings, that sets `--model`, `--manifest`, `--tp`,
+  `--served-model-name`, `--help` or a `--lora…` / `--max-lora…` option, or whose options the engine refuses.
+
+Whether a model other than the default can be loaded is found out at its first activation, not at startup.
+
+#### Routing
+
+- The request's `model` picks the model, before any tokeniser, template or grammar is touched; the
+  request is then served with that model's own tokeniser, chat template, grammar and context limit.
+  No `model` goes to the default model. An unknown id is a 404 `model_not_found` that lists the ids served.
+- `GET /v1/models` lists every configured model, active or not.
+- A `GET` that names no model (`/health`, `/metrics`, `/v1/models`) never activates the default model:
+  it is answered while the default model is cold. Any other request that needs a cold default model
+  starts its activation (a `GET` for anything else gets a 503 `model_not_active`).
+- A model served from a manifest produces the same tokens as `--model` with the same options (checked: greedy,
+  seeded sampling, streaming, a long prompt, dense and MoE), also beside another active model.
+
+#### Lifecycle of a model
+
+| state (`/radiance/models`) | | meaning |
+|---|---|---|
+| `cold` | KALT | no copy in RAM; an activation reads the container or checkpoint |
+| `prepared` | VORBEREITET | not active, weights in RAM; an activation uploads them |
+| `activating` | AKTIVIEREND | an activation is running; requests for the model wait |
+| `active` | AKTIV | every rank is ready and the model serves |
+| `deactivating` | DEAKTIVIEREND | out of the route table, its runtime is being destroyed |
+| `failed` | FEHLGESCHLAGEN | the last activation failed and was rolled back; `error` and `retry_after_seconds` say why and until when |
+
+(The state VORBEREITEND, `preparing`, exists in the code's list of states, but nothing sets it: a first
+load is part of the activation.)
+
+- **Start.** Only the default model is started with the process; every other model is `cold`.
+- **Activation at the first request.** The first request for a model that is not active starts its
+  activation on a thread of its own; no HTTP thread builds an engine and the other models keep
+  serving. Requests that arrive meanwhile wait on the same activation, so concurrent first requests
+  cause one activation. One model is built at a time (each reads the cards' free memory to find its share), so
+  activations of different models run one after the other. A waiting request is bounded by
+  `cache.max_queued_requests` (a 429 beyond it) and by a fixed deadline of ten minutes (a 503). A client that hangs up while waiting
+  frees its place and gets nothing; the activation goes on for the next request.
+- **Idle deactivation.** With `cache.idle_timeout_ms`, a model that has had no request for that long is
+  deactivated, the default model too. A model is idle only when no request is between routing and the
+  end of its response and its server has nothing admitted: a streaming response keeps it busy until the
+  last chunk. The check runs every fifth of the timeout, at least every 100 ms. Deactivation destroys the
+  model's runtime, so its KV cache, prefix cache (and the host tier of it) and recurrent state are gone: the
+  first request after the next activation prefills in full. The weights in the prepared store and the
+  expert heat (below) stay.
+- **Deactivation under VRAM pressure.** Each model has a fixed VRAM share (below). When
+  `cache.max_active_models` is lower than the number of models, the shares are larger than an equal
+  split and do not all fit at once. A model that finds the cards full makes the router deactivate the
+  active model that has been idle the longest, and then activates it again. A model that is serving
+  something is never chosen; if every other model is busy, the request keeps waiting until one goes idle or the
+  deadline passes; if no other model is active, there is nothing to free and it fails at once. One
+  request makes at most one such round per configured model.
+- **Failure and backoff.** An activation that fails (not enough VRAM or RAM, a bad container, a
+  rank error) frees every partial allocation on every rank and leaves the other active models
+  untouched; the model is `failed`. It is not tried again before its backoff has passed: 1 s after the
+  first failure, doubling per failure in a row up to 60 s (the two `activation_backoff` keys), reset by
+  a successful activation. A request inside the backoff gets a 503 at once, with the time left in
+  `Retry-After`. A request that failed for lack of VRAM is the exception: it makes room first
+  (above).
+- **Unhealthy.** A device error (`RAD_E_DEVICE`) during an activation marks the whole GPU group
+  unhealthy: no activation is started again, every request is a 503 `gpu_group_unhealthy`, `/health`
+  answers 503, and `/metrics` and `/radiance/models` still answer (`radiance:gpu_group_healthy` 0,
+  `healthy: false`). Generations already running are not cut. Only a restart of the process clears it.
+
+What a client sees while the model it asked for is not there:
+
+| status | `code` | when | `Retry-After` |
+|---|---|---|---|
+| 404 | `model_not_found` | the id is not in the manifest | |
+| 429 | `model_queue_full` | `cache.max_queued_requests` requests already wait for this model | 1 |
+| 499 | | the client left while waiting (no body worth reading) | |
+| 501 | | an image, audio or video endpoint, or such a part in a text request | |
+| 503 | `model_activation_failed` | the activation this request waited on failed; the message names the cause | at least 1 (the backoff left) |
+| 503 | `model_activation_backoff` | the model failed recently and is not tried again yet | the backoff left, at least 1 |
+| 503 | `model_activation_timeout` | not active within ten minutes, or still waiting for VRAM because every other model is busy | 1 |
+| 503 | `model_not_active` | a `GET` that names no model, other than `/health`, `/ping`, `/metrics` and the model lists, while the default model is cold | 1 |
+| 503 | `gpu_group_unhealthy` | a device error took the group down (restart the process) | none |
+| 503 | `server_stopping` | the process is shutting down | 1 |
+
+#### RAM sizing
+
+The host RAM a manifest needs is easy to underestimate, because **a model's weights are in RAM a
+second time**.
+
+1. **Store copies.** The first activation of a model copies its weights, in the form the kernels
+   read (never dequantised or requantised), into the process's prepared store, with no extra read from
+   the drive. That copy is made while the model is still active, so an active model's weights exist
+   twice, on the card (or in its host pool) and in the store, and a deactivated model keeps only the
+   copy. The store holds the weights of all ranks: 2.4 GB for
+   Qwen3.5-0.8B, 72.5 GB (67.5 GiB) for Qwen3.8-Flash-Next at `--tp 2`.
+2. **Host pools of active models.** What an active model pins in RAM: `--host-pool-mib` (per rank, §4.3),
+   the pinned embedding and encoder towers, the host tier of the prefix cache (§4.8), activation arenas,
+   the checkpoint snapshot store, and the RAM copy of an n-gram table (`--ngram-placement ram`).
+   They end with the model's deactivation.
+3. **Staging.** While a load runs, an upload ring of 8 × 4 MiB pinned per load worker (a warm load
+   uses at most 4 workers, 128 MiB) and, for a load from a checkpoint or container, a relayout window of at most
+   4 GiB. They are released when the load ends.
+4. **Not counted:** the KV mirror of streaming KV (§4.4.1), the scheduler's pinned buffers, and anything
+   that lives in the page cache.
+
+**Page cache is not RAM backing.** A container read through a mapping, a mapped n-gram table and the file tier
+are served from the page cache. The kernel can take them back at any time, so they are not counted and a
+model is never `prepared` on their account: they are read again at every activation. The prepared store
+and the pools are anonymous memory of the process, counted against the budget and never taken by the
+kernel. An unchanged container is deliberately copied into the store, not kept as a reference to its
+mapping, so that "the second activation reads no checkpoint bytes" is true.
+
+**The budget.** `cache.host_budget_mib` bounds the three counted kinds together (the status calls them `store`,
+`pools` and `staging`). When a booking does not fit:
+
+1. the prepared model idle the longest is dropped and becomes `cold` (LRU by last deactivation or load);
+2. then the store copy of an **active** model (it keeps running; after its deactivation it is cold);
+3. last the activating model's own copy.
+
+A model whose load is running is never dropped, and the pools of active models never are: if they
+alone exceed the budget the activation still goes ahead (it fails only on the existing host checks),
+`over_budget_claims` counts it and the log warns. A copy is made at all only when the whole model fits next
+to `--host-headroom-mib` and the cgroup and memlock limits; otherwise the model stays cold (log warning
+"not kept for a warm activation"). With the budget at 0, those host checks alone decide, and they make
+the same room by dropping the longest idle copy. The bookings are estimates from the configuration, made
+after planning and before allocating, not measured resident sizes.
+
+**To size a host:**
+
+    RAM  ≳  Σ store copies of the models you want warm
+          + Σ host pools of the models active together
+          + the largest load's staging (up to 4 GiB)
+          + --host-headroom-mib (4096 by default)
+          + whatever page cache you still want
+
+**Example, measured:** a 170 GiB host (48 vCPU, two R9700), Qwen3.8-Flash-Next (113.6 GiB `.rad`: 67.5
+GiB of weights and a 47.7 GiB mapped n-gram table), `--tp 2`, host pools of 12 288 to 20 000 MiB per rank.
+
+| setup | host RAM in use | available |
+|---|---|---|
+| Flash-Next deactivated and prepared (store 72.5 GB) | 75 GiB | |
+| one Flash-Next active, store copy kept | **153 GiB** of 170 | 17 GiB; the page cache was pushed down to 17 GB |
+| two Flash-Next entries active | **160 GiB** of 170 | 10 GiB; only the first took a store copy (72.5 GB), the second is cold after its deactivation |
+
+Of the 153 GiB, 67.5 GiB is the store copy and the rest is the active model's pools and the system's own use (host pool, the RAM copy
+of the n-gram table, arenas); the acceptance did not split that by kind, `host_memory` in `/radiance/models`
+does on your machine. Two such models in one process is already at the edge of 170 GiB, and with the page cache
+squeezed out, a mapped table is read from the drive at every activation. What helps: `--ngram-placement disk`
+(no RAM copy; warm re-activation fell from 45 to 6.3–7.6 s), a smaller `--host-pool-mib`, or a `host_budget_mib`
+that says how much the models may take, so the cost lands on the copies you choose to lose. The acceptance
+did not vary `host_budget_mib`.
+
+#### VRAM split
+
+- **A fixed share per model.** A model started with the process, or activated later, claims the free
+  VRAM of the group's tightest card, less `--gpu-headroom-mib`, divided by
+  `min(number of models, cache.max_active_models)`; with `max_active_models` 0 the models are meant to
+  all be active, so each gets an equal part and the last one started takes what is left. The share
+  is computed once, when the first model is built, and caps that model's static weights, KV cache and
+  experts. A `--gpu-headroom-mib` in a model's `engine` list replaces the share calculation for that
+  model. With the shares of all models bigger than the cards, set `cache.max_active_models` below the number of
+  models: activating one beyond that finds the cards full and deactivates the model idle the longest. Measured:
+  three 0.8B models with `max_active_models` 2 (16 235 MiB each): a request for the third deactivated the
+  idle-longest one and was served after 4.9–5.1 s, with a warm re-activation.
+- **Experts between models (GroupPlanner).** Inside the shares, a group planner divides the expert slots of
+  the MoE models by group heat: every model keeps a minimum (the larger of its expert floor and half the
+  equal part), the rest goes to the hottest experts of the group, valued by heat × bytes per slot byte. A
+  model that leaves gives its budget back. A model gets no more than its share offered, so **in the
+  acceptance (two MoE models in equal shares) the first model gave up no slot** when the second was busy. A
+  slot a running model gives up at a step boundary is released **logically only**: the bytes stay in its
+  weights pool and no other model can use them. Elastic expert slabs that free them physically
+  are not yet available (#35).
+- **KV between models.** The KV loan (§4.3: idle KV blocks lent to the experts) works inside one model.
+  A model's KV partition does not grow into another's: the planner layer for it exists but is not connected,
+  because no pool can yet back the bytes (#17, needs #35).
+- **Heat warmup.** A model's expert heat is saved when it is deactivated. With `cache.warmup_budget_mib` > 0
+  the next activation ranks its experts by that heat and puts the hottest, within the budget (bytes of
+  expert slots per rank), on the card at load time, instead of starting with the container's profile (an explicit
+  `--expert-profile` takes precedence). The heat lives as long as the process; a model that routed no experts (a dense model) saves none. The acceptance used `--placement expert_tiered`. Measured on Flash-Next (`early_hit`, below): 83.45 % after
+  re-activation without a budget, 89.12 % with 12 288 MiB.
+
+#### What it costs
+
+Measured on 2× Radeon AI PRO R9700 (gfx1201, 31.86 GiB each), `--tp 2`, 170 GiB host, dense =
+Qwen3.5-0.8B, MoE = Qwen3.8-Flash-Next.
+
+**Activation: warm against cold**
+
+| model | cold (from drive) | warm (from the store) | what is left of a warm one |
+|---|---|---|---|
+| dense 0.8B | 2.6 s (weights 0.69 s) | **2.1 s** p50, 2.2 s p95 (120 cycles); weights 0.25 s | ~1.9 s of planning, all-reduce setup, arena and kernel set-up |
+| MoE Flash-Next, n-gram in RAM | 70 s (weights 59–70 s: 113.6 GiB read) | **60 s** (weights 45 s) | 39 s to copy the mapped n-gram table from the drive again at each activation: the store holds only the 67.5 GiB of weights (about 6 s) |
+| MoE Flash-Next, `--ngram-placement disk` | | **6.3–7.6 s** weights | |
+
+Warm means `source_read_bytes` 0 (nothing read from the container). `disk_read_bytes` is the
+process-wide `read_bytes` delta, so a page-cache miss on a mapped table, or another model's activation
+at the same time, shows up there. A deactivation takes 0.7 s (dense) to 1.4 s (MoE). 120 dense
+activate/deactivate cycles left no growth in VRAM (266 MiB per card, every cycle), queues, threads or file
+descriptors; host RSS grew by at most 17 MiB over the last 72 cycles. A process with no active model still holds 209 MiB
+per card (HIP context, code objects) until it exits.
+
+**Throughput with two models active.** The collectives of all models in a group run in one order, the same on
+every rank (ADR 0003), so two active models do not communicate in parallel. You do not get twice the work from two
+models; you get the second one without waiting for the first.
+
+| load | alone | two active (both busy) |
+|---|---|---|
+| dense, 1 sequence | 326–332 tok/s | 154 + 154 tok/s: half each |
+| dense, 8 sequences, aggregate | 2026–2029 tok/s | 1287–1366 + 716–725 tok/s |
+| dense `a` while `b` is active but idle | 326–332 tok/s | 294–300 tok/s (≈ 10 % for a second engine; tapes are bypassed while several engines are registered) |
+| MoE, 1 sequence | 74.8 tok/s | 59.3 tok/s (beside a busy dense model, which makes 52 tok/s) |
+| two MoE, 1 sequence | | 9.3 → 30.4 tok/s each as the heat warms; host RAM is full |
+
+These figures are with the collective hand-off between the ranks' threads spinning for 300 µs before it sleeps;
+without that, two dense models made 31 tok/s each.
+Prefill beside a busy second model: dense 36 000–47 000 tok/s against 69 000–71 000 alone; MoE 4520–4730
+against 5120. TTFT is not split by queue, activation and prefill in any metric; derive it as the request's
+wall time = wait for the router + `activation_seconds` (the delta in `/radiance/models`) + the engine's `timings.ttft_ms`.
+For a warm dense activation that is about 2.16 s total with 25 ms of prefill; for a cold MoE about 70 s.
+
+**Experts from RAM (today).** An expert held in the pinned host pool is read across the link by the GEMM.
+Measured with `r4d_selftest --perfmoe 2048 5 512 10 <pooled %>`: a 2048-token gate_up GEMM takes 1.17 ms with every expert on the card
+and 3.2 ms with the coldest 13 % in the host pool. That is what `--host-pool-mib` costs per pooled
+expert (§4.3).
+
+**Static weights from RAM: not yet available.** Streaming the *non-expert* weights (attention, GDN, dense
+MLP, embeddings, head) from host RAM, so that a model could start while the cards are full and move into
+VRAM as slots free up, is not in this build (#18, #19). A model whose static weights do not fit its share
+fails its activation (`not enough VRAM`) and is handled as pressure above. The prototype measurement
+that decided the design (`swap/measure-static-streaming.md`, prototype outside the engine):
+
+| | VRAM | streamed from host RAM |
+|---|---|---|
+| bandwidth | 600–870 GB/s | 28.4 GB/s over PCIe 4.0 ×16 (24.5–28.4 GB/s read in place) |
+| GEMV, one token | 0.04–0.19 ms | 1.35–4.2 ms: 21× to 36× slower (fp16) |
+| GEMM, prefill read in place | | 8× to 64× slower |
+| GEMM, prefill through a staging ring | | ≈ 1.2× (transfer overlaps compute) |
+| decode, all static weights streamed (projected) | 64–67 tok/s | 5.6 tok/s Flash-Next, 1.9 tok/s Qwen3.8-27B: -92 % to -97 % |
+
+So streaming static weights is meant as a bridge only: it lets a model answer its first requests at once
+while its weights move to the card, and prefill goes through the staging ring, never in place. As a steady state
+it is not usable. The figures from the finished engine path will replace the projected row.
+
+#### Status and metrics
+
+`GET /radiance/models`:
+
+```sh
+curl -s localhost:8000/radiance/models | jq
+```
+
+Per model (`data[]`): `id`, `state`, `default`, `activations`, `activation_seconds`, `deactivations`,
+`deactivation_seconds`, `queued_requests`, `activation_failures`, `pressure_deactivations`,
+`vram_released_mib` (of the last deactivation, right only while no other model changed the cards at the same time),
+`prepared_bytes`, `warm_activations`, `cold_activations`, `last_weight_load` (`kind` warm or cold, `bytes`,
+`bytes_from_store`, `seconds`, `source_read_bytes`, `disk_read_bytes`, `mapped_bytes`) and, when failed, `error`
+and `retry_after_seconds`. At top level: `idle_timeout_ms`, `healthy`, `unhealthy_reason`, and `host_memory`:
+`budget_bytes` (0: derived), `used_bytes`, `store_bytes`, `pool_bytes`, `staging_bytes`, `evicted_prepared`,
+`evicted_active_copies`, `evicted_bytes`, `over_budget_claims`. Not shown: a model's VRAM share, KV partition or
+share of RAM streaming.
+
+`GET /metrics` carries these beside the others (§6.3), each with a `model` label:
+
+| | |
+|---|---|
+| `radiance:model_state{state}` | 1 for the state the model is in |
+| `radiance:model_activations_total`, `_activation_seconds_total`, `_activation_failures_total` | |
+| `radiance:model_deactivations_total`, `_deactivation_seconds_total`, `_pressure_deactivations_total` | |
+| `radiance:model_vram_released_mib`, `radiance:model_prepared_bytes` | |
+| `radiance:model_weight_loads_total{kind}`, `_load_bytes_total`, `_load_seconds_total`, `_source_read_bytes_total`, `_disk_read_bytes_total` | `kind` is `warm` or `cold` |
+| `radiance:gpu_group_healthy` | 0 once a device error took the group down |
+| `radiance:host_budget_bytes`, `radiance:host_used_bytes{kind}` | `kind` is `store`, `pools` or `staging` |
+| `radiance:host_evictions_total{kind}`, `radiance:host_evicted_bytes_total` | `kind` is `prepared` or `active_copy` |
+
+`/stats`, `/graph` and the rest of `/metrics` report **the default model** only (a `?model=` is ignored); the
+expert and mover counters of a second model are only in the log. The heat warmup is read from `/stats` as
+`experts.early_routed` and `experts.early_routed_res`: `early_hit` is the share of experts routed in the first 64
+steps after an activation that were already on the card (also `early_hit=…%` in `--live`).
+
+#### Known limits
+
+- **Slot release is logical** (#35 open): a model that gives experts away frees no VRAM another model can use,
+  and the shares stay fixed. The shrink and regrow path did not run in the acceptance (two MoE models with
+  equal shares).
+- **No cross-model KV loan** (#17 open): a model's KV partition cannot grow at another's expense. The loan runs
+  inside one model.
+- **No RAM streaming of static weights** (#18, #19 open): a model whose static weights do not fit its share
+  fails to activate or displaces an idle model.
+- **Host RAM is the limit of large models.** Two Flash-Next on 170 GiB fill the host; the store copy of the
+  second does not fit. `staging_budget_mib` is parsed only; bookings are estimates.
+- **A MoE activation takes a minute** (60 s warm, 70 s cold, with the n-gram table in RAM), because the mapped table
+  is copied at every activation and the store pushes the page cache out; `--ngram-placement disk` avoids it.
+- **`vram_released_mib` is wrong when other models change at the same time** (the log and the metric subtract
+  free memory before and after, and `-214 MiB` has been seen); it is right for a single model in motion.
+- **A failed activation can cost a healthy model.** A model that can never fit (`nomem` in the acceptance)
+  still deactivates one idle model once before it fails.
+- **`gpu_group.devices` selects nothing**, and `staging_budget_mib` limits nothing (above).
+- **Ceiling on activations:** each activation creates about 46 device streams, whose ids are never reused and come
+  from a table of 1 Mi entries: about 22 000 activations per process before `rad_stream_create` fails.
+- **Not measured:** `host_budget_mib` with two large models, more than two models, streaming while a second
+  model is deactivated, 120 cycles with a MoE, sampling and abort on a MoE.
+
 ---
 
 ## 5. API
@@ -2226,7 +2607,8 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
+| `GET /radiance/models` | with `--manifest`: each model's state (cold, prepared, activating, active, deactivating, failed), activations, the last weight load and the host-RAM budget (§4.12) |
+| `GET /v1/models`, `/v1/models/:id` | what is loaded (with `--manifest`, every configured model, §4.12), with `max_model_len` (the context it serves) and `root` (the `--model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
 | `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |
@@ -3661,6 +4043,7 @@ there is none.
 | `num_requests_preempted` | | 
 | `preempt_forced_total` | preempted prefill waits that ended by reclaiming cache blocks and forcing a lowest-priority running victim (`--preempt-wait-ms`) |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
+| `model_*`, `gpu_group_healthy`, `host_*` | with `--manifest` only: per model state, activations, deactivations and weight loads (warm or cold), the group's health, and the host-RAM budget (§4.12). `/stats` and the rest of `/metrics` report the default model only |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
 Two pitfalls:
@@ -3810,6 +4193,7 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates, so a card that refuses its weights pool lost that memory to another process in between (the next line says how much is free now). A refused `host_pool` is pinned memory: every rank pins its own `--host-pool-mib` (twice at `--tp 2`), and the amdgpu driver caps what all processes together pin at RAM less 1/64 and 1.5 GiB. It is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode can refuse a single pin above about 2.5 GiB; a failing piece means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through, but on such a host it can also remove peer access between the cards, moving every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
 | `device: a synchronisation has seen no queue advance for 5 s; the queues:` with the packet each queue is on, then `device: no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue; the kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps moves under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits on a queue that never drains. Clock instability (a voltage offset) is the other cause seen on R9700s. A wait that is only long (a deep prefill, a video's denoising pass) reports nothing while any queue advances | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset restores the power cap, fan curve and voltage offset to firmware defaults; re-apply them before every start. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`, which a reboot loses. `docker inspect` shows exit code 0 for a container Docker already restarted, whatever ended the old process |
+| `503` with `model_activation_failed` / `model_activation_backoff` / `model_activation_timeout`, or `the failed activation is rolled back` in the log (`--manifest`) | A model's activation failed and was undone on every rank; the next try waits for the backoff. `not enough VRAM` means its share did not fit beside the other active models; `Retry-After` says when it is tried again | Read the message in the 503 and `error` in `GET /radiance/models`. A higher `cache.max_active_models` makes every share smaller; smaller `--max-model-len` / `--max-num-seqs` shrink what a model needs. A `gpu_group_unhealthy` answer needs a restart (§4.12) |
 | `--draft-model is not implemented` | The engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The prompt alone does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | An unknown flag is an error, so a typo in a budget flag cannot silently change the plan | Check `radiance --help` |
@@ -3909,6 +4293,7 @@ name in the source and read the comment beside it.
 | [PLUGIN.md](PLUGIN.md) | writing a kernel plugin: exports, constraints, hooks, out-of-tree build |
 | [OPS.md](OPS.md) | the conventional op vocabulary, held to the registries by `ctest -R ops_doc` |
 | [ARCHITECTURES.md](ARCHITECTURES.md) | per-architecture geometry, and the mistakes that stay plausible when they are wrong |
+| [swap/](swap/gpu-acceptance.md) | several models in one process (§4.12): the acceptance measurements (`gpu-acceptance.md`), the static-weight streaming measurement (`measure-static-streaming.md`), and one note per mechanism: warm activation, host budget, slot release, KV loan, pressure deactivation, heat warmup |
 | [IMPLEMENTATION.md](IMPLEMENTATION.md) | layout, build and conventions for working on the engine |
 | [KERNELS.md](KERNELS.md) | what `rad-kbench` last measured |
 | [QSA.md](QSA.md), [MOE-W4.md](MOE-W4.md) | the sparse-attention indexer; the four-bit expert format |
