@@ -35,10 +35,12 @@ std::atomic<bool> g_signalled{false};   /* set by the SIGINT/SIGTERM handler, re
  * The registry and the router belong to the process; an Engine belongs to the thread that serves
  * it and is destroyed when that thread returns.
  *
- * The fixed share caps a model's KV cache and static weights until the KV partitions can grow
- * (#17, docs/swap/kv-lend.md: needs the elastic expert slab, #35). The group planner (place/group_planner.h) divides only the experts, inside those shares:
- * every engine, the default one and a cold one at its activation, joins it when it plans and
- * leaves it when it is destroyed.
+ * The fixed share fixes a model's static weights and the KV cache it starts with (its carve). The
+ * carve is no longer the cache's ceiling: a partition that needs more claims bytes from the group's
+ * expert pool, up to the cache's own ceiling (--max-model-len x --max-num-seqs), and the experts of
+ * any model give them back (#17, docs/swap/kv-lend.md). The group planner (place/group_planner.h)
+ * divides the expert pool inside those shares: every engine, the default one and a cold one at its
+ * activation, joins it when it plans and leaves it when it is destroyed.
  *
  * VRAM pressure (docs/swap/pressure-deactivation.md): `cache.max_active_models` below the number of
  * models makes each share larger than an equal split. A model that then finds the VRAM taken, seen
