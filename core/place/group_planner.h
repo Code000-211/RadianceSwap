@@ -37,8 +37,13 @@
  *
  * join() runs in Engine::plan, right after the single-engine resolve: the engine offers what it
  * resolved and starts with min(offer, target). Targets of engines already running are recomputed
- * on every join, leave and update, and exposed by target(), but nothing shrinks a running engine
- * yet (ticket #15 will act on them at a step boundary).
+ * on every join, leave and update, and exposed by target().
+ *
+ * A running engine acts on its target at a step boundary (ticket #15, Engine::group_tick): it
+ * reports its heat with update(), reads target(), and states the cap per slab class to its mover
+ * (group_resident_cap, Mover::set_resident_cap), which gives slots back or takes them again.
+ * What a shrink frees is logical: the engine's slab stays one reservation in its own weights
+ * pool, so the bytes are not another engine's to use (Mover::set_resident_cap).
  */
 #pragma once
 #include "heat.h"
@@ -92,6 +97,14 @@ std::vector<GroupBudget> group_allocate(const std::vector<int64_t>& pool,
  * the power of two their heat is near. Without a heat engine running every unit has heat 0. */
 std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat);
 
+/* The slab classes of a plan whose units the group planner counts (group_heat_bins). */
+std::vector<int32_t> group_classes(const Plan& plan);
+
+/* How many resident units of slab class `slab_class` the target `b` lets an engine keep, for
+ * Mover::set_resident_cap; -1 for no limit. A sole engine's target names no classes and equals
+ * its offer; a target that names some grants the others nothing. */
+int64_t group_resident_cap(const RankBudget& b, int32_t slab_class);
+
 /* The process-wide planner, one per GPU group. Thread-safe. Engines join when they plan (the
  * default model at startup, a cold model when its first request activates it) and leave when
  * they end. */
@@ -110,6 +123,8 @@ public:
     void leave(const std::string& id);
     /* A running engine's new heat summary, one bin list per rank; targets are recomputed. */
     void update(const std::string& id, const std::vector<std::vector<HeatBin>>& bins);
+    /* The same for one rank, which reports on its own: the other ranks' bins stay as they were. */
+    void update(const std::string& id, size_t rank, std::vector<HeatBin> bins);
     /* What the engine is entitled to now (empty when it is not registered). */
     GroupBudget target(const std::string& id) const;
 

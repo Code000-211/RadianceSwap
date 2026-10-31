@@ -166,8 +166,8 @@ TEST(an_engine_starting_with_less_free_than_its_target_gets_only_what_is_free) {
     GroupPlanner g(2);
     g.join("a", one_rank(40, { bin(20, 2, 0.0f) }));   /* holds 30: 10 stay for the engine to come */
     /* Equal planes and no heat would split the 50 MiB the pool now is in half, but B offers 20 and
-     * that is its ceiling; A is owed the rest. A running engine is not shrunk here (ticket #15):
-     * its target just records what it is owed. */
+     * that is its ceiling; A is owed the rest. A running engine acts on its target at a step
+     * boundary (Engine::group_tick); the planner just records what it is owed. */
     const GroupBudget b = g.join("b", one_rank(20, { bin(20, 2, 0.0f) }));
     CHECK_EQ(b[0].bytes, (int64_t)20 * MiB);
     CHECK(g.target("b")[0].bytes <= (int64_t)20 * MiB);
@@ -316,6 +316,52 @@ TEST(heat_bins_group_a_plans_expert_units_by_class_and_heat) {
     /* The routed pair is hotter than b's units, which are hotter than a's cold six. */
     CHECK_EQ(got[0][0].class_units.at(0), (int64_t)2);
     CHECK_EQ(got[1][0].class_units.at(0), (int64_t)6);
+}
+
+TEST(a_rank_reports_its_own_heat_and_the_others_keep_theirs) {
+    GroupPlanner g(0);
+    GroupFacts two(2);
+    for (RankFacts& r : two) { r.offer = 10 * MiB; r.bins = { bin(8, 1, 1.0f) }; }
+    g.join("a", two);
+    g.join("b", two);
+    const int64_t r1 = g.target("a")[1].bytes;
+    g.update("a", 0, { bin(8, 1, 50.0f) });
+    CHECK_EQ(g.target("a")[1].bytes, r1);                    /* rank 1 reported nothing */
+    g.update("a", 5, { bin(8, 1, 50.0f) });                  /* no such rank: ignored */
+    g.update("none", 0, { bin(8, 1, 50.0f) });
+    CHECK_EQ(g.target("a")[1].bytes, r1);
+}
+
+TEST(a_target_states_a_resident_cap_per_slab_class) {
+    /* A sole engine: its target names no class and equals its offer, so nothing is capped. */
+    GroupPlanner g(1);
+    const GroupBudget sole = g.join("only", one_rank(20, { bin(8, 2, 1.0f, 3) }));
+    CHECK_EQ(group_resident_cap(sole[0], 3), (int64_t)-1);
+    CHECK_EQ(group_resident_cap(g.target("only")[0], 3), (int64_t)-1);
+
+    /* A target that names classes grants the others nothing. */
+    RankBudget b;
+    b.bytes = 6 * MiB;
+    b.class_units[0] = 3;
+    CHECK_EQ(group_resident_cap(b, 0), (int64_t)3);
+    CHECK_EQ(group_resident_cap(b, 1), (int64_t)0);
+    /* An empty grant is a cap of zero, not "no limit". */
+    CHECK_EQ(group_resident_cap(RankBudget{}, 0), (int64_t)0);
+
+    /* The classes a plan's experts live in; preplaced and non-expert units do not count. */
+    Plan p;
+    for (int i = 0; i < 6; ++i) {
+        MoveUnit mu;
+        mu.expert = i < 5 ? i : -1;
+        mu.slab_class = i % 2 ? 2 : 0;
+        mu.slot_bytes = mu.bytes = MiB;
+        mu.access = RAD_ACCESS_CONDITIONAL;
+        mu.tier = i == 2 ? Tier::Mapped : Tier::VRAM;
+        p.units.push_back(mu);
+    }
+    const std::vector<int32_t> classes = group_classes(p);
+    CHECK_EQ(classes.size(), (size_t)2);
+    CHECK(classes == (std::vector<int32_t>{ 0, 2 }));
 }
 
 RAD_TEST_MAIN()

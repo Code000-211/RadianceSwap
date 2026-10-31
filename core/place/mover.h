@@ -106,6 +106,14 @@ public:
     int64_t capacity() const { return n_; }
     int64_t stride() const { return stride_; }
     int64_t n_free() const { return n_usable_; }
+    /* n_free() restricted to slots below `hi`: the budgeted range of a slab whose free list also
+     * holds lent slots. */
+    int64_t n_free_below(int64_t hi) const {
+        int64_t k = 0;
+        for (int64_t s : free_)
+            if (s < hi && covered(s) && !held_[(size_t)s]) ++k;
+        return k;
+    }
     /* Slots in use: a resident unit, a staged one, or a copy in flight. Fill and drain decide
      * against this, because the working slots must stay free whatever the target is. */
     int64_t held() const { return n_held_; }
@@ -313,6 +321,13 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+
+    /* A group planner may shrink this mover's resident set at a step boundary and regrow it
+     * (Mover::set_resident_cap). A shrunk resident goes to the pinned host pool, which holds only
+     * the units that were not resident, so init reserves spare pool slots beyond them: as many as
+     * there are movable residents and --host-pool-mib has room for after every pooled unit and the
+     * file tier's reserves. Off: no spare slots, and set_resident_cap changes nothing. */
+    bool shrinkable = false;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -607,13 +622,51 @@ public:
     /* Whether idle ticks keep the turnover slots filled; the engine holds them through a prompt
      * and the few steps after it (Engine::tiering_dispatch). */
     void hold_turnover(bool held) { hold_turnover_ = held; }
-    /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`. */
+    /* ---- the resident cap: giving slots back to a group of models ---------------------------
+     *
+     * The group planner (place/group_planner.h) tells each running engine how many expert units
+     * it may keep resident per slab class. set_resident_cap() states that cap; balance() (once a
+     * step, or idle_tick() for a parked rank) carries it out with the machinery above and no
+     * placement algorithm of its own:
+     *
+     *   - The slab's budgeted segment shrinks by the cap's difference (SlotPool::set_target):
+     *     its top slots, which hold no unit and keep the working reserve, stop being handed out.
+     *   - The pinned pool grows into its spare capacity by the same count (a shrunk resident
+     *     needs a host copy and the pool was sized to the non-residents).
+     *   - The coldest movable residents are demoted by the ordinary Demote move (D2H copy,
+     *     publish, quarantine) until the resident count is the cap; a unit stranded above the
+     *     shrunk segment moves down into a freed slot (Migrate). The mover publishes only at a
+     *     step boundary, so a running request keeps reading valid addresses; evicted experts
+     *     are then read from the host pool, as every other pooled expert is.
+     *   - A raised cap regrows the segment, and fill() promotes the hottest pooled units into
+     *     the slots that came back.
+     *
+     * The slots are released logically only: the slab is one reservation in the weights pool
+     * (a bump allocator over a plain device allocation, mem/pools.h), so no byte goes back to the
+     * card and another engine's pool cannot use it. A cap above what the plan placed regrows no
+     * further than the slots that exist. */
+    /* `units` < 0 lifts the cap. A class with no movable resident, or no spare pool slot, is kept
+     * at the size it can reach. Cheap: bookkeeping only, applied by the next balance(). */
+    int     set_resident_cap(size_t klass, int64_t units);
+    /* Slab slots of the class's budgeted segment currently given back. */
+    int64_t released_slots(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].n_fixed - pools_[klass].slab.target(0) : 0;
+    }
+    /* Whether a cap has moved the segment and not yet settled (balance() has work). */
+    bool    resizing() const {
+        for (const ClassPools& cp : pools_)
+            if (cp.resized) return true;
+        return false;
+    }
+
+    /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`.
+     * The range runs to the pool's spare capacity: a shrunk resident is read from there. */
     int pool_ranges(uint64_t* lo, uint64_t* hi, uint64_t* stride, int max) const {
         int n = 0;
         for (const ClassPools& cp : pools_)
             if (cp.pool_dev && cp.stride > 0 && n < max) {
                 lo[n] = (uint64_t)(uintptr_t)cp.pool_dev;
-                hi[n] = lo[n] + (uint64_t)cp.pool.size() * (uint64_t)cp.stride;
+                hi[n] = lo[n] + (uint64_t)cp.pool.capacity() * (uint64_t)cp.stride;
                 stride[n] = (uint64_t)cp.stride;
                 ++n;
             }
@@ -748,6 +801,12 @@ private:
                                         * (MoverConfig::turnover_slots) */
         int64_t  n_donated = 0;        /* units in lent slots that gave their host copy away
                                         * (Mover::donor_slot); at most n_turn of them */
+        /* Resident-cap bookkeeping (set_resident_cap). `n_pool0` is the pool's size at init, the
+         * slots past it are spare; `n_resident0` the units the plan placed in the budgeted range
+         * and `n_movable0` how many of them heat may demote. `resized` stays set from the first
+         * cap that moved the segment until the resident count is the cap again. */
+        int64_t  n_pool0 = 0, n_resident0 = 0, n_movable0 = 0;
+        bool     resized = false;
         std::vector<char*>   flex_ptr;
         /* One slab segment per lender that carved slots for this class. `need[i]` is the loan,
          * in the lender's measure, that covers the segment's i-th slot; ascending. */
@@ -872,8 +931,11 @@ private:
     bool migrate(int32_t unit, HeatEngine* heat);
     /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. */
     int  promote_to(int32_t unit, int64_t slot);
-    /* Promote the hottest pooled units of one class into up to `room` free slots. */
-    int  fill(size_t klass, int64_t room, HeatEngine* heat);
+    /* Promote the hottest pooled units of one class into up to `room` free slots at or above `lo`
+     * (the lent ones by default). */
+    int  fill(size_t klass, int64_t room, HeatEngine* heat, int64_t lo = -1);
+    /* Carries out the class's resident cap; true when it moved something. */
+    bool resize(size_t klass, HeatEngine* heat);
     void count_flex();
 };
 
