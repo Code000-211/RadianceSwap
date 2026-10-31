@@ -11,12 +11,17 @@
 #include "device/device.h"
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <thread>
 
-/* Manifest mode: every model is its own Engine (a model runtime), started one after the other on
- * the same GPU group, each with a fixed share of the free VRAM, then served behind one listener
- * that routes by the request's `model` (server/model_router.h). The registry and the router belong
- * to the process; the engines are stopped in the reverse order of their start. */
+/* Manifest mode: every model is its own Engine (a model runtime) on the same GPU group, each with a
+ * fixed share of the free VRAM, behind one listener that routes by the request's `model`
+ * (server/model_router.h). Only the default model is started here; the others are cold and the
+ * router starts them on their first request, each on its own activation thread. The registry and
+ * the router belong to the process; an Engine belongs to the thread that serves it and is destroyed
+ * when that thread returns. */
 static int serve_manifest(rad::ModelRegistry& registry) {
     const std::vector<rad::ModelRecord>& models = registry.models();
     const size_t n = models.size();
@@ -33,16 +38,18 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         return least;
     };
 
-    std::vector<std::unique_ptr<rad::Engine>> engines;
-    auto fail = [&](int code) {
-        while (!engines.empty()) engines.pop_back();
-        return code;
-    };
+    /* One model is built at a time: the budget resolver claims what the card has free, and a
+     * model's step staging comes out of the room it kept (start_execution), before the next
+     * model's budget reads the card. Models already serving are not held up by it. */
+    std::mutex build_m;
     int64_t share_mib = -1;
-    for (size_t i = 0; i < n; ++i) {
+    /* Starts the engine of model `i`: its VRAM share, start(), start_execution(). A negative status
+     * has been reported. 1 is --debug-graph, done with `*dump_rc`. */
+    auto build = [&](size_t i, bool at_startup, std::unique_ptr<rad::Engine>* out, int* dump_rc) {
+        std::lock_guard<std::mutex> lk(build_m);
         rad::Config cfg = models[i].config;
         /* An explicit --gpu-headroom-mib, on the command line or in the model's `engine`, wins. */
-        if (n > 1 && i + 1 < n && !cfg.given.count("--gpu-headroom-mib")) {
+        if (n > 1 && !cfg.given.count("--gpu-headroom-mib")) {
             const int64_t free = free_mib(cfg.tp);
             if (free > 0) {
                 if (share_mib < 0) share_mib = (free - cfg.gpu_headroom_mib) / (int64_t)n;
@@ -52,46 +59,73 @@ static int serve_manifest(rad::ModelRegistry& registry) {
                          (long long)cfg.gpu_headroom_mib);
             }
         }
-        if (!rad::resolve_hf_model(cfg)) return fail(1);
-        engines.push_back(std::make_unique<rad::Engine>(std::move(cfg)));
-        rad::Engine& e = *engines.back();
-        e.set_registry(&registry);
+        if (!rad::resolve_hf_model(cfg)) return (int)RAD_E_NOTFOUND;
+        auto engine = std::make_unique<rad::Engine>(std::move(cfg));
+        engine->set_registry(&registry);
 
         /* A startup that stops logging reports where it waits (util/stallwatch.h). */
         rad::StallWatch watch(("startup " + models[i].id).c_str(), 120000);
-        int s = e.start();
+        int s = engine->start();
         if (s < 0) {
-            e.print_startup_report(s);
-            return fail(1);
+            engine->print_startup_report(s);
+            return s;
         }
-        if (e.config().debug_graph) {
-            const int rc = e.dump();
-            return fail(rc);
+        if (at_startup && engine->config().debug_graph) {
+            *dump_rc = engine->dump();
+            return 1;
         }
-        /* Its step staging comes out of the room the budget kept, before the next model's budget
-         * reads the card. */
-        s = e.start_execution();
-        if (s < 0) return fail(1);
-        registry.set_state(models[i].id, rad::ModelState::Active);
+        s = engine->start_execution();
+        if (s < 0) return s;
+        *out = std::move(engine);
+        return 0;
+    };
+
+    std::atomic<bool> serve_failed{false};
+    rad::server::ModelRouter* router_ptr = nullptr;
+    /* Serves `e` until the router stops. A failure of the default model, or of a model that had
+     * attached (its step loop), stops the process; a cold model whose serve() fails before it
+     * attached is an activation failure, which the router reports to the requests waiting for it. */
+    auto serve_engine = [&](rad::Engine& e, const std::string& id) {
+        const int st = e.serve(nullptr, router_ptr);
+        if (st < 0) {
+            if (!e.startup_report_printed()) e.print_startup_report(st);
+            if (id == registry.default_model().id || registry.state_of(id) == rad::ModelState::Active) {
+                serve_failed = true;
+                router_ptr->stop();
+            }
+        }
+        return st;
+    };
+
+    const std::string default_id = registry.default_model().id;
+    rad::server::ActivationOptions act;
+    act.max_queued = registry.cache.max_queued_requests;
+    rad::server::ModelRouter router(default_id, 1, &registry, act);
+    router_ptr = &router;
+    size_t default_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (models[i].id == default_id) { default_idx = i; continue; }
+        router.add_cold(models[i].id, [&, i](const std::string& id) {
+            std::unique_ptr<rad::Engine> e;
+            int dump_rc = 0;
+            const int s = build(i, false, &e, &dump_rc);
+            return s < 0 ? s : serve_engine(*e, id);
+        });
     }
 
-    rad::server::ModelRouter router(registry.default_model().id, n);
-    std::vector<int> status(n, 0);
-    std::vector<std::thread> threads;
-    for (size_t i = 0; i < n; ++i)
-        threads.emplace_back([&, i] {
-            status[i] = engines[i]->serve(nullptr, &router);
-            if (status[i] < 0) {
-                if (!engines[i]->startup_report_printed()) engines[i]->print_startup_report(status[i]);
-                router.stop();
-            }
-        });
-    int s = router.run();
+    std::unique_ptr<rad::Engine> engine;
+    int dump_rc = 0;
+    registry.set_state(default_id, rad::ModelState::Activating);
+    const int bs = build(default_idx, true, &engine, &dump_rc);
+    if (bs < 0) return 1;
+    if (bs > 0) return dump_rc;
+
+    std::thread serving([&] { serve_engine(*engine, default_id); });
+    const int s = router.run();
     router.stop();
-    for (std::thread& t : threads) t.join();
-    int rc = s < 0 ? 1 : 0;
-    for (int st : status) if (st < 0) rc = 1;
-    return fail(rc);
+    serving.join();
+    router.join();
+    return s < 0 || serve_failed ? 1 : 0;
 }
 
 int main(int argc, char** argv) {

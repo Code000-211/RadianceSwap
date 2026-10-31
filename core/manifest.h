@@ -10,15 +10,17 @@
  *
  * JSON because nlohmann/json is already a dependency and the project parses no YAML. A model's
  * `engine` is an argv-style list handed to config_parse over the command line's own options, so
- * there is one option parser and one validation. Every model is started at once as its own Engine on
- * the same GPU group (main.cpp, server/model_router.h). The gpu_group and cache sections are only
- * parsed and checked here; nothing reads the cache values yet.
+ * there is one option parser and one validation. Every model is its own Engine on the same GPU
+ * group (main.cpp, server/model_router.h): the default model is started at once, the others on
+ * their first request. `cache.max_queued_requests` bounds the requests waiting for one cold model
+ * (0: 64). The gpu_group section and the other cache values are only parsed and checked here.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
 #pragma once
 
 #include "rad_core.h"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -57,11 +59,16 @@ public:
     const ModelRecord* find(const std::string& id) const;
     /* Valid only for a registry a manifest_* call filled. */
     const ModelRecord& default_model() const;
-    void set_state(const std::string& id, ModelState s);
+    /* The state is written by the activation threads (server/model_router.h) and read from any
+     * thread: go through these two, not through ModelRecord::state, once the router runs. */
+    void       set_state(const std::string& id, ModelState s);
+    ModelState state_of(const std::string& id) const;
+    void reset();
     void add(ModelRecord r) { models_.push_back(std::move(r)); }
 
 private:
     std::vector<ModelRecord> models_;
+    mutable std::mutex       state_m_;
 };
 
 /* The fixed VRAM share of a model started while its siblings are not (ticket #8). The budget
