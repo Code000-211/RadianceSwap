@@ -1897,9 +1897,11 @@ int Engine::plan() {
         weights_va_extra_.assign(facts.size(), 0);
         if (group_) {
             /* Several models share the group's expert pool: this one's slab sits on elastic pages
-             * (docs/swap/elastic-slab.md), with address space for the whole plane to grow into.
+             * (docs/swap/elastic-slab.md), with 8 TiB of fresh address space to map its pieces at.
              * A lone model keeps the plain allocation: nothing could use what it would give back. */
-            const bool shared = registry_ && registry_->models().size() > 1;
+            /* RADIANCE_ELASTIC_SLAB=off keeps the plain pool in a group (a control for measurements). */
+            const char* const el = getenv("RADIANCE_ELASTIC_SLAB");
+            const bool shared = registry_ && registry_->models().size() > 1 && !(el && !std::strcmp(el, "off"));
             if (shared && rad_dev_set(ranks_[0]->device) >= 0 && !VMem::supported())
                 RAD_INFO("group planner: this device layer has no virtual memory management, so "
                          "the expert slab is not elastic: '%s' keeps its share's bytes",
@@ -1912,7 +1914,7 @@ int Engine::plan() {
                 gf[i].floor = facts[i].expert_floor;
                 if (shared && n > 0 && VMem::supported()) {
                     gf[i].elastic = true;
-                    weights_va_extra_[i] = facts[i].experts + facts[i].experts / 4 + ((int64_t)64 << 20);
+                    weights_va_extra_[i] = (int64_t)8 << 40;   /* the arena: address space only (Pool::va_arena) */
                 }
                 /* No heat yet: one cold bin for the plane. */
                 if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
@@ -3066,7 +3068,7 @@ int Engine::load_weights() {
          * and the host spins in the runtime, like a hang. Checked for every copy before any
          * starts. */
         const uint8_t* wp_lo = (const uint8_t*)r->pools.weights().base();
-        /* An elastic pool's slab tails are address space inside its range (va_bytes). */
+        /* An elastic pool's arena is address space inside its range (va_bytes). */
         const uint8_t* wp_hi = wp_lo + r->pools.weights().va_bytes();
         auto dst_fits = [&](const void* p, int64_t len, const char* nm) {
             const uint8_t* q = (const uint8_t*)p;

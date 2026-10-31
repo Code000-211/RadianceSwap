@@ -64,7 +64,7 @@ void Pool::release() {
         alloc_->free(base_, kind_);
     }
     base_ = nullptr;
-    bytes_ = used_ = gap_ = va_extra_ = 0;
+    bytes_ = used_ = arena_cursor_ = arena_end_ = 0;
 }
 
 void Pool::reset(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
@@ -94,23 +94,24 @@ int Pool::init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a) {
 }
 
 void* Pool::reserve(std::string_view what, int64_t bytes, int64_t align, int64_t* off_out) {
-    return reserve_growing(what, bytes, 0, align, off_out);
-}
-
-void* Pool::reserve_growing(std::string_view what, int64_t bytes, int64_t va_tail, int64_t align,
-                            int64_t* off_out) {
-    if (bytes < 0 || va_tail < 0 || align <= 0 || (va_tail > va_spare() && va_tail > 0))
-        return nullptr;
+    if (bytes < 0 || align <= 0) return nullptr;
     int64_t off = align_up(used_, align);
-    if (off - gap_ + bytes > bytes_) {
-        shortfalls_.push_back({name_, std::string(what), bytes, bytes_ - (off - gap_)});
+    if (off + bytes > bytes_) {
+        shortfalls_.push_back({name_, std::string(what), bytes, bytes_ - off});
         return nullptr;
     }
-    used_ = off + bytes + va_tail;
-    gap_ += va_tail;
+    used_ = off + bytes;
     res_.push_back({std::string(what), off, bytes});
     if (off_out) *off_out = off;
     return (char*)base_ + off;
+}
+
+int64_t Pool::va_arena(int64_t bytes, int64_t align) {
+    if (!elastic_ || bytes <= 0 || align <= 0) return -1;
+    const int64_t off = align_up(arena_cursor_, align);
+    if (off + bytes > arena_end_) return -1;
+    arena_cursor_ = off + bytes;
+    return off;
 }
 
 /* ------------------------------------------------------------------ elastic */
@@ -125,18 +126,21 @@ int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocato
     reset(nm, bytes, kind, a);
     if (bytes_ <= 0) return RAD_OK;
 
-    va_extra_ = std::max<int64_t>(va_extra, 0);
-    const int rc = vm_.reserve(bytes_ + va_extra_, RAD_ALIGN_POOL);
+    const int64_t arena = std::max<int64_t>(va_extra, 0);
+    const int64_t arena_lo = align_up(bytes_, (int64_t)RAD_ALIGN_POOL);
+    const int rc = vm_.reserve(arena_lo + arena, RAD_ALIGN_POOL);
     if (rc < 0) {
         /* Refuse; never retry smaller. A failed address reservation on a 64-bit card is a bug,
          * not a budget limit. */
         const char* why = rad_dev_last_error();
-        shortfalls_.push_back({ name_, "address reservation", bytes_ + va_extra_, 0,
+        shortfalls_.push_back({ name_, "address reservation", arena_lo + arena, 0,
                                 *why ? why : "the device layer gave no reason" });
-        bytes_ = va_extra_ = 0;
+        bytes_ = 0;
         return rc;
     }
     base_ = vm_.base();
+    arena_cursor_ = arena_lo;
+    arena_end_ = arena_lo + arena;
     /* bytes_ stays the requested budget, not vm_.size() (rounded up to a granule): using the
      * rounded size would let reserve() grant more than the split allows. The rounded tail stays
      * reserved so the last reservation's commit can round outward into it. */

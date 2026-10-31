@@ -65,7 +65,7 @@ public:
 
     const char* name()  const { return name_.c_str(); }
     int64_t     bytes() const { return bytes_; }
-    int64_t     used()  const { return used_ - gap_; }
+    int64_t     used()  const { return used_; }
     int64_t     avail() const { return bytes_ - used(); }
     void*       base()  const { return base_; }
     int         kind()  const { return kind_; }
@@ -76,16 +76,19 @@ public:
      * may be a device pointer the host cannot dereference. */
     void* reserve(std::string_view what, int64_t bytes, int64_t align, int64_t* off_out = nullptr);
 
-    /* reserve() for a range that is to grow: `bytes` are charged to the budget and backed by the
-     * caller, and `va_tail` further bytes of address space follow them, uncharged and unbacked
-     * (an elastic pool made with address space beyond its budget, below). The caller commits the
-     * tail on demand, each time against the card's free memory instead of the budget. */
-    void* reserve_growing(std::string_view what, int64_t bytes, int64_t va_tail, int64_t align,
-                          int64_t* off_out = nullptr);
-    /* Address space still free for reserve_growing() tails. */
-    int64_t va_spare() const { return va_extra_ - gap_; }
-    /* Whole range of an elastic pool, tails included; equals bytes() otherwise. */
-    int64_t va_bytes() const { return bytes_ + va_extra_; }
+    /* Fresh address space of an elastic pool, for ranges the caller backs and gives back (the expert
+     * slab, Mover). Returns the offset from base() of `bytes` that no earlier call returned and
+     * nothing has been mapped at since the pool was made, or -1 when the arena is used up.
+     *
+     * An address is never handed out twice, because the device layer cannot map it twice: after an
+     * unmap, a map at the same address leaves the old translation in place on this ROCr/kernel
+     * (hsa_amd_vmem_map; docs/swap/elastic-slab.md, tests/device_test.cpp
+     * vmem_stress_*), so the new page is never reached and the old one, given to another range
+     * since, is read and written instead. The arena is virtual only. */
+    int64_t va_arena(int64_t bytes, int64_t align = RAD_ALIGN_POOL);
+    int64_t va_arena_left() const { return arena_end_ - arena_cursor_; }
+    /* Whole range of an elastic pool, arena included; equals bytes() otherwise. */
+    int64_t va_bytes() const { return arena_end_ > 0 ? arena_end_ : bytes_; }
 
     /* True when nothing was refused. Checked once at the end of startup so the report names every
      * failure, not only the first (spec §3.1). */
@@ -122,8 +125,8 @@ public:
 private:
     /* Reserve the address range and back nothing. `bytes` is the maximum the pool may ever hold
      * and what reserve() carves against; committed() is what it costs the card. `va_extra` is
-     * address space past the budget for reserve_growing() tails (the expert slab of a model that
-     * may take bytes another gives up). Falls back to a whole allocation without virtual memory
+     * address space past the budget for va_arena() (the expert slab of a model that may take bytes
+     * another gives up). Falls back to a whole allocation without virtual memory
      * management, with no tails: elastic() is then false and callers must not grow. */
     int init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocator* a,
                      int64_t va_extra = 0);
@@ -136,9 +139,8 @@ private:
 
     std::string   name_;
     int64_t       bytes_ = 0;
-    int64_t       used_  = 0;       /* the cursor: address space handed out, tails included */
-    int64_t       gap_   = 0;       /* of it, the tails: not charged to the budget */
-    int64_t       va_extra_ = 0;    /* address space past `bytes_` that tails may take */
+    int64_t       used_  = 0;
+    int64_t       arena_cursor_ = 0, arena_end_ = 0;   /* the fresh address space past `bytes_` (va_arena) */
     void*         base_  = nullptr;
     int           kind_  = RAD_MEM_DEVICE;
     bool          elastic_ = false;

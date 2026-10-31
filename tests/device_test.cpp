@@ -1576,3 +1576,162 @@ TEST(a_damaged_code_object_is_refused_not_misread) {
 }
 
 RAD_TEST_MAIN_HOST_KARGS()
+
+/* ------------------------------------------------------------------ elastic memory under a foreign DRM client */
+
+/* The expert slab of ticket #35 gives granules back and takes others while the process runs. A second
+ * process that opens a render node makes the kernel allocate VRAM (its page tables) on a card that is
+ * full, which can evict this process's buffers. This case churns granules (unmap one, map another,
+ * write a pattern through the copy path, read it back) beside a granule range nobody touches, with a
+ * child opening and closing the render nodes, and counts every granule that reads back wrong.
+ * RAD_VMEM_STRESS=<seconds> turns it on; RAD_VMEM_STRESS_DRM=0 leaves the foreign client out;
+ * RAD_VMEM_STRESS_LIST=1 writes with the DMA copy list instead of copy kernels;
+ * RAD_VMEM_STRESS_FRESH=1 never maps an address twice (what Pool::va_arena does) and must read back
+ * clean; without it addresses are reused after an unmap, which reproduces the corruption;
+ * RAD_VMEM_STRESS_TRACE=1 sweeps all granules after every step and names the first wrong ones;
+ * RAD_VMEM_STRESS_CYCLE=1 gives each granule its own reservation, freed with it (still reuses the
+ * address); RAD_VMEM_STRESS_PEEK=1 reads an address after its unmap; RAD_VMEM_STRESS_DELAY_MS=n
+ * waits between unmap and map. */
+TEST(vmem_stress_a_foreign_drm_client_beside_a_churning_elastic_range) {
+    const char* e = std::getenv("RAD_VMEM_STRESS");
+    if (!e) { radtest::skip("RAD_VMEM_STRESS is not set"); return; }
+    if (!need_vmem()) return;
+    if (rad::device_is_host()) { radtest::skip("needs a card"); return; }
+    const double secs = std::atof(e);
+    const bool drm = !std::getenv("RAD_VMEM_STRESS_DRM") || std::atoi(std::getenv("RAD_VMEM_STRESS_DRM"));
+    const bool lists = std::getenv("RAD_VMEM_STRESS_LIST") && std::atoi(std::getenv("RAD_VMEM_STRESS_LIST"));
+    const int64_t g = rad::VMem::granularity();
+    constexpr int kStatic = 64, kPool = 4096, kLive = 96;
+    const bool cycle = std::getenv("RAD_VMEM_STRESS_CYCLE") != nullptr;     /* each granule is its own reservation, freed with it */
+    const bool fresh = std::getenv("RAD_VMEM_STRESS_FRESH") != nullptr;      /* never map a granule address twice */
+    const int delay_ms = std::getenv("RAD_VMEM_STRESS_DELAY_MS") ? std::atoi(std::getenv("RAD_VMEM_STRESS_DELAY_MS")) : 0;
+    int fresh_next = kLive;
+    rad::VMem fixed, churn;
+    CHECK_OK(fixed.reserve(kStatic * g));
+    CHECK_OK(churn.reserve(cycle ? g : kPool * g));
+    std::vector<rad::VMem> own((size_t)kPool);
+    auto addr = [&](int i) -> char* { return cycle ? (char*)own[(size_t)i].base() : (char*)churn.base() + (int64_t)i * g; };
+    auto map_in = [&](int i) { if (!cycle) return churn.commit((int64_t)i * g, g); int rc = own[(size_t)i].reserve(g); return rc < 0 ? rc : own[(size_t)i].commit(0, g); };
+    auto map_out = [&](int i) { if (!cycle) return churn.decommit((int64_t)i * g, g); own[(size_t)i].release(); return (int)RAD_OK; };
+    CHECK_OK(fixed.commit(0, kStatic * g));
+    Stream st;
+    DevBuf<uint8_t> host(g, RAD_MEM_HOST_PINNED), back(g, RAD_MEM_HOST_PINNED);
+    REQUIRE(host && back);
+    auto write = [&](void* dst, uint32_t seed) {
+        fill(host, g, seed);
+        int rc;
+        if (lists) { RadCopySeg sg{ dst, host.p, g }; rc = rad_memcpy_list_async(&sg, 1, 0, st.s); }
+        else       rc = rad_memcpy_async(dst, host.p, g, st.s);
+        return rc < 0 ? rc : rad_stream_sync(st.s);       /* `host` is reused by the next write */
+    };
+    auto bad = [&](const void* src, uint32_t seed) {
+        std::memset(back.p, 0, 64);
+        if (rad_memcpy_async(back.p, src, g, st.s) < 0 || rad_stream_sync(st.s) < 0) return true;
+        std::vector<uint8_t> want((size_t)g);
+        fill(want.data(), g, seed);
+        return std::memcmp(back.p, want.data(), (size_t)g) != 0;
+    };
+    for (int i = 0; i < kStatic; ++i) CHECK_OK(write((char*)fixed.base() + i * g, 1000u + (uint32_t)i));
+    CHECK_OK(rad_stream_sync(st.s));
+    std::vector<uint32_t> seed(kPool, 0);       /* 0: not committed */
+    uint32_t next = 5000;
+    std::vector<int> live;
+    for (int i = 0; i < kLive; ++i) {
+        CHECK_OK(map_in(i));
+        seed[(size_t)i] = ++next;
+        CHECK_OK(write(addr(i), seed[(size_t)i]));
+        live.push_back(i);
+    }
+    CHECK_OK(rad_stream_sync(st.s));
+    if (drm) (void)std::system("(while :; do python3 -c 'import os,time\nfd=[os.open(\"/dev/dri/renderD%d\" % n, os.O_RDWR) for n in (128, 129)]\ntime.sleep(0.15)\n[os.close(f) for f in fd]' ; sleep 0.3; done) >/dev/null 2>&1 & echo $! > /tmp/vmem_stress_child");
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t iters = 0, bad_static = 0, bad_churn = 0, bad_now = 0;
+    uint32_t rng = 12345;
+    auto rnd = [&](uint32_t n) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % n; };
+    const bool trace = std::getenv("RAD_VMEM_STRESS_TRACE") != nullptr;
+    int64_t events = 0;
+    std::vector<std::pair<int, std::string>> hist;      /* (granule, what) */
+    /* Which pattern does a bad granule hold? Every seed ever written, by its first 16 bytes. */
+    std::vector<uint32_t> ever;
+    auto who = [&](const uint8_t* b) -> long long {
+        uint8_t w[16];
+        for (uint32_t sd : ever) {
+            uint32_t x = sd | 1u;
+            for (int q = 0; q < 16; ++q) { x = x * 1664525u + 1013904223u; w[q] = (uint8_t)(x >> 24); }
+            if (!std::memcmp(w, b, 16)) return sd;
+        }
+        return -1;
+    };
+    for (int i = 0; i < kLive; ++i) ever.push_back(seed[(size_t)i]);
+    auto sweep = [&](const char* when, int out, int in) {
+        for (int i : live) {
+            if (seed[(size_t)i] == 0 || !bad(addr(i), seed[(size_t)i])) continue;
+            ++bad_churn;
+            if (++events <= 15) {
+                int64_t zero = 0;
+                for (int64_t b = 0; b < g; ++b) zero += back.p[b] == 0;
+                if (events <= 2) {
+                    const long long who_seed = who(back.p);
+                    for (const auto& h : hist) if (h.first == i) fprintf(stderr, "    history of granule %d: %s\n", i, h.second.c_str());
+                    for (uint32_t q = 0; q < kPool; ++q) if (who_seed > 0 && seed[q] == (uint32_t)who_seed) {
+                        fprintf(stderr, "    the pattern belongs to granule %u\n", q);
+                        for (const auto& h : hist) if (h.first == (int)q) fprintf(stderr, "    history of granule %u: %s\n", q, h.second.c_str());
+                    }
+                }
+                fprintf(stderr, "  iteration %lld, %s (out %d, in %d): granule %d (seed %u) reads wrong; holds the pattern of seed %lld; %lld zero bytes\n",
+                        (long long)iters, when, out, in, i, seed[(size_t)i], who(back.p), (long long)zero);
+            }
+        }
+    };
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < secs) {
+        const size_t k = rnd((uint32_t)live.size());
+        const int out = live[k];
+        CHECK_OK(map_out(out));
+        hist.push_back({ out, rad::fmt("it %lld unmap", (long long)iters) });
+        const uint32_t out_seed = seed[(size_t)out];
+        if (std::getenv("RAD_VMEM_STRESS_PEEK") && !cycle) {
+            const bool still = !bad(addr(out), out_seed);
+            fprintf(stderr, "  peek: granule %d after its unmap %s its old content\n", out, still ? "still holds" : "no longer holds");
+        }
+        seed[(size_t)out] = 0;
+        if (trace) sweep("after the unmap", out, -1);
+        int in;
+        if (fresh) in = fresh_next++ % kPool;
+        else do { in = (int)rnd(kPool / 16); } while (seed[(size_t)in] != 0 || in == out);
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        CHECK_OK(map_in(in));
+        hist.push_back({ in, rad::fmt("it %lld map", (long long)iters) });
+        if (trace) sweep("after the map", out, in);
+        seed[(size_t)in] = ++next;
+        ever.push_back(next);
+        CHECK_OK(write(addr(in), seed[(size_t)in]));
+        live[k] = in;
+        if (bad(addr(in), seed[(size_t)in])) ++bad_now;
+        if (trace) sweep("after the write", out, in);
+        else if (iters % 8 == 0) sweep("periodic", out, in);
+        (void)out_seed;
+        ++iters;
+    }
+    if (drm) (void)std::system("kill $(cat /tmp/vmem_stress_child) 2>/dev/null; pkill -f 'renderD%d' 2>/dev/null; true");
+    fprintf(stderr, "vmem stress: %lld churn iterations in %.0f s (%s, %s): %lld wrong granules in the churned range (%lld right after their write), %lld in the untouched one\n",
+            (long long)iters, secs, drm ? "foreign DRM client" : "no foreign client", lists ? "copy list" : "copy kernels",
+            (long long)bad_churn, (long long)bad_now, (long long)bad_static);
+    /* Mapping an address again after an unmap reads back wrong on this ROCr/kernel (the reason for
+     * Pool::va_arena), so only the run that never maps an address twice is held to zero. */
+    CHECK_EQ(bad_static, 0);
+    if (fresh) CHECK_EQ(bad_churn, 0);
+}
+
+TEST(vmem_stress_reserve_sizes) {
+    if (!std::getenv("RAD_VMEM_STRESS")) { radtest::skip("RAD_VMEM_STRESS is not set"); return; }
+    if (!need_vmem()) return;
+    if (rad::device_is_host()) { radtest::skip("needs a card"); return; }
+    for (int64_t gib : { 64, 1024, 4096, 16384, 65536 }) {
+        rad::VMem v;
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = v.reserve(gib << 30);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "reserve %lld GiB: rc %d in %.1f ms; commit of the first granule: %d\n", (long long)gib, rc, ms,
+                rc == 0 ? v.commit(0, 1) : -1);
+    }
+}

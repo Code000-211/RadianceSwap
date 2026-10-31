@@ -1598,6 +1598,8 @@ struct LoanRig {
         MoverConfig mc;
         mc.turnover_slots = turnover;
         mc.shrinkable = shrinkable;
+        mc.slab_chunk_bytes = (int64_t)4 << 20;       /* pieces of a few slots, so a small slab has several */
+        mc.slab_chunk_bytes = (int64_t)4 << 20;       /* pieces of a few slots, so a small slab has several */
         if (va_extra > 0 || use_pools) {
             Config c = hf.cfg;
             c.vram_kv_mib = 16;
@@ -2351,9 +2353,11 @@ TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow
     LoanRig r(64, 40);
     r.shrinkable = true;
     r.lend = false;
-    r.va_extra = 128 * MiB;
+    r.va_extra = 1024 * MiB;
     CHECK_OK(r.build());
     CHECK(r.m.slab_elastic());
+    const int64_t K = r.m.chunk_slots(expert_class(r));
+    REQUIRE(K >= 2);
     const size_t cls = expert_class(r);
     const std::vector<int32_t> res = resident_units(r);
     const int64_t before = (int64_t)res.size();
@@ -2367,12 +2371,14 @@ TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow
     CHECK_EQ(r.m.slab_held_bytes(cls), r.m.slab_offer_bytes(cls));      /* as placed: held = offered */
     CHECK_EQ(r.m.slab_offer_bytes(cls), before * stride);
 
-    /* Shrink by 12 slots (12 MiB): at least 8 MiB of whole granules go back, the slab's high end. */
+    /* Shrink by 12 slots: the pieces above the highest slot still needed (K slots, K MiB, each) go
+     * back to the card, the slab's high end; the rest of the slots' pages stay. */
     CHECK_OK(r.m.set_resident_cap(cls, before - 12));
     CHECK_OK(settle(r, 8));
     CHECK_EQ((int64_t)resident_units(r).size(), before - 12);
-    CHECK(backed_bytes(r) <= plan_backed - 8 * MiB);
-    CHECK(r.m.backed_slots(cls) <= plan_slots - 12);
+    CHECK(backed_bytes(r) <= plan_backed - K * MiB);
+    CHECK(r.m.backed_slots(cls) < plan_slots);
+    CHECK(r.m.backed_slots(cls) >= before - 12);
     int bad = 0;
     CHECK_OK(stamp_units(r, true, &bad));
     CHECK_EQ(bad, 0);
@@ -2388,7 +2394,7 @@ TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow
     CHECK_OK(r.m.set_resident_cap(cls, before + 10));
     CHECK_OK(settle(r, 16));
     CHECK_EQ((int64_t)resident_units(r).size(), before + 10);
-    CHECK(backed_bytes(r) >= plan_backed + 8 * MiB);
+    CHECK(backed_bytes(r) >= plan_backed + 8 * MiB - K * MiB);
     CHECK_EQ(r.m.released_slots(cls), (int64_t)0);
     CHECK(r.m.backed_slots(cls) >= plan_slots + 10);
     CHECK_OK(stamp_units(r, true, &bad));
@@ -2407,27 +2413,27 @@ TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow
     CHECK_OK(r.m.set_resident_cap(cls, -1));
     CHECK_OK(settle(r, 16));
     CHECK_EQ((int64_t)resident_units(r).size(), before);
-    CHECK_EQ(r.m.backed_slots(cls), plan_slots);
+    CHECK(r.m.backed_slots(cls) >= plan_slots - K && r.m.backed_slots(cls) <= plan_slots + K);
     CHECK(!r.m.resizing());
     CHECK_OK(stamp_units(r, true, &bad));
     CHECK_EQ(bad, 0);
 }
 
 /* The slab grows only into the address space the pool reserved: a cap past that clamps. */
-TEST(an_elastic_slab_grows_no_further_than_the_address_space_it_was_given) {
+TEST(an_elastic_slab_grows_no_further_than_the_fresh_address_space_it_was_given) {
     if (!VMem::supported()) return;
     LoanRig r(64, 40);
     r.shrinkable = true;
     r.lend = false;
-    r.va_extra = 6 * MiB;
+    r.va_extra = 64 * MiB;          /* the plan's pieces take most of it; two more fit */
     CHECK_OK(r.build());
     const size_t cls = expert_class(r);
-    const int64_t before = (int64_t)resident_units(r).size();
-    CHECK_OK(r.m.set_resident_cap(cls, before + 100));
-    CHECK_OK(settle(r, 16));
-    const int64_t now = (int64_t)resident_units(r).size();
-    CHECK(now > before);
-    CHECK(now <= before + 6);
+    const int64_t K = r.m.chunk_slots(cls);
+    const int64_t plan_slots = r.m.backed_slots(cls);
+    CHECK_OK(r.m.set_resident_cap(cls, plan_slots + 1000));
+    for (int k = 0; k < 300; ++k) CHECK_OK(r.dispatch());
+    CHECK(r.m.backed_slots(cls) > plan_slots);                    /* it did grow ... */
+    CHECK(r.m.backed_slots(cls) <= plan_slots + 3 * K);           /* ... into the pieces that were left */
 }
 
 /* Without a group (a plain weights pool) the cap stays bookkeeping: nothing is backed or given

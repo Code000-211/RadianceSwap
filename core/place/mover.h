@@ -334,6 +334,10 @@ struct MoverConfig {
      * and a card taken to the last byte corrupts the kernel that needed them. */
     int     device = 0;
     int64_t grow_floor = 0;
+    /* Size of the pieces an elastic slab is mapped and unmapped in (ClassPools::chunk_slots), about
+     * this many bytes each. A piece gets address space no mapping has used before, and a piece
+     * given back is never mapped again. */
+    int64_t slab_chunk_bytes = (int64_t)128 << 20;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -674,12 +678,17 @@ public:
     /* Whether the slab sits on elastic pages (the weights pool was made with address space to
      * grow into). Without, backed_slots() is the plan's size for good. */
     bool    slab_elastic() const {
-        for (const ClassPools& cp : pools_) if (cp.slab_off >= 0) return true;
+        for (const ClassPools& cp : pools_) if (cp.chunk_slots > 0) return true;
         return false;
     }
     /* Slots of the class's budgeted range with pages behind them, working slots included. */
     int64_t backed_slots(size_t klass) const {
         return klass < pools_.size() ? pools_[klass].backed : 0;
+    }
+    /* Slots in one mapped piece of the class's elastic slab (0: the slab is not elastic). Pages go
+     * back to the card a piece at a time. */
+    int64_t chunk_slots(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].chunk_slots : 0;
     }
     /* The class's movable expert capacity, in bytes: what the group planner counts (units heat may
      * move), without the working slots and the residents that cannot move. `slab_offer_bytes` is
@@ -841,9 +850,19 @@ private:
         int64_t  n_fixed = 0;          /* slots in the budgeted range, growth slots included; the flex ones start here */
         /* The plan's slots (resident, shadow, staging): backed at init. The `n_fixed - n_base` after
          * them exist as address space only and are backed when a cap grows the segment into them
-         * (elastic weights pool, `slab_off` >= 0). */
+         * (elastic weights pool, `chunk_slots` > 0). */
         int64_t  n_base = 0;
-        int64_t  slab_off = -1;        /* the slab's offset in the weights pool; -1: not elastic */
+        /* Elastic slab: the slots are cut into pieces of `chunk_slots`, each mapped at address space of
+         * its own taken from the weights pool's arena (Pool::va_arena) and unmapped as a whole. A
+         * piece's address is never mapped twice (the device layer cannot do that; see Pool::va_arena),
+         * so a slot's address changes when its piece comes back, and slot_ptr() resolves it. `mapped`
+         * is how many of the piece's leading slots have pages behind them. 0: one contiguous
+         * reservation. */
+        int64_t  chunk_slots = 0;
+        int64_t  chunk_span = 0;       /* address space of a piece, in bytes */
+        struct Chunk { int64_t off = -1; int64_t mapped = 0; };   /* off: from the pool's base */
+        std::vector<Chunk> chunks;
+        char*    arena = nullptr;      /* the weights pool's base */
         int64_t  backed = 0;           /* slots [0, backed) have pages behind them (elastic only) */
         int64_t  want_target = 0;      /* the segment size the cap asks for; slab.target(0) follows it */
         uint64_t grow_after_ns = 0;    /* a refused commit backs growth off until then */
@@ -869,6 +888,8 @@ private:
         bool     strand_check = true;
 
         char* slot_ptr(int64_t slot) const {
+            if (chunk_slots > 0 && slot < n_fixed)
+                return arena + chunks[(size_t)(slot / chunk_slots)].off + (slot % chunk_slots) * stride;
             return slot < n_fixed ? (char*)slab_base + slot * stride
                                   : flex_ptr[(size_t)(slot - n_fixed)];
         }
@@ -963,8 +984,8 @@ private:
     int  retire(HeatEngine* heat);
     int  record_gate();
     void republish(int32_t unit);
-    void* reserve(const char* what, int64_t bytes, int kind, int64_t va_tail = 0,
-                  int64_t* off_out = nullptr);
+    void* reserve(const char* what, int64_t bytes, int kind, bool back = true);
+    static void pick_chunk(int64_t want_bytes, int64_t stride, int64_t* slots, int64_t* span);
     int  free_move_record() const;
     int  start_stage(int32_t unit, int64_t slab_slot);
     void release_slot(int32_t unit);
@@ -992,12 +1013,11 @@ private:
     /* The pages behind the elastic slab, a burst a call (resize()). */
     bool grow_backing(ClassPools& cp);
     bool shrink_backing(ClassPools& cp);
-    /* The pool offset where slot `s`'s pages begin, and the end of the backing for `slots` slots: the
-     * tail pad is kept so a wide read at the last slot's end stays on backed pages. */
-    int64_t slot_off(const ClassPools& cp, int64_t s) const { return cp.slab_off + s * cp.stride; }
-    int64_t backing_end(const ClassPools& cp, int64_t slots) const {
-        return slot_off(cp, slots) + (int64_t)RAD_ALIGN_UNIT;
-    }
+    /* Maps slots [backed, upto) of an elastic class, piece by piece; the status of the first piece
+     * that would not map (backed stops there). */
+    int  map_slots(ClassPools& cp, int64_t upto);
+    /* The topmost piece with pages that no slot needed (below the target or held) lives in, or -1. */
+    int64_t releasable_chunk(const ClassPools& cp) const;
     void count_flex();
 };
 
