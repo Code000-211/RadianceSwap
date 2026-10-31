@@ -23,6 +23,14 @@ int64_t to_mib_up(int64_t bytes) { return bytes > 0 ? (bytes + kMiB - 1) / kMiB 
  * has come in 4 MiB below what the driver later held, leaving the first kernel launches short of
  * headroom. Four times that, charged before anything is split. */
 constexpr int64_t kDriverDrift = 16 * kMiB;
+
+/* The cache a model keeps when its static weights are streamed (RAM-Streaming, ticket #18): one
+ * full-length sequence, but at most this. A GiB holds a few thousand to some tens of thousands of
+ * tokens, enough to answer; the whole of a long --max-model-len is a provisioning choice that a
+ * smaller context lowers, and must not cost decode speed by streaming statics for it.
+ * shortcut: a fixed GiB, not a per-token figure; upgrade when a model's KV bytes a token make a
+ * GiB too little to answer a request. */
+constexpr int64_t kStreamCacheMax = 1024 * kMiB;
 }  /* namespace */
 
 /* The fraction of the paged (context) part of the ceiling the cache backs. The ceiling also
@@ -133,19 +141,22 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* ---- the static weights come off the top, as a floor ------------------------------------
      *
-     * Unless they do not fit beside one full-length sequence of cache: before this, such a model
-     * was refused for want of cache. Under a placement that can stream, the card then holds the
-     * statics that fit once the cache's one sequence and the prefill staging ring are paid, and
-     * the planner reads the rest from the pinned host pool (docs/swap/static-streaming.md). */
+     * Unless they do not fit beside a workable cache (one full-length sequence, at most a GiB):
+     * before this, such a model got a cache of what was left, none at all once the statics filled
+     * the card. Under a placement that can stream, the card then holds the statics that fit once
+     * that cache and the prefill staging ring are paid, and the planner reads the rest from the
+     * pinned host pool (docs/swap/static-streaming.md). Statics that fit beside it are untouched. */
     b.statics_total = b.statics;
+    /* A streamed KV plan needs its whole conversation (kv_one is a requirement there). */
+    const int64_t kv_keep = cfg.kv_streams ? kv_one : std::min(kv_one, kStreamCacheMax);
     const bool streaming = (cfg.placement == "auto" || cfg.placement == "expert_tiered") &&
-                           b.statics > 0 && b.statics + kv_one > b.claimable;
+                           b.statics > 0 && b.statics + kv_keep > b.claimable;
     int64_t stream_stage = 0;
     if (streaming) {
         /* What the statics and the ring share: all but the cache's one sequence. The ring is two
          * layers' share of the statics left off the card, and the more it takes the more is left
          * off, so it is settled in a few steps (it only grows; the last one is paid in full). */
-        const int64_t room = std::max<int64_t>(b.claimable - kv_one, 0);
+        const int64_t room = std::max<int64_t>(b.claimable - kv_keep, 0);
         auto card_of = [&](int64_t stage) {
             return std::min(b.statics_total, std::max<int64_t>(room - stage, 0) / kMiB * kMiB);
         };
@@ -162,12 +173,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.statics = card_of(stream_stage);
         b.statics_streamed = b.statics_total - b.statics;
         if (log)
-            RAD_WARN("the static (non-expert) weights (%s) and one --max-model-len sequence's cache "
-                     "(%s) do not fit the %s this card can give: %s of the static weights (%.0f%%) "
+            RAD_WARN("the static (non-expert) weights (%s) and a workable cache (%s) do not fit the %s "
+                     "this card can give: %s of the static weights (%.0f%%) "
                      "are read from the pinned host pool, over a link 20-60x slower than VRAM. "
                      "Decode slows by about that share; use more cards, a smaller "
                      "--max-num-batched-tokens, or deactivate another model",
-                     humanb(b.statics_total).c_str(), humanb(kv_one).c_str(),
+                     humanb(b.statics_total).c_str(), humanb(kv_keep).c_str(),
                      humanb(b.claimable).c_str(), humanb(b.statics_streamed).c_str(),
                      100.0 * (double)b.statics_streamed / (double)b.statics_total);
     } else {
@@ -191,7 +202,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         const int64_t kv_cap = b.kv_ceiling > 0 ? b.kv_ceiling : b.elastic;
         int64_t kv = 0, exp = 0;
         if (streaming) {
-            /* Nothing is left for experts: the cache holds its one sequence (more only once the
+            /* Nothing is left for experts: the cache holds what it keeps (more only once the
              * statics are all on the card, which the trigger excludes), the ring is paid, and
              * every expert is read from the host pool. */
             kv = std::min(kv_cap, std::max<int64_t>(b.elastic - stream_stage, 0));
