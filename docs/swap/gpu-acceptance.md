@@ -302,7 +302,7 @@ und `/radiance/models` je Phase, Greedy-Tokens beider Models danach). Das Angebo
 | Ende `m2:60` (nur m2 unter Last) | 0 | 7 220 / 5 168 / 10 314 | 13 460 / 13 460 / 10 366 | 20 680 ≤ 20 680 |
 | | 1 | 6 445 / 5 192 / 10 361 | 14 319 / 14 328 / 10 412 | 20 764 ≤ 20 773 |
 
-- Unter m1-Last gibt m2 rund 3 GiB je Rank physisch zurück (committed 10 366 → 7 231 auf Rank 0), und m1
+- Unter m1-Last hält m2 rund 3 GiB je Rank weniger als sein Angebot (committed 7 231 gegen 10 366 auf Rank 0), und m1
   committet sie (13 448 gegen sein Angebot von 10 314); unter m2-Last kehrt es sich um (m2 13 460, m1 7 220).
   Die Summe der Commits übersteigt den Pool nie (die Planer-Gate vergibt Wachstum erst nach der Meldung
   des Gebers). Das Target des Gebers fällt sofort (5 168), das des Nehmenden folgt der Freigabe
@@ -341,4 +341,4 @@ eine `rad_dev_alloc`; der Mover reserviert wie zuvor.
 
 C1 und C8 liegen im dichten Fall innerhalb 1 %. Prefill streut bei beiden Builds von Lauf zu Lauf um
 ±5 % (Basis allein 57 257–65 110); ein systematischer Unterschied ist nicht messbar. Die MoE-Läufe
-streuen durch die Heat (dynamisch) und die Kartenlage stärker als 2 %; ihre Mediane liegen gleich.
+streuen durch die Heat (dynamisch) und die Kartenlage stärker als 2 %; ein Unterschied zwischen den Builds ist darin nicht zu erkennen (nicht statistisch geprüft).
