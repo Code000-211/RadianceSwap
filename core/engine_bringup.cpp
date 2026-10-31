@@ -1973,6 +1973,7 @@ int Engine::plan() {
          * pool shrinks (the cache and the staging region keep their share), and by whole MiB
          * rounded down, so the pool never falls under what was granted. */
         weights_va_extra_.assign(facts.size(), 0);
+        kv_va_extra_.assign(facts.size(), 0);
         if (group_) {
             /* Several models share the group's expert pool: this one's slab sits on elastic pages
              * (docs/swap/elastic-slab.md), with 8 TiB of fresh address space to map its pieces at.
@@ -1986,6 +1987,9 @@ int Engine::plan() {
                          cfg_.served_model_name.c_str());
             GroupFacts gf(facts.size());
             for (size_t i = 0; i < facts.size(); ++i) {
+                /* The cache may take on bytes the experts of any model give up, so its pool gets an
+                 * arena too, whether or not this model has experts (docs/swap/kv-lend.md). */
+                if (shared && VMem::supported()) kv_va_extra_[i] = (int64_t)4 << 40;
                 const int64_t unit = wfs[i].expert_unit_max;
                 const int64_t n = unit > 0 ? facts[i].experts / unit : 0;
                 gf[i].offer = vb.experts;
@@ -2134,7 +2138,8 @@ int Engine::plan() {
         /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
          * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
         int s = r->pools.configure(rc, props.vram_bytes, nullptr, nullptr,
-                                   ri < weights_va_extra_.size() ? weights_va_extra_[ri] : 0);
+                                   ri < weights_va_extra_.size() ? weights_va_extra_[ri] : 0,
+                                   ri < kv_va_extra_.size() ? kv_va_extra_[ri] : 0);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
             report_pool_refusal(r->index, r->device, r->pools, rc);
@@ -4246,8 +4251,10 @@ int Engine::start() {
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
-                st.top = (char*)p.base + L * stripe + p.pool_blocks() * lbpb;
-                st.bytes = p.pool_blocks() * lbpb;
+                /* The carve's top, not the stripe's: a growing group's stripe runs on past it into
+                 * address space that is not backed (KVManager, growth). */
+                st.top = (char*)p.base + L * stripe + p.carve_blocks * lbpb;
+                st.bytes = p.carve_blocks * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
                 strips.push_back(st);

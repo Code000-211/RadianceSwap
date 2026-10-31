@@ -643,9 +643,22 @@ private:
     /* Per rank, address space past the weights pool's budget for the elastic expert slab; 0: a plain
      * pool (plan(), Pools::configure). */
     std::vector<int64_t> weights_va_extra_;
+    /* The same for the KV pool: address space for the chunks its partition grows by. */
+    std::vector<int64_t> kv_va_extra_;
     /* group_tick: the last step an engine ran (idle heat cools from it), what each rank last
      * reported as held, and the cap last applied to each slab class (ranks x class). */
     uint64_t group_busy_ns_ = 0;
+    /* The cache's growth (group_tick, KVManager "growth"): report the partition to the group planner
+     * and back or return chunks to match its grant. `state` is 0 until the first tick has checked
+     * that every rank can grow the same way, then 1 (growing) or -1 (fixed). `key` is the last
+     * report, in chunks, so a partition is reported when it moves by one. */
+    void kv_growth_tick(const std::vector<int64_t>& kv_grant, uint64_t now_ns);
+    struct KvGrowth {
+        int state = 0;
+        std::vector<int64_t> key;
+        uint64_t retry_ns = 0;
+        uint64_t shrink_since_ns = 0;
+    } kvg_;
     std::vector<int64_t> group_held_;
     std::map<std::pair<size_t, int32_t>, int64_t> group_cap_;
     bool     lending_ = false;

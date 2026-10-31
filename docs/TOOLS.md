@@ -963,6 +963,7 @@ measured on (`/root/models/...`, `/home/orca/models/...`); edit them before use.
 | `feat.py PORT MODEL OUT` | seeded sampling, streaming, a long prompt and a client that drops mid-stream |
 | `bench.py PORT MODEL[,MODEL2] [PREFILL_TOKENS]` | one sequence, eight sequences (aggregate) and a prefill; with two models the same loads run on both at once |
 | `cycles.py N PID [MODE]` | N activate/deactivate cycles; `MODE` is a string of model ids, one letter each, taken in turn (default `ab`); after each, waits until all are deactivated and samples VRAM (`rocm-smi`), host RSS, threads, file descriptors and the activation time. A leak shows as a series that rises |
+| `m_kv.json`, `kvgrow.py LOG SEQS PROMPT_TOKENS GEN_TOKENS [IDLE_S]` | the cross-model KV partition ([swap/kv-lend.md](swap/kv-lend.md)): two MoE models; `m2` has a cache ceiling above its carve (a small `--host-pool-mib` keeps the carve small). Loads `m2` with many long sequences while `m1`'s slab is full, samples both slabs, `m2`'s grown KV bytes and the VRAM, and prints PASS/FAIL for: `m2` got KV, `m1`'s slab sank, nothing planned twice, no errors or non-finite logits, running sequences undisturbed, bytes returned |
 | `grp.py MODEL SECONDS` | eight clients on one model for SECONDS, then the expert counters from `/stats` (does the other model's mover move?) |
 | `heat.py PHASE` | the topic workload on model `moe`, then `early_hit` from `/stats` |
 

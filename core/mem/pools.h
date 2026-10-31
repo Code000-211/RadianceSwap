@@ -165,10 +165,13 @@ public:
      * `weights_va_extra` > 0 makes the weights pool elastic with that much address space past its
      * budget: the expert slab can then give pages back to the card and take others (a model in a
      * group, docs/swap/elastic-slab.md). 0 is the plain allocation every other engine gets.
+     *
+     * `kv_va_extra` > 0 gives the KV pool the same kind of arena (Pool::va_arena) past its budget,
+     * for the stripes of a group whose cache can grow (KVManager::carve, docs/swap/kv-lend.md).
      */
     int configure(const Config& cfg, int64_t vram_capacity,
                   MemAllocator* device = nullptr, MemAllocator* host = nullptr,
-                  int64_t weights_va_extra = 0);
+                  int64_t weights_va_extra = 0, int64_t kv_va_extra = 0);
 
     Pool& weights()     { return weights_; }
     Pool& kv()          { return kv_; }

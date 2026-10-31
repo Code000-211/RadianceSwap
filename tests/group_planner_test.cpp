@@ -659,6 +659,137 @@ TEST(an_elastic_models_classes_move_together_whatever_their_heat) {
     CHECK_EQ(got[0][0].bytes, a * 2 * MiB + b * MiB);
 }
 
+/* ---- the cache grows for real (ticket #17, part 2): a claim is granted as bytes are physically free. */
+
+namespace {
+/* A's elastic slab (30 MiB offer, cold) and B, a dense model with 10 MiB offer and a KV carve of 8 MiB that
+ * is full: it wants 14, so it claims 6. */
+void fill_kv_group(GroupPlanner& g) {
+    (void)g.join("a", elastic_rank(30, { bin(15, 2, 0.1f) }));
+    (void)g.join("b", elastic_rank(10, { bin(5, 2, 5.0f) }));
+    g.update_held("a", 0, 30 * MiB);     /* A's slab is full: it holds its whole offer */
+    g.update_held("b", 0, 10 * MiB);
+}
+KvPartition kv_of(int64_t carve, int64_t held, int64_t want, int64_t grown, int64_t growable = 32) {
+    KvPartition k{ carve * MiB, held * MiB, want * MiB, 64 * MiB, growable * MiB };
+    k.grown = grown * MiB;
+    return k;
+}
+}  /* namespace */
+
+TEST(a_kv_claim_is_granted_only_after_the_experts_gave_the_bytes_back) {
+    GroupPlanner g(0);
+    fill_kv_group(g);
+    g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    CHECK_EQ(mib(g.target("a")), 24);              /* A is told to shrink at once ... */
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)0);   /* ... B waits: A still holds the pages */
+    g.update_held("a", 0, 27 * MiB);               /* 3 MiB went back to the card */
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)3 * MiB);
+    g.update_held("a", 0, 24 * MiB);
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(mib(g.target("a")), 24);
+}
+
+TEST(backed_kv_bytes_are_not_free_for_the_experts_and_a_returned_chunk_is) {
+    GroupPlanner g(0);
+    fill_kv_group(g);
+    g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    g.update_held("a", 0, 24 * MiB);
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    /* B backs the 6 MiB; the need ends. A's target is 30 again, but the 6 MiB are B's pages until B
+     * reports them returned: A is not granted them. */
+    g.update_kv("b", 0, kv_of(8, 8, 8, 6));
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)0);   /* the cue to give chunks back */
+    CHECK_EQ(mib(g.target("a")), 24);
+    g.update_kv("b", 0, kv_of(8, 8, 8, 0));
+    CHECK_EQ(mib(g.target("a")), 30);
+    /* B's need returns while it holds the chunks: nothing is asked of A again. */
+    g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    CHECK_EQ(mib(g.target("a")), 24);
+}
+
+TEST(a_kv_grant_not_yet_backed_stays_reserved_against_the_experts_growth) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(30, { bin(15, 2, 0.1f) }));
+    (void)g.join("b", elastic_rank(10, { bin(5, 2, 5.0f) }));
+    (void)g.join("c", elastic_rank(10, { bin(5, 2, 9.0f) }));
+    g.update_held("a", 0, 30 * MiB);
+    g.update_held("b", 0, 10 * MiB);
+    g.update_held("c", 0, 10 * MiB);
+    /* B claims 6 MiB of KV. A gives 6 back; the planner grants them to B ... */
+    g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    g.update_held("a", 0, 24 * MiB);
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    /* ... and a heat update must not hand them to the hot C before B has backed them. */
+    g.update("c", std::vector<std::vector<HeatBin>>{ { bin(5, 2, 9.5f) } });
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    CHECK(mib(g.target("c")) <= 10 + 0);
+    /* What is held or granted never passes the pool, whatever the order of the reports. */
+    int64_t sum = 24 + 10 + 10 + g.target("b")[0].kv_grow / MiB;
+    CHECK(sum <= 50);
+}
+
+TEST(free_bytes_go_to_statics_then_the_kv_claim_then_the_experts_and_never_twice) {
+    auto setup = [](GroupPlanner& g) {
+        (void)g.join("a", elastic_rank(30, { bin(15, 2, 0.1f) }));
+        (void)g.join("b", elastic_rank(10, { bin(5, 2, 5.0f) }));
+        (void)g.join("c", elastic_rank(10, { bin(5, 2, 9.0f) }));
+        g.update_held("a", 0, 30 * MiB);
+        g.update_held("b", 0, 10 * MiB);
+        g.update_held("c", 0, 10 * MiB);
+    };
+    StaticFacts s;
+    s.left = 4 * MiB; s.heat = 1.0f;
+    /* B claims 6 of KV, C streams 4 of statics and the card has 4 free; then A gives 6 MiB back. */
+    GroupPlanner g(0);
+    setup(g);
+    g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    g.update_statics("c", 0, s);
+    g.update_free(0, 4 * MiB);
+    g.update_held("a", 0, 24 * MiB);
+    CHECK_EQ(g.target("c")[0].statics_cap, (int64_t)4 * MiB);
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)2 * MiB);        /* statics first: 6 - 4 */
+    CHECK_EQ(mib(g.target("c")), 10);                            /* no expert growth on top */
+    /* The other way round: B's grant stands (not backed yet), the card's free bytes are then
+     * spoken for and the statics get nothing out of them. */
+    GroupPlanner h(0);
+    setup(h);
+    h.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    h.update_held("a", 0, 24 * MiB);
+    CHECK_EQ(h.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    h.update_statics("c", 0, s);
+    h.update_free(0, 6 * MiB);
+    CHECK_EQ(h.target("b")[0].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(h.target("c")[0].statics_cap, (int64_t)0);
+}
+
+TEST(a_kv_claim_in_a_group_is_decided_per_rank_at_world_size_2) {
+    GroupPlanner g(0);
+    GroupFacts fa(2), fb(2);
+    for (size_t r = 0; r < 2; ++r) {
+        fa[r] = elastic_rank(30, { bin(15, 2, 0.1f) })[0];
+        fb[r] = elastic_rank(10, { bin(5, 2, 5.0f) })[0];
+    }
+    (void)g.join("a", fa);
+    (void)g.join("b", fb);
+    for (size_t r = 0; r < 2; ++r) { g.update_held("a", r, 30 * MiB); g.update_held("b", r, 10 * MiB); }
+    g.update_kv("b", 1, kv_of(8, 8, 14, 0));      /* only rank 1 needs room */
+    g.update_held("a", 1, 24 * MiB);
+    CHECK_EQ(g.target("b")[0].kv_grow, (int64_t)0);
+    CHECK_EQ(g.target("b")[1].kv_grow, (int64_t)6 * MiB);
+    CHECK_EQ(g.target("a")[0].bytes, (int64_t)30 * MiB);
+}
+
+TEST(a_kv_claim_never_names_a_byte_of_a_partition_to_give_up) {
+    GroupPlanner g(0);
+    fill_kv_group(g);
+    /* B holds 12 of a 8 MiB carve + 6 grown: its want falls under what it holds, which is the floor. */
+    g.update_kv("b", 0, kv_of(8, 12, 2, 6));
+    CHECK(g.target("b")[0].kv_grow >= 0);
+    g.update_held("a", 0, 24 * MiB);
+    CHECK(g.target("b")[0].kv_grow >= 4 * MiB);
+}
+
 /* ================================================================== streamed statics (#19) */
 
 namespace {

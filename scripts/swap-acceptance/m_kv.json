@@ -1,0 +1,63 @@
+{
+ "gpu_group": {
+  "devices": [
+   0,
+   1
+  ],
+  "tp": 2
+ },
+ "cache": {
+  "idle_timeout_ms": 0
+ },
+ "models": [
+  {
+   "id": "m1",
+   "path": "/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad",
+   "default": true,
+   "engine": [
+    "--max-model-len",
+    "4096",
+    "--max-num-seqs",
+    "4",
+    "--placement",
+    "expert_tiered",
+    "--host-pool-mib",
+    "26000",
+    "--kv-cache-dtype",
+    "fp8",
+    "--tp-wire",
+    "wht6",
+    "--num-speculative-tokens",
+    "3",
+    "--max-num-batched-tokens",
+    "1024",
+    "--ngram-placement",
+    "disk"
+   ]
+  },
+  {
+   "id": "m2",
+   "path": "/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad",
+   "engine": [
+    "--max-model-len",
+    "16384",
+    "--max-num-seqs",
+    "16",
+    "--placement",
+    "expert_tiered",
+    "--host-pool-mib",
+    "20500",
+    "--kv-cache-dtype",
+    "fp8",
+    "--tp-wire",
+    "wht6",
+    "--num-speculative-tokens",
+    "3",
+    "--max-num-batched-tokens",
+    "1024",
+    "--ngram-placement",
+    "disk"
+   ]
+  }
+ ]
+}

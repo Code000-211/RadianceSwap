@@ -45,7 +45,7 @@ Der Anteil eines aktiven Models am gemeinsamen KV-Byte-Budget einer GPU-Gruppe, 
 _Avoid_: KV-Pool, geteilter Cache
 
 **KV-Leihe**:
-Idle KV-Blöcke, die dem Expert-Slab überlassen werden und bei Bedarf durch Verdrängen von Experts zurückkehren, auch über Model-Grenzen hinweg.
+Idle KV-Blöcke, die dem Expert-Slab überlassen werden und bei Bedarf durch Verdrängen von Experts zurückkehren, auch über Model-Grenzen hinweg. Über Model-Grenzen heißt: die KV-Partition eines Models wächst in Stücken (`KVManager`-Chunks) um Bytes, die der Expert-Slab eines beliebigen Models physisch zurückgegeben hat (`docs/swap/kv-lend.md`).
 _Avoid_: KV-Sharing, Loan-Pool
 
 **RAM-Streaming**:

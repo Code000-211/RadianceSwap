@@ -255,6 +255,15 @@ public:
     /* The waiting queue's request ids in service order, for the live view and for tests (a
      * preempted request re-enters at the front). Returns how many were written. */
     int      queue_snapshot(uint64_t* out, int max) const;
+    /* Tokens the in-flight requests, waiting or running, still have to place in the KV cache
+     * (sequence length less what is computed): the demand a KV partition cannot see in its held
+     * blocks, since a prompt takes its blocks a chunk at a time (Engine::kv_growth_tick). The caller
+     * holds hold(). */
+    int64_t  unplaced_tokens_locked() const;
+    /* Evicts up to `n` prefix-cache entries (IPrefixCache::evict); 0 without a cache. The caller
+     * holds hold(). A KV partition that gives a chunk back needs the blocks of idle conversations
+     * out of it first (Engine::kv_growth_tick). */
+    int64_t  evict_cache_locked(int64_t n);
 
     /* ---------------------------------------------------------- who is in flight
      *

@@ -1657,7 +1657,149 @@ void Engine::group_tick(bool idle) {
         if (st < 0) RAD_WARN("rank %d: resizing the expert slab while idle: %s", r.index,
                              rad_strerror(st));
     }
+    {
+        std::vector<int64_t> grant;
+        for (const RankBudget& b : want) grant.push_back(b.kv_grow);
+        kv_growth_tick(grant, now);
+    }
     (void)rad_dev_set(ranks_[0]->device);
+}
+
+/* ------------------------------------------------------------------ the cache's growth
+ *
+ * The KV partition claims bytes beyond its carve when its held blocks and buffer need them
+ * (KvPartition); the planner cuts the experts of the group by the claim and grants the bytes once
+ * the givers' pages are back on the card (group_gate). Here the engine reports the partition and
+ * backs one chunk per tick while the grant covers one more, on every rank before rank 0 offers its
+ * blocks. A grant that falls below the chunks held returns the topmost chunk, after five seconds
+ * and only when every block of it is free (KVManager::retire_chunk): a running sequence is never
+ * touched, and the pages go back to the card for the experts to take (the next report states them).
+ * Between steps and under the scheduler's lock, like the loan. */
+void Engine::kv_growth_tick(const std::vector<int64_t>& grant, uint64_t now) {
+    constexpr uint64_t kShrinkAfterNs = 5000000000ull;
+    if (kvg_.state == 0) {
+        const KVManager& k0 = ranks_[0]->kv;
+        bool same = k0.growth_enabled();
+        for (const auto& r : ranks_)
+            same = same && r->kv.growth_enabled() && r->kv.chunk_tokens() == k0.chunk_tokens() &&
+                   r->kv.chunk_bytes() == k0.chunk_bytes();
+        kvg_.state = same ? 1 : -1;
+        if (same)
+            RAD_INFO("kv: '%s' can grow by chunks of %s (%lld tokens), %d of address space",
+                     cfg_.served_model_name.c_str(), humanb(k0.chunk_bytes()).c_str(),
+                     (long long)k0.chunk_tokens(), k0.chunks_left());
+    }
+    if (kvg_.state < 0) return;
+    KVManager& lead = ranks_[0]->kv;
+    const int64_t cb = lead.chunk_bytes();
+
+    /* ---- report ---- */
+    KvPartition kp;
+    int chunks, left;
+    {
+        const auto lk = sched_.hold();
+        for (const KVGroupPlan& p : lead.plans()) {
+            kp.carve += lead.pool_bytes_carved(p.index);
+            kp.held += lead.pool_bytes_used(p.index);
+        }
+        /* What the cache needs beyond its carve, in chunks. Not `held + buffer` against the carve: the
+         * carve also holds the per-sequence states of every slot, which never grow, so it hides
+         * how full the paged blocks are. A prompt takes its blocks a chunk at a time and a waiting
+         * request holds none: neither `held` nor the shortfall peak shows the rest of the prompts in
+         * flight, so they count as demand. */
+        const int64_t over = lead.tokens_beyond_carve(sched_.unplaced_tokens_locked());
+        kp.want = std::max(kp.held, kp.carve + (over > 0 ? (over + lead.chunk_tokens() - 1) / lead.chunk_tokens() * cb : 0));
+        /* The shortfall peak decays once a tick, here when the loan does not do it. */
+        if (!lending_) (void)lead.spare_tokens();
+        chunks = lead.chunks();
+        left = lead.chunks_left();
+    }
+    kp.cap = lead.ceiling(cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
+    /* Chunks are what can be backed: what the cache wants beyond its carve, and the most it can
+     * use, are stated in whole chunks, so a claim of a few blocks is not rounded down to nothing. */
+    auto in_chunks = [&](int64_t bytes) {
+        return bytes > kp.carve ? kp.carve + (bytes - kp.carve + cb - 1) / cb * cb : bytes;
+    };
+    kp.want = in_chunks(kp.want);
+    kp.cap = in_chunks(kp.cap);
+    kp.grown = chunks * cb;
+    kp.growable = (int64_t)(chunks + left) * cb;
+    const std::vector<int64_t> key = { kp.carve, kp.grown, kp.growable, kp.cap, kp.held / cb,
+                                       kp.want / cb };
+    if (key != kvg_.key) {
+        kvg_.key = key;
+        for (size_t i = 0; i < ranks_.size(); ++i) group_->update_kv(cfg_.served_model_name, i, kp);
+    }
+
+    /* ---- apply: one chunk a tick, the least any rank is granted ---- */
+    int64_t target = INT64_MAX;
+    for (size_t i = 0; i < ranks_.size() && i < grant.size(); ++i)
+        target = std::min(target, grant[i] / cb);
+    if (target == INT64_MAX) return;
+
+    if (target > chunks) {
+        kvg_.shrink_since_ns = 0;
+        /* Nothing is lent while a chunk is backed (KVManager, growth): the loan drains first, which
+         * its tick does once the cache no longer has blocks to spare. */
+        if (now < kvg_.retry_ns || lead.loan_tokens() > 0) return;
+        /* The card keeps what the slab's growth keeps (MoverConfig::grow_floor). */
+        const int64_t floor = (int64_t)Config{}.gpu_headroom_mib << 20;
+        for (auto& r : ranks_) {
+            RadDeviceProps props{};
+            if (rad_dev_set(r->device) < 0 || rad_dev_props(r->device, &props) < 0) return;
+            if (props.vram_free - cb < floor) { kvg_.retry_ns = now + 250000000ull; return; }
+        }
+        /* Every rank backs the chunk (its ids are the same everywhere), rank 0 offers it last. */
+        std::vector<size_t> backed;
+        int rc = RAD_OK;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const int st = rad_dev_set(ranks_[i]->device) < 0 ? RAD_E_DEVICE : ranks_[i]->kv.back_chunk();
+            if (st < 0) rc = st; else backed.push_back(i);
+        }
+        if (rc < 0) {
+            for (size_t i : backed) {
+                (void)rad_dev_set(ranks_[i]->device);
+                ranks_[i]->kv.abandon_chunk();
+            }
+            kvg_.retry_ns = now + 1000000000ull;
+            RAD_WARN("kv: '%s' could not back a chunk of %s (%s); it stays at %d chunk(s) for a second",
+                     cfg_.served_model_name.c_str(), humanb(cb).c_str(), rad_strerror(rc), chunks);
+            return;
+        }
+        {
+            const auto lk = sched_.hold();
+            for (size_t i = ranks_.size(); i-- > 0;) ranks_[i]->kv.publish_chunk();
+        }
+        RAD_INFO("kv: '%s' backed chunk %d (+%s, %lld tokens): %s beyond its carve, granted %s",
+                 cfg_.served_model_name.c_str(), chunks + 1, humanb(cb).c_str(),
+                 (long long)lead.chunk_tokens(), humanb((int64_t)(chunks + 1) * cb).c_str(),
+                 humanb(grant[0]).c_str());
+    } else if (target < chunks) {
+        if (!kvg_.shrink_since_ns) kvg_.shrink_since_ns = now;
+        if (now - kvg_.shrink_since_ns < kShrinkAfterNs) return;
+        /* A chunk that still holds a block waits; the next tick looks again. */
+        kvg_.shrink_since_ns = now - kShrinkAfterNs + 1000000000ull;
+        for (auto& r : ranks_) {
+            if (rad_dev_set(r->device) < 0) return;
+            (void)rad_stream_sync(r->ctx.stream());
+        }
+        const auto lk = sched_.hold();
+        if (rad_dev_set(ranks_[0]->device) < 0) return;
+        /* A finished conversation the prefix cache keeps holds blocks of the chunk; the claim is over,
+         * so the cache gives them up (a block a sequence holds stays, and so does its chunk). */
+        if (lead.retire_chunk(true) < 0) { (void)sched_.evict_cache_locked(4096); return; }
+        for (size_t i = 1; i < ranks_.size(); ++i) {
+            if (rad_dev_set(ranks_[i]->device) < 0) continue;
+            (void)ranks_[i]->kv.retire_chunk(false);
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        kvg_.shrink_since_ns = now;
+        RAD_INFO("kv: '%s' gave a chunk back (%s): %s beyond its carve, granted %s",
+                 cfg_.served_model_name.c_str(), humanb(cb).c_str(),
+                 humanb((int64_t)(chunks - 1) * cb).c_str(), humanb(grant[0]).c_str());
+    } else {
+        kvg_.shrink_since_ns = 0;
+    }
 }
 
 /* ------------------------------------------------------------------ the arena's level */
@@ -2363,11 +2505,11 @@ std::string Engine::engine_info() const {
         k["name"]     = pl->name;
         k["kind"]     = bld_kv_kind_name(pl->kind);
         k["n_layers"] = pl->n_layers;
-        k["bytes"]    = pl->pool_bytes;
+        k["bytes"]    = pl->paged() ? kv.pool_bytes_carved(g) : pl->pool_bytes;
         if (pl->paged()) {
             k["block_size"] = pl->block_size;
-            k["blocks"]     = pl->n_blocks;
-            k["tokens"]     = pl->n_blocks * pl->block_size;
+            k["blocks"]     = kv.total_blocks(g);
+            k["tokens"]     = kv.total_blocks(g) * pl->block_size;
         } else {
             k["states"] = pl->n_seq_states();
         }

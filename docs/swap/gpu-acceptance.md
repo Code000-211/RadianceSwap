@@ -31,6 +31,7 @@ Freigabe-Zahlen unten.
 | – | #13 Host-Budget mit großem Model | bestanden nach Fix 3; Host-RAM ist dabei der Engpass (siehe unten) |
 | – | Issue-Kriterien Sampling, MTP, Streaming, Abbruch, lange Prompts | bestanden |
 | 11 | Gestreamte Statik zurück in den VRAM (#19) | bestanden, siehe §11 |
+| 12 | KV-Leihe zwischen Models, die KV-Partition wächst (#17) | bestanden, nach vier Fixes (siehe §12) |
 
 ## Gefundene Fehler und Fixes
 
@@ -462,3 +463,88 @@ Beobachtungen:
   zeigt den ersten `promoted static weights`-Schub vor der Deaktivierung von `a`.
 - Nicht gemessen: ein MoE (Host-RAM ~170 GiB; zwei MoE führen zum OOM-Kill, Issue #46) und der Fall „Expert-Slab
   gibt Seiten ab“ auf der Karte (Host-Test: `group_planner_test`, kein Doppelverplanen mit den Expert-Zusagen).
+
+## 12 Modellübergreifende KV-Leihe: die KV-Partition wächst (#17)
+
+`scripts/swap-acceptance/kvgrow.py LOG SEQS PROMPT_TOKENS GEN_TOKENS [IDLE_S]` mit `m_kv.json`, Server
+`start.sh LOG 1500 --manifest scripts/swap-acceptance/m_kv.json --tp 2` (Port 18080, GPUs exklusiv). Design:
+`kv-lend.md`. Beide Models sind dieselbe Flash-Next-MoE-Datei (zwei MoE, Host-RAM beachtet: `--host-pool-mib`
+26 000 und 20 500; kein OOM). **A** = `m1`, `--max-model-len 4096 --max-num-seqs 4`,
+`--host-pool-mib 26000`, hält nach 20 s Last den vollen Expert-Slab (S0: 10 051 / 10 100 MiB committed je Rang, sein
+Angebot sind 10 394 MiB). **B** = `m2`, `--max-model-len 16384 --max-num-seqs 16`, `--host-pool-mib 20500`: der kleine
+Host-Pool macht den Expert-Boden hoch (9,72 GiB = sein ganzes Angebot) und lässt dem Cache nur 1916 MiB Carve
+(21 112 Token + 1,7 GiB Zustände für 16 Sequenzen), seine Obergrenze ist 3788 MiB. Ein Stück = 234 MiB = 32 768
+Token. (Die ursprüngliche `m_kv.json` ließ B's Carve die ganze Obergrenze decken: 5,38 GiB, dann gab es nichts zu
+wachsen.)
+
+Ablauf: Referenz (jedes Prompt allein auf B, Greedy, `logprobs`), A 20 s warm, dann alle Prompts gleichzeitig auf B
+(`logprobs`, 96 Token), 30–45 s Leerlauf, je eine Probe an A und B. `rocm-smi --showmeminfo vram` und
+`/radiance/models` alle 2 s (der Beobachter, der das Aliasing in #35 auslöste).
+
+| Lauf | Last auf B | größtes Wachstum (je Rang) | Anfragen B / Fehler / nicht endlich | `never_twice` | Rückgabe |
+|---|---|---|---|---|---|
+| 1 | 12 × ~6000 Token | 468 MiB (2 Stücke) | 12+12+2 / 0 / 0 | ja | auf 0 nach ~13 s, A+B committed 20 011 / 20 094 gegen S0 20 071 / 20 119 MiB |
+| 2 | dito | 468 MiB | dito | ja | auf 0, 20 016 / 20 046 gegen 20 071 / 20 119 |
+| 3 | dito | 468 MiB | dito | ja | auf 0, 20 011 / 20 046 gegen 20 071 / 20 119 |
+| 4 | 16 × ~8000 Token, 64 Token | 702 MiB (3 Stücke) | 16+16+2 / 0 / 0 | ja | auf 0 nach ~20 s, 20 016 / 20 094 gegen 20 071 / 20 082 |
+
+Zeitlauf von Lauf 1 (Sample alle 2 s; A committed | B committed | B Wachstum gewährt/gebackt, Rang 0; MiB):
+
+| t | A | B | B's KV (gebackt / Ziel) | Beobachtung |
+|---|---|---|---|---|
+| 103 s (S0) | 10 051 | 10 019 | 0 / 0 | A warm, voller Slab |
+| 109,8 s | 10 019 | 10 019 | 0 / 151 | B's Anspruch, A's Slab schrumpft noch nicht |
+| 116,2 s | 9 348 | 10 276 | 234 / 468 | A gibt ab, das erste Stück gebackt |
+| 122,6 s | 7 813 | 11 657 | 468 / 468 | beide Stücke gebackt |
+| 129 s | 7 238 | 12 271 | 468 / 0 | Last zu Ende, der Anspruch endet |
+| 141,8 s | 7 238 | 12 726 | 0 / 0 | beide Stücke zurück, die 468 MiB bei B's Experts |
+| 154,5 s | 7 622 | 12 389 | 0 / 0 | Leerlauf, beide kalt |
+
+- **B bekommt KV, obwohl A den VRAM füllt**: ohne Wachstum kann B's Carve (21 112 Token) die Last nur nacheinander
+  bedienen (Kontrolle mit `RADIANCE_ELASTIC_SLAB=off`: kein Stück); mit Wachstum
+  wurde in jedem Lauf das erste Stück 6–7 s nach dem Anspruch gebackt, nachdem A's Slab die Bytes zurückgegeben hatte, das
+  zweite 6 s später.
+- **A's committed Slab sinkt**: 10 051 / 10 100 → 7 238 / 6 613 MiB (−2,8 / −3,5 GiB je Rang). Das ist nicht nur der
+  KV-Anspruch: B's Experts sind heiß und wachsen auch (10 019 → 12 271 / 12 989 MiB, #35). Der KV-Anteil sind die
+  468–702 MiB der Stücke; die Summe aus A's Slab, B's Slab und B's Stücken blieb in jedem Sample unter dem Pool
+  (`never_twice`; pro Rang, 20 267 MiB Angebote).
+- **Laufende Sequenzen ungestört**: alle 12 (16) Anfragen antworteten 200 mit endlichen Logprobs. Die Greedy-Tokens unter Last weichen nach
+  5–83 Token von der Einzel-Referenz ab (9–10 von 12 Prompts); **dasselbe zeigt die Kontrolle ohne Wachstum**
+  (`RADIANCE_ELASTIC_SLAB=off`: 9 von 12 nach 5–83 Token). Vor der ersten Abweichung ist die größte |Δ logprob| gegen die
+  Referenz 0,32 / 0,42 / 0,33 / 0,31 (Läufe 1–4) mit Wachstum und 0,33 ohne: Batchrauschen. Verschobene KV-Bytes
+  zeigten sich schon beim ersten Token; das erste Token stimmte immer.
+- **Keine nicht endlichen Logits** in vier Läufen mit `rocm-smi` alle 2 s als Beobachter (in jedem Lauf `logprobs` auf jeder Anfrage an B und A; Server-Log: „no finite logit“ 0, kein `E`/`W` zum KV). Die Stücke mappen nur frische
+  Adressen und geben nie eine zurück (`Pool::va_arena`), das Aliasing aus §9 kann nicht entstehen.
+- **Rückgabe nach Idle**: B's Wachstum fällt 5 s nach dem Ende des Anspruchs stückweise auf 0 (ein Stück alle 5 s: 2 Stücke
+  binnen ~13 s, 3 Stücke binnen ~20 s); die Bytes gehen an die Experts (A+B committed liegt am Ende wieder bei S0, ±100 MiB).
+  VRAM je Karte nach dem Server-Ende: 57 MiB (Basis).
+
+### Fehler und Fixes
+
+1. **Wartende Prompts waren kein Bedarf** (kein Wachstum: `held` blieb unter dem Carve). `want` war `held + Puffer`,
+   und ein Prompt nimmt seine Blöcke erst Chunk für Chunk, ein wartender Request hält keine; also sah weder `held` noch der Fehlbetrag-Spitzenwert den Bedarf. Fix: `Scheduler::unplaced_tokens_locked`
+   (Sequenzlänge minus berechnete Token aller laufenden und wartenden Requests) geht in den Anspruch ein.
+2. **Der Carve verbarg, wie voll die Blöcke waren.** `want` (in Bytes) wurde mit dem ganzen Carve verglichen, der 1,7
+   GiB Sequenzzustände enthält, die nie wachsen; `held + Puffer + wartend` blieb auch voll belegt unter dem Carve. Fix:
+   `KVManager::tokens_beyond_carve` rechnet je wachsender Gruppe in Blöcken gegen deren Carve-Blöcke, in ganzen
+   Stücken.
+3. **Der Prefix-Cache hielt das Stück und den Anspruch fest** (B's Wachstum blieb 45 s nach dem Ende bei 468 MiB). Blöcke
+   fertiger Gespräche zählen im `held`; sie sind Cache, keine Last. Fix: Blöcke nur des Prefix-Cache zählen nicht zum
+   Bedarf (`cache_only_blocks`), und die Rückgabe räumt bis zu 4096 Cache-Einträge pro Versuch
+   (`Scheduler::evict_cache_locked`), wenn nur sie das oberste Stück halten.
+4. **Zusammenführen mit #19 (Statik in den VRAM)**: beide nehmen die freien Bytes der Karte. `group_statics` rechnete
+   einen gewährten, noch nicht gebackten KV-Anspruch nicht als vergeben, die Statik hätte dieselben Bytes bekommen. Fix:
+   `kv_grow − grown` zählt wie der Grant eines elastischen Slabs; die Reihenfolge ist Statik, KV-Anspruch,
+   Expert-Wachstum (`kv-lend.md`).
+5. Skript: `kvgrow.py` schickte A (`--max-model-len 4096`) Prompts von B's Länge (HTTP 400); `returned` verlangte, dass A
+   allein auf S0 zurückkehrt (B's heiße Experts behalten den Teil, der KV-Anteil ist aber zurück), jetzt A+B gegen S0;
+   `running_undisturbed` verlangte Gleichheit der Tokens, die auch ohne Wachstum nicht gilt, jetzt Logprobs vor der
+   ersten Abweichung (siehe oben).
+
+### Grenzen
+
+- Die Kette Anspruch → A's Slab schrumpft → Stück gebackt dauert 6–7 s je Stück; solange bleibt B beim Carve.
+- B's Carve hängt von `--host-pool-mib` ab (Expert-Boden); das Manifest wurde darauf eingestellt, dass der Carve kleiner
+  ist als die Obergrenze. Eine Obergrenze, die der Carve ohnehin deckt (Standard `m_kv.json` zuvor), wächst nie.
+- Nicht gemessen: Idle KV von A an den Slab von B (`lend_from` über Engines, bleibt ungebaut), drei Models, dichte
+  Models mit großem Cache-Bedarf.

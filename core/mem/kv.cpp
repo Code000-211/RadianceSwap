@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <numeric>
 
 namespace rad {
 
@@ -411,6 +412,8 @@ void KVManager::forget() {
     plans_.clear(); free_blocks_.clear(); refcount_.clear(); free_states_.clear();
     live_.clear(); free_usable_.clear(); bucket_blocks_.clear(); held_hist_.clear();
     chunk_blocks_.clear(); short_peak_.clear();
+    chunks_.clear(); pend_ = {}; chunk_pending_ = false; dead_.clear();
+    chunk_tokens_ = chunk_bytes_ = 0;
     pool_ = nullptr;
     clears_.clear();
     seqs_.clear(); pending_.clear();
@@ -558,11 +561,16 @@ int KVManager::carve_into(Pool& kv_pool) {
         }
     }
 
+    for (auto& p : plans_) p.carve_blocks = p.paged() ? p.n_blocks : 0;
+    plan_growth(kv_pool);
+    const int64_t reserved_before = kv_pool.used();   /* the streaming maps, if any */
+
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
     for (auto& p : plans_) {
-        int64_t bytes = p.paged() ? kv_pool_bytes(p)
-                                  : p.n_states * p.bytes_per_state;
+        int64_t bytes = p.growable()  ? p.carve_blocks * p.bytes_per_block
+                      : p.paged()     ? kv_pool_bytes(p)
+                                      : p.n_states * p.bytes_per_state;
         if (p.zero) {
             p.base = nullptr;
             p.pool_offset = 0;
@@ -582,6 +590,20 @@ int KVManager::carve_into(Pool& kv_pool) {
         p.base = ptr;
         p.pool_offset = off;
         p.pool_bytes = bytes;
+        if (p.growable()) {
+            /* The budget above is only accounting: this group's stripes sit in the arena, past the
+             * budget, so they can be deeper than the carve (plan_growth). Nothing in the budget's
+             * range is backed for it. */
+            const int64_t va = kv_pool.va_arena(p.va_blocks * p.bytes_per_block,
+                                                std::max<int64_t>(RAD_ALIGN_POOL, VMem::granularity()));
+            if (va < 0) {
+                RAD_ERR("KV group '%s': the address space for its growth ran out", p.name.c_str());
+                return RAD_E_NOMEM;
+            }
+            p.base = (char*)kv_pool.base() + va;
+            p.pool_offset = va;
+            p.pool_bytes = p.va_blocks * p.bytes_per_block;
+        }
     }
     /* --checkpoint-slots does nothing on a model with no recurrent state; say so. */
     if (ckpts_ > 0 && checkpoint_bytes_ <= 0)
@@ -620,7 +642,20 @@ int KVManager::carve_into(Pool& kv_pool) {
      * conv slots) is sized per sequence and has no idle fraction to release. */
     if (pool_ && pool_->elastic()) {
         const int64_t used = pool_->used();
-        const int rc = pool_->commit(0, used);
+        int rc = RAD_OK;
+        if (chunk_bytes_ <= 0) {
+            rc = pool_->commit(0, used);
+        } else {
+            /* A growing group is backed where its stripes are, up to its carve; the budget range
+             * it was accounted in stays unbacked. The others keep their place in the budget. */
+            rc = pool_->commit(0, reserved_before);
+            for (const auto& p : plans_) {
+                if (rc < 0) break;
+                if (p.zero || p.pool_bytes <= 0) continue;
+                rc = p.growable() ? commit_ids(p, 0, p.carve_blocks)
+                                  : pool_->commit(p.pool_offset, p.pool_bytes);
+            }
+        }
         if (rc < 0) {
             RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back "
                     "it", humanb(used).c_str());
@@ -632,6 +667,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     bucket_blocks_.assign(plans_.size(), 1);
     chunk_blocks_.assign(plans_.size(), 0);
     short_peak_.assign(plans_.size(), 0);
+    dead_.assign(plans_.size(), 0);
     held_hist_.assign(plans_.size(), {});
     for (size_t i = 0; i < plans_.size(); ++i) {
         const auto& p = plans_[i];
@@ -677,12 +713,213 @@ int KVManager::carve_into(Pool& kv_pool) {
                        p.name.c_str(), (long long)p.runtime_tokens,
                        (long long)p.ring_blocks_max());
     }
+    if (chunk_bytes_ > 0)
+        report_ += fmt("    growth: chunks of %s (%lld tokens a group), %d of address space\n",
+                       humanb(chunk_bytes_).c_str(), (long long)chunk_tokens_, chunks_left());
     /* The pool's address range, so a GPU fault address can be placed in the carve. */
     report_ += fmt("    pool at %p, %s; groups at +%lld..+%lld\n",
                    pool_base_, humanb(pool_ ? pool_->bytes() : 0).c_str(),
                    (long long)(plans_.size() > 1 ? plans_[1].pool_offset : 0),
                    (long long)(plans_.empty() ? 0 : plans_.back().pool_offset +
                                                     plans_.back().pool_bytes));
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ growth */
+
+static int64_t align_up_to(int64_t v, int64_t a) { return a > 0 ? (v + a - 1) / a * a : v; }
+
+/* Decides whether the cache can grow and how, once n_blocks is known and before anything is
+ * carved. Growth is offered only where every paged group's capacity follows the FULL groups': a
+ * fixed window already at its pool cap does not scale with tokens, but a runtime window, a zero
+ * group or a streamed one does, and so does a group that has not reached its window cap. Any of
+ * those leaves the cache fixed, as does a pool without an arena. */
+void KVManager::plan_growth(Pool& pool) {
+    chunk_tokens_ = chunk_bytes_ = 0;
+    for (auto& p : plans_) { p.va_blocks = p.chunk_blocks = p.chunk_align = 0; }
+    if (!pool.elastic() || pool.va_arena_left() <= 0 || !VMem::supported()) return;
+    const int64_t gran = std::max<int64_t>(VMem::granularity(), 1);
+
+    std::vector<size_t> gs;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!p.paged()) continue;
+        if (p.zero || p.streamed() || stream_.windowed(p.index)) return;
+        if (p.kind == RAD_KV_FULL && lendable(p.index)) { gs.push_back(i); continue; }
+        if (p.kind == RAD_KV_WINDOW && !p.runtime_win && p.n_blocks >= window_pool_cap(p)) continue;
+        return;
+    }
+    if (gs.empty()) return;
+
+    /* A chunk adds the same tokens to every growing group, and starts and ends on a granule of
+     * each layer's stripe, or a given-back chunk would leave granules no later unmap can reach. */
+    int64_t tokens = 1;
+    for (size_t i : gs) {
+        const KVGroupPlan& p = plans_[i];
+        const int64_t lb = p.layer_bytes_per_block();
+        if (lb <= 0 || p.n_layers <= 0 || p.bytes_per_block != lb * p.n_layers) return;
+        tokens = std::lcm(tokens, gran / std::gcd(gran, lb) * p.block_size);
+        if (tokens > ((int64_t)1 << 24)) return;
+    }
+    int64_t bytes = 0;
+    for (size_t i : gs) bytes += tokens / plans_[i].block_size * plans_[i].bytes_per_block;
+    if (bytes > ((int64_t)1 << 30)) return;
+    /* About the slab's piece (MoverConfig::slab_chunk_bytes). */
+    const int64_t k = std::max<int64_t>(1, ceil_div((int64_t)128 << 20, bytes));
+    tokens *= k;
+    bytes *= k;
+
+    int64_t base_bytes = 0;
+    for (size_t i : gs) {
+        const KVGroupPlan& p = plans_[i];
+        base_bytes += align_up_to(p.n_blocks, gran / std::gcd(gran, p.layer_bytes_per_block())) *
+                      p.bytes_per_block;
+    }
+    const int64_t align = std::max<int64_t>(RAD_ALIGN_POOL, gran);
+    const int64_t left = pool.va_arena_left() - base_bytes - (int64_t)gs.size() * align;
+    if (left < bytes) return;
+    int64_t n = left / bytes;
+    /* A slot index is an int32 (RadKVGroupBatch::slot_mapping): ids times the block size must fit. */
+    for (size_t i : gs) {
+        const KVGroupPlan& p = plans_[i];
+        const int64_t e0 = align_up_to(p.n_blocks, gran / std::gcd(gran, p.layer_bytes_per_block()));
+        n = std::min(n, (INT32_MAX / p.block_size - e0) / std::max<int64_t>(tokens / p.block_size, 1));
+    }
+    if (n < 1) return;
+    for (size_t i : gs) {
+        KVGroupPlan& p = plans_[i];
+        p.chunk_align = gran / std::gcd(gran, p.layer_bytes_per_block());
+        p.chunk_blocks = tokens / p.block_size;
+        p.va_blocks = align_up_to(p.n_blocks, p.chunk_align) + n * p.chunk_blocks;
+    }
+    chunk_tokens_ = tokens;
+    chunk_bytes_ = bytes;
+}
+
+int KVManager::commit_ids(const KVGroupPlan& p, int64_t first, int64_t n) {
+    const int64_t lb = p.layer_bytes_per_block(), stripe = p.layer_stride();
+    for (int64_t l = 0; l < p.n_layers; ++l) {
+        const int rc = pool_->commit(p.pool_offset + l * stripe + first * lb, n * lb);
+        if (rc < 0) return rc;
+    }
+    return RAD_OK;
+}
+
+void KVManager::decommit_ids(const KVGroupPlan& p, int64_t first, int64_t n) {
+    const int64_t lb = p.layer_bytes_per_block(), stripe = p.layer_stride();
+    for (int64_t l = 0; l < p.n_layers; ++l)
+        (void)pool_->decommit(p.pool_offset + l * stripe + first * lb, n * lb);
+}
+
+void KVManager::extend_ids(size_t i, int64_t upto) {
+    KVGroupPlan& p = plans_[i];
+    if (upto <= p.n_blocks) return;
+    refcount_[i].resize((size_t)upto, -1);
+    cached_[i].resize((size_t)upto, 0);
+    dead_[i] += upto - p.n_blocks;
+    if (live_[i] == p.n_blocks) live_[i] = upto;     /* nothing is lent: the mark follows the top */
+    if (p.n_slots == p.n_blocks) p.n_slots = upto;   /* a group that does not stream keeps them equal */
+    p.n_blocks = upto;
+    held_hist_[i].resize((size_t)ceil_div(upto, bucket_blocks_[i]), 0);
+}
+
+int KVManager::chunks_left() const {
+    if (chunk_bytes_ <= 0) return 0;
+    int64_t n = INT32_MAX;
+    for (const auto& p : plans_) {
+        if (!p.growable()) continue;
+        n = std::min(n, (p.va_blocks - align_up_to(p.n_blocks, p.chunk_align)) / p.chunk_blocks);
+    }
+    return (int)std::max<int64_t>(n, 0);
+}
+
+int KVManager::back_chunk() {
+    if (!configured_ || chunk_bytes_ <= 0 || !pool_ || chunk_pending_ || loan_ > 0) return RAD_E_STATE;
+    Chunk c;
+    c.first.assign(plans_.size(), -1);
+    c.n.assign(plans_.size(), 0);
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!p.growable()) continue;
+        c.first[i] = align_up_to(p.n_blocks, p.chunk_align);
+        c.n[i] = p.chunk_blocks;
+        if (c.first[i] + c.n[i] > p.va_blocks) return RAD_E_NOMEM;   /* the ids are used up */
+    }
+    int rc = RAD_OK;
+    size_t reached = 0;
+    for (size_t i = 0; i < plans_.size() && rc >= 0; ++i) {
+        if (c.n[i] <= 0) continue;
+        reached = i + 1;
+        rc = commit_ids(plans_[i], c.first[i], c.n[i]);
+    }
+    if (rc < 0) {
+        for (size_t i = 0; i < reached; ++i)
+            if (c.n[i] > 0) decommit_ids(plans_[i], c.first[i], c.n[i]);
+    }
+    /* Backed or not, these addresses are spent: a failed commit may have mapped part of them, and
+     * a mapped address is never mapped again. */
+    for (size_t i = 0; i < plans_.size(); ++i)
+        if (c.n[i] > 0) extend_ids(i, c.first[i] + c.n[i]);
+    if (rc < 0) return rc;
+    pend_ = std::move(c);
+    chunk_pending_ = true;
+    return RAD_OK;
+}
+
+void KVManager::publish_chunk() {
+    if (!chunk_pending_) return;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (pend_.n[i] <= 0) continue;
+        auto& fl = free_blocks_[i];
+        for (int64_t b = pend_.first[i]; b < pend_.first[i] + pend_.n[i]; ++b) {
+            refcount_[i][(size_t)b] = 0;
+            fl.push_back((int32_t)b);
+            std::push_heap(fl.begin(), fl.end(), std::greater<int32_t>());
+        }
+        dead_[i] -= pend_.n[i];
+        free_usable_[i] += pend_.n[i];
+    }
+    chunks_.push_back(std::move(pend_));
+    pend_ = {};
+    chunk_pending_ = false;
+}
+
+void KVManager::abandon_chunk() {
+    if (!chunk_pending_) return;
+    for (size_t i = 0; i < plans_.size(); ++i)
+        if (pend_.n[i] > 0) decommit_ids(plans_[i], pend_.first[i], pend_.n[i]);
+    pend_ = {};
+    chunk_pending_ = false;
+}
+
+bool KVManager::top_chunk_free() const {
+    if (chunks_.empty() || chunk_pending_) return false;
+    const Chunk& c = chunks_.back();
+    for (size_t i = 0; i < plans_.size(); ++i)
+        for (int64_t b = c.first[i]; c.n[i] > 0 && b < c.first[i] + c.n[i]; ++b)
+            if (refcount_[i][(size_t)b] != 0) return false;
+    return true;
+}
+
+int KVManager::retire_chunk(bool check) {
+    if (chunks_.empty() || chunk_pending_) return RAD_E_STATE;
+    if (check && !top_chunk_free()) return RAD_E_STATE;
+    const Chunk c = chunks_.back();
+    chunks_.pop_back();
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (c.n[i] <= 0) continue;
+        const int64_t lo = c.first[i], hi = c.first[i] + c.n[i];
+        /* Every block of it is free and below the live mark, so it counts once in free_usable_ and
+         * sits in the heap (possibly more than once: reserve_specific_block leaves entries). */
+        auto& fl = free_blocks_[i];
+        fl.erase(std::remove_if(fl.begin(), fl.end(), [&](int32_t b) { return b >= lo && b < hi; }),
+                 fl.end());
+        std::make_heap(fl.begin(), fl.end(), std::greater<int32_t>());
+        for (int64_t b = lo; b < hi; ++b) refcount_[i][(size_t)b] = -1;
+        dead_[i] += c.n[i];
+        free_usable_[i] -= c.n[i];
+        decommit_ids(plans_[i], lo, c.n[i]);
+    }
     return RAD_OK;
 }
 
@@ -781,11 +1018,13 @@ int64_t KVManager::free_blocks(int32_t g) const {
 }
 int64_t KVManager::held_blocks(int32_t g) const {
     if (g < 0 || g >= (int32_t)live_.size()) return 0;
-    const int64_t held = live_[(size_t)g] - free_usable_[(size_t)g];
+    const int64_t held = usable((size_t)g, live_[(size_t)g]) - free_usable_[(size_t)g];
     return held > 0 ? held : 0;
 }
 int64_t KVManager::total_blocks(int32_t g) const {
-    const KVGroupPlan* p = plan(g); return p ? p->n_blocks : 0;
+    const KVGroupPlan* p = plan(g);
+    if (!p) return 0;
+    return p->n_blocks - ((size_t)g < dead_.size() ? dead_[(size_t)g] : 0);
 }
 int64_t KVManager::live_blocks(int32_t g) const {
     return (g >= 0 && g < (int32_t)live_.size()) ? live_[(size_t)g] : 0;
@@ -802,6 +1041,19 @@ int64_t KVManager::buf_blocks(size_t i) const {
     return peak > floor_b ? peak : floor_b;
 }
 
+int64_t KVManager::tokens_beyond_carve(int64_t unplaced_tokens) const {
+    int64_t over = 0;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!lendable(p.index)) continue;
+        /* Blocks only the prefix cache holds are not demand: an eviction frees them on the spot. */
+        const int64_t need = held_blocks(p.index) - cache_only_blocks(p.index) + buf_blocks(i) +
+                             blocks_for(p.index, unplaced_tokens);
+        over = std::max(over, (need - p.carve_blocks) * p.block_size);
+    }
+    return over;
+}
+
 int64_t KVManager::buffer_bytes() const {
     int64_t b = 0;
     for (size_t i = 0; i < plans_.size(); ++i)
@@ -815,7 +1067,7 @@ int64_t KVManager::buffer_bytes() const {
 int64_t KVManager::available_blocks(int32_t g) const {
     const KVGroupPlan* p = plan(g);
     if (!p || !p->paged()) return 0;
-    const int64_t lent = p->n_blocks - live_blocks(g);
+    const int64_t lent = loan_ > 0 ? p->carve_blocks - live_blocks(g) : 0;
     return free_blocks(g) + (lent > 0 ? lent : 0);
 }
 
@@ -831,7 +1083,18 @@ int64_t KVManager::lent_blocks(size_t i, int64_t tokens) const {
     const KVGroupPlan& p = plans_[i];
     if (!lendable(p.index) || tokens <= 0) return 0;
     const int64_t b = tokens / p.block_size;
-    return b < p.n_blocks ? b : p.n_blocks;
+    return b < p.carve_blocks ? b : p.carve_blocks;
+}
+
+int64_t KVManager::usable(size_t i, int64_t live) const {
+    return live >= plans_[i].n_blocks && i < dead_.size() ? live - dead_[i] : live;
+}
+
+/* The live mark a loan of `tokens` leaves: the carve less the lent blocks, or everything addressed
+ * when nothing is lent (growth adds ids above the carve; a loan and a chunk exclude each other). */
+int64_t KVManager::live_for(size_t i, int64_t tokens) const {
+    const int64_t lent = lent_blocks(i, tokens);
+    return lent > 0 ? plans_[i].carve_blocks - lent : plans_[i].n_blocks;
 }
 
 int64_t KVManager::held_top(size_t i) const {
@@ -855,12 +1118,12 @@ int KVManager::grow_for(int32_t g, int64_t blocks) {
     if ((size_t)g < short_peak_.size() && short_by > short_peak_[(size_t)g])
         short_peak_[(size_t)g] = short_by;
 
-    if (!lendable(g) || loan_ <= 0 || live_[(size_t)g] >= p.n_blocks) return RAD_E_FULL;
+    if (!lendable(g) || loan_ <= 0 || live_[(size_t)g] >= p.carve_blocks) return RAD_E_FULL;
     int64_t live = live_[(size_t)g] + short_by + buf_blocks((size_t)g);
-    if (live > p.n_blocks) live = p.n_blocks;
+    if (live > p.carve_blocks) live = p.carve_blocks;
     /* The loan, in tokens, that leaves this group `live` blocks. It only shrinks: a shortfall in
      * one group never lends more of another. */
-    int64_t keep = (p.n_blocks - live) * p.block_size;
+    int64_t keep = (p.carve_blocks - live) * p.block_size;
     if (keep > loan_) keep = loan_;
     if (reclaim_) {
         const int rc = reclaim_(keep);
@@ -884,8 +1147,9 @@ int64_t KVManager::spare_tokens() {
         if (!lendable(plans_[i].index)) continue;
         const KVGroupPlan& p = plans_[i];
         int64_t keep = held_top(i) + buf_blocks(i);
-        if (keep > p.n_blocks) keep = p.n_blocks;
-        const int64_t t = (p.n_blocks - keep) * p.block_size;
+        if (keep > p.carve_blocks) keep = p.carve_blocks;
+        /* A cache that grew holds more than its carve: nothing to lend until the chunks are back. */
+        const int64_t t = chunks_.empty() ? (p.carve_blocks - keep) * p.block_size : 0;
         if (spare < 0 || t < spare) spare = t;
     }
     return spare > 0 ? spare : 0;
@@ -893,10 +1157,15 @@ int64_t KVManager::spare_tokens() {
 
 int KVManager::set_loan(int64_t tokens) {
     if (tokens < 0) tokens = 0;
+    if (tokens > 0 && (!chunks_.empty() || chunk_pending_)) {
+        RAD_ERR("KV loan: asked to lend %lld tokens while the cache holds %d grown chunk(s)",
+                (long long)tokens, (int)chunks_.size());
+        return RAD_E_STATE;
+    }
     /* Check every group before moving any, so a refused loan changes nothing. */
     for (size_t i = 0; i < plans_.size(); ++i) {
         if (!lendable(plans_[i].index)) continue;
-        const int64_t live = plans_[i].n_blocks - lent_blocks(i, tokens);
+        const int64_t live = live_for(i, tokens);
         if (live < live_[i] && held_top(i) > live) {
             RAD_ERR("KV group '%s': asked to lend down to block %lld with a block held at or above "
                     "%lld", plans_[i].name.c_str(), (long long)live,
@@ -911,10 +1180,10 @@ int KVManager::set_loan(int64_t tokens) {
 void KVManager::apply_loan(int64_t tokens) {
     for (size_t i = 0; i < plans_.size(); ++i) {
         if (!lendable(plans_[i].index)) continue;
-        const int64_t live = plans_[i].n_blocks - lent_blocks(i, tokens);
-        /* The free count moves with the mark; the heap is unchanged. Every id between the old
+        const int64_t live = live_for(i, tokens);
+        /* The free count moves with the mark; the heap is unchanged. Every live id between the old
          * and new mark is free, so the count moves by exactly the distance. */
-        free_usable_[i] += live - live_[i];
+        free_usable_[i] += usable(i, live) - usable(i, live_[i]);
         live_[i] = live;
     }
     loan_ = tokens;
@@ -934,7 +1203,7 @@ int64_t KVManager::pool_bytes(int32_t g) const {
     const KVGroupPlan* p = plan(g);
     if (!p) return 0;
     /* Live blocks only: lent ones are reported by the slab (Mover::flex_used_bytes). */
-    if (p->paged())    return live_blocks(g) * p->bytes_per_block;
+    if (p->paged())    return usable((size_t)g, live_blocks(g)) * p->bytes_per_block;
     if (p->stateful()) return p->n_states * p->bytes_per_state;
     return 0;
 }
@@ -942,7 +1211,7 @@ int64_t KVManager::pool_bytes(int32_t g) const {
 int64_t KVManager::pool_bytes_carved(int32_t g) const {
     const KVGroupPlan* p = plan(g);
     if (!p) return 0;
-    if (p->paged())    return kv_pool_bytes(*p);
+    if (p->paged())    return p->va_blocks > 0 ? p->carve_blocks * p->bytes_per_block : kv_pool_bytes(*p);
     if (p->stateful()) return p->n_states * p->bytes_per_state;
     return 0;
 }
@@ -982,7 +1251,7 @@ bool KVManager::can_ever_fit(int64_t n_tokens) const {
     for (const auto& p : plans_) {
         /* Both kinds are tested explicitly: the null group at handle 0 is neither and holds no
          * states, so a bare `else` would refuse every sequence. */
-        if (p.paged())         { if (blocks_for(p.index, n_tokens) > p.n_blocks) return false; }
+        if (p.paged())         { if (blocks_for(p.index, n_tokens) > total_blocks(p.index)) return false; }
         else if (p.stateful()) { if (p.n_states < 1) return false; }
     }
     return true;
@@ -1152,7 +1421,7 @@ int KVManager::set_window(uint64_t id, int64_t visible_lo, int64_t window_tokens
         if (w.ring_blocks < 1) w.ring_blocks = 1;   /* the ring always has somewhere to write */
         /* What the sequence can hold: the reference's blocks, then the whole ring. */
         const int64_t need = w.ring_pos / p.block_size + w.ring_blocks;
-        if (p.n_blocks > 0 && need > p.n_blocks) return RAD_E_FULL;
+        if (p.n_blocks > 0 && need > total_blocks(p.index)) return RAD_E_FULL;
         s->win[g] = w;
         any = true;
     }

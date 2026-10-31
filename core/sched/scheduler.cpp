@@ -873,6 +873,20 @@ int Scheduler::queue_snapshot(uint64_t* out, int max) const {
     return n;
 }
 
+int64_t Scheduler::evict_cache_locked(int64_t n) {
+    return pc_ && cfg_.prefix_cache ? pc_->evict(n) : 0;
+}
+
+int64_t Scheduler::unplaced_tokens_locked() const {
+    int64_t n = 0;
+    for (const std::vector<int32_t>* q : { &waiting_, &running_ })
+        for (int32_t slot : *q) {
+            const SchedReq& s = *reqs_[(size_t)slot];
+            n += std::max<int64_t>(s.seq_len() - s.req->n_computed, 0);
+        }
+    return n;
+}
+
 /* Copied out under the step lock rather than handed out as pointers; see ReqStat. */
 int Scheduler::requests(ReqStat* out, int max) const {
     std::lock_guard<std::mutex> lk(mu_);
