@@ -11,6 +11,7 @@
 #include "engine.h"
 #include "tiny_model.h"
 #include "build/startup.h"
+#include "place/group_planner.h"
 
 #include <cstring>
 #include <filesystem>
@@ -837,6 +838,23 @@ TEST(a_frontend_lease_outlives_the_server_and_frees_the_frontend_when_dropped) {
     CHECK_EQ(lease->tok->decode({ 'o', 'k' }), std::string("ok"));
     lease.reset();
     CHECK_EQ(destroyed.load(), 1);
+}
+
+/* Manifest mode: an Engine leaves the group planner when it is destroyed, whatever way it ended
+ * (a cold model whose activation failed, or whose serve returned). */
+TEST(an_engine_leaves_the_group_planner_when_destroyed) {
+    rad::GroupPlanner group(0);
+    rad::GroupFacts facts(1);
+    facts[0].offer = 8 << 20;
+    group.join("leaver", facts);
+    CHECK_EQ(group.target("leaver").size(), (size_t)1);
+    {
+        rad::Config cfg;
+        cfg.served_model_name = "leaver";
+        rad::Engine engine(cfg);
+        engine.set_group_planner(&group);
+    }
+    CHECK(group.target("leaver").empty());
 }
 
 /* Engine execution lifecycle: start_execution() -> stop_execution() -> start_execution()

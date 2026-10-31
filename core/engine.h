@@ -47,6 +47,7 @@
 namespace rad {
 
 class Kld;
+class GroupPlanner;    /* place/group_planner.h */
 class ModelRegistry;   /* manifest.h */
 class StallWatch;
 namespace server { class Server; class ModelRouter; }
@@ -111,6 +112,11 @@ public:
     /* Manifest mode: the process's registry (manifest.h), whose other models /v1/models lists.
      * Each model is its own Engine; this one runs the model it was built from. */
     void set_registry(const ModelRegistry* r) { registry_ = r; }
+    /* Manifest mode: the group's expert planner (place/group_planner.h). plan() offers it the
+     * expert budget it resolved (inside the model's fixed VRAM share) and starts with what the group
+     * grants, never more. The destructor leaves the group. The planner outlives the Engine. Null:
+     * the resolved budget stands, as without a manifest. */
+    void set_group_planner(GroupPlanner* g) { group_ = g; }
 
     /* The startup report (core/diag/diag.h): every option with its value and source, the
      * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
@@ -166,6 +172,7 @@ private:
 
     Config cfg_;
     const ModelRegistry* registry_ = nullptr;
+    GroupPlanner* group_ = nullptr;
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in

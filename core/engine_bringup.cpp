@@ -22,6 +22,7 @@
 #include "format/table_share.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "place/group_planner.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1860,6 +1861,32 @@ int Engine::plan() {
                fmt("weights %s (experts %s of it), KV cache %s, a card", humanb(vb.weights).c_str(),
                    humanb(vb.experts).c_str(), humanb(vb.kv).c_str()),
                vb.report);
+        /* Manifest mode: the group planner divides the expert share between the models. The bytes
+         * it does not grant stay unclaimed, free for the next model's budget. Only the weights
+         * pool shrinks (the cache and the staging region keep their share), and by whole MiB
+         * rounded down, so the pool never falls under what was granted. */
+        if (group_) {
+            GroupFacts gf(facts.size());
+            for (size_t i = 0; i < facts.size(); ++i) {
+                const int64_t unit = wfs[i].expert_unit_max;
+                const int64_t n = unit > 0 ? facts[i].experts / unit : 0;
+                gf[i].offer = vb.experts;
+                gf[i].floor = facts[i].expert_floor;
+                /* No heat yet: one cold bin for the plane. */
+                if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
+            }
+            const GroupBudget gb = group_->join(cfg_.served_model_name, std::move(gf));
+            int64_t granted = vb.experts;
+            for (const RankBudget& rb : gb) granted = std::min(granted, rb.bytes);
+            const int64_t cut_mib = (vb.experts - granted) >> 20;
+            if (cut_mib > 0) {
+                cfg_.vram_weights_mib = std::max<int64_t>(cfg_.vram_weights_mib - cut_mib, 1);
+                RAD_INFO("group planner: '%s' keeps %s of the %s of experts it was offered; "
+                         "weights pool %lld MiB", cfg_.served_model_name.c_str(),
+                         humanb(granted).c_str(), humanb(vb.experts).c_str(),
+                         (long long)cfg_.vram_weights_mib);
+            }
+        }
         /* The staging region the budget took from the experts, placed above every planned buffer:
          * the arena top that smaller levels lend. */
         if (vb.stage > 0)
