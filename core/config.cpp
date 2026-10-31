@@ -46,9 +46,10 @@ static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
                                         "Hugging Face repo id (owner/name), fetched before startup" },
     { "--manifest",           "FILE",   "serve the models a JSON manifest lists (GPU group, cache, models with\n"
-                                        "their own engine options) instead of one --model; every model is\n"
-                                        "started at once, each with its own share of the VRAM (--gpu-headroom-mib\n"
-                                        "per model moves it), behind one listener that routes by the request's\n"
+                                        "their own engine options) instead of one --model; the default\n"
+                                        "model is started at once, the others on their first request, each with\n"
+                                        "its own share of the VRAM (--gpu-headroom-mib per model moves it),\n"
+                                        "behind one listener that routes by the request's\n"
                                         "`model`. Text only; excludes --model and LoRA" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },

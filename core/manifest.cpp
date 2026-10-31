@@ -37,7 +37,20 @@ const ModelRecord& ModelRegistry::default_model() const {
 }
 
 void ModelRegistry::set_state(const std::string& id, ModelState s) {
+    std::lock_guard<std::mutex> lk(state_m_);
     for (ModelRecord& r : models_) if (r.id == id) r.state = s;
+}
+
+void ModelRegistry::reset() {
+    group = ManifestGroup();
+    cache = ManifestCache();
+    models_.clear();
+}
+
+ModelState ModelRegistry::state_of(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(state_m_);
+    const ModelRecord* r = find(id);
+    return r ? r->state : ModelState::Cold;
 }
 
 namespace {
@@ -203,7 +216,7 @@ int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_
 }
 
 int manifest_parse(const std::string& text, const Config& base, ModelRegistry* out) {
-    *out = ModelRegistry();
+    out->reset();
     const json j = json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) {
         RAD_ERR("manifest: not a JSON object");
