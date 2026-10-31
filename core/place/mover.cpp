@@ -1539,7 +1539,9 @@ int Mover::set_resident_cap(size_t klass, int64_t units) {
      * address space init reserved (n_fixed - n_base slots, elastic weights pool). */
     const int64_t spare = cp.pool.capacity() - cp.n_pool0;
     const int64_t least = std::max(cp.n_work + cp.n_resident0 - cp.n_movable0, cp.n_base - spare);
-    const int64_t t = units < 0 ? cp.n_base : std::clamp(units + cp.n_work, least, cp.n_fixed);
+    /* `units` counts movable residents; the residents that cannot move are held beside them. */
+    const int64_t fixed = cp.n_resident0 - cp.n_movable0;
+    const int64_t t = units < 0 ? cp.n_base : std::clamp(units + fixed + cp.n_work, least, cp.n_fixed);
     if (t == cp.want_target) return RAD_OK;
     cp.want_target = t;
     cp.resized = true;
@@ -1562,11 +1564,18 @@ bool Mover::grow_backing(ClassPools& cp) {
                                 std::max(cp.backed, have) + std::max<int64_t>(kBurstBytes / cp.stride, 1));
     if (to > cp.backed) {
         Pool& wp = budget_->weights();
+        if (cfg_.grow_floor > 0) {
+            RadDeviceProps props{};
+            if (rad_dev_props(cfg_.device, &props) >= 0 && props.vram_free - (to - cp.backed) * cp.stride < cfg_.grow_floor) {
+                cp.grow_after_ns = rad_mono_ns() + 250000000ull;
+                return false;
+            }
+        }
         const int64_t from = backing_end(cp, cp.backed);
         const int rc = wp.commit(from, (to - cp.backed) * cp.stride);
         if (rc < 0) {
-            /* What mapped before the refusal is untracked by `backed`: give it back. */
-            (void)wp.decommit(from, (to - cp.backed) * cp.stride);
+            /* Granules that mapped before the refusal stay recorded in the pool (a partial grow
+             * is usable) and the next attempt commits only the rest; `backed` stays as it was. */
             cp.grow_after_ns = rad_mono_ns() + 1000000000ull;
             RAD_WARN("mover: the card would not back %lld more slab slots of %s; the cap stays at "
                      "%lld slots for a second (%s)", (long long)(to - cp.backed),

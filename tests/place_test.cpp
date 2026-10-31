@@ -2364,6 +2364,8 @@ TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow
     const int64_t stride = r.hf.plan.classes[cls].stride;
     CHECK_EQ(r.m.slab_held_bytes(cls), (plan_slots - r.hf.plan.classes[cls].n_shadow -
                                          r.hf.plan.classes[cls].n_stage) * stride);
+    CHECK_EQ(r.m.slab_held_bytes(cls), r.m.slab_offer_bytes(cls));      /* as placed: held = offered */
+    CHECK_EQ(r.m.slab_offer_bytes(cls), before * stride);
 
     /* Shrink by 12 slots (12 MiB): at least 8 MiB of whole granules go back, the slab's high end. */
     CHECK_OK(r.m.set_resident_cap(cls, before - 12));

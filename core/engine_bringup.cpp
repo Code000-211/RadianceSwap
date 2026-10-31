@@ -1918,6 +1918,10 @@ int Engine::plan() {
                 if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
             }
             const GroupBudget gb = group_->join(cfg_.served_model_name, std::move(gf));
+            for (size_t i = 0; i < gb.size(); ++i)
+                RAD_INFO("group planner: '%s' rank %zu joins offering %s of experts and starts with %s",
+                         cfg_.served_model_name.c_str(), i, humanb(vb.experts).c_str(),
+                         humanb(gb[i].bytes).c_str());
             int64_t granted = vb.experts;
             for (const RankBudget& rb : gb) granted = std::min(granted, rb.bytes);
             const int64_t cut_mib = (vb.experts - granted) >> 20;
@@ -3042,6 +3046,8 @@ int Engine::load_weights() {
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
         mc.shrinkable = group_ != nullptr;
+        mc.device = r->device;
+        mc.grow_floor = (int64_t)Config{}.gpu_headroom_mib << 20;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3060,7 +3066,8 @@ int Engine::load_weights() {
          * and the host spins in the runtime, like a hang. Checked for every copy before any
          * starts. */
         const uint8_t* wp_lo = (const uint8_t*)r->pools.weights().base();
-        const uint8_t* wp_hi = wp_lo + r->pools.weights().bytes();
+        /* An elastic pool's slab tails are address space inside its range (va_bytes). */
+        const uint8_t* wp_hi = wp_lo + r->pools.weights().va_bytes();
         auto dst_fits = [&](const void* p, int64_t len, const char* nm) {
             const uint8_t* q = (const uint8_t*)p;
             if (!wp_lo || (q >= wp_lo && q + len <= wp_hi)) return true;

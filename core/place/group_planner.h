@@ -185,13 +185,22 @@ public:
     /* The same for one rank, which reports on its own: the other ranks' bins stay as they were. */
     void update(const std::string& id, size_t rank, std::vector<HeatBin> bins);
     /* How many expert bytes a rank's slab has pages behind now; targets are recomputed. This is the
-     * giver's receipt: only after it falls can a taker be granted the bytes. Ignored for an
-     * unknown id or rank. */
-    void update_held(const std::string& id, size_t rank, int64_t held);
+     * giver's receipt: only after it falls can a taker be granted the bytes. The bytes are the
+     * movable slots the bins count (Mover::slab_held_bytes), so they compare with the targets.
+     * `offer` >= 0 replaces the offer join() took from the single-engine resolver, which also
+     * covers the slots that cannot move (Mover::slab_offer_bytes); the first report states it,
+     * and until then the member's whole offer is reserved as held. Ignored for an unknown id or
+     * rank. */
+    void update_held(const std::string& id, size_t rank, int64_t held, int64_t offer = -1);
     /* A rank's KV partition; targets are recomputed. Ignored for an unknown id or rank. */
     void update_kv(const std::string& id, size_t rank, const KvPartition& kv);
     /* What the engine is entitled to now (empty when it is not registered). */
     GroupBudget target(const std::string& id) const;
+
+    /* One rank of a member, for status and metrics: the target (bytes), what its slab has pages
+     * behind (held, the physical commit) and the offer the pool counts for it. */
+    struct RankView { int64_t target = 0, committed = 0, offer = 0; bool elastic = false; };
+    std::vector<RankView> view(const std::string& id) const;
 
 private:
     void recompute();

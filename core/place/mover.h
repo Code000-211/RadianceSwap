@@ -104,6 +104,7 @@ public:
         return n;
     }
     int64_t capacity() const { return n_; }
+    bool held_at(int64_t s) const { return s >= 0 && s < n_ && held_[(size_t)s]; }
     int64_t stride() const { return stride_; }
     int64_t n_free() const { return n_usable_; }
     /* n_free() restricted to slots below `hi`: the budgeted range of a slab whose free list also
@@ -328,6 +329,11 @@ struct MoverConfig {
      * there are movable residents and --host-pool-mib has room for after every pooled unit and the
      * file tier's reserves. Off: no spare slots, and set_resident_cap changes nothing. */
     bool shrinkable = false;
+    /* An elastic slab grows only while the card keeps `grow_floor` bytes free after the pages are
+     * backed (rank's device `device`): the runtime allocates scratch and code objects on first use,
+     * and a card taken to the last byte corrupts the kernel that needed them. */
+    int     device = 0;
+    int64_t grow_floor = 0;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -675,13 +681,20 @@ public:
     int64_t backed_slots(size_t klass) const {
         return klass < pools_.size() ? pools_[klass].backed : 0;
     }
-    /* Bytes of resident-capable slab with pages behind them in the class: backed slots less the
-     * working reserve. This is what the class costs the card as expert slots, and what the group
-     * planner is told the model holds (GroupPlanner::update_held). */
+    /* The class's movable expert capacity, in bytes: what the group planner counts (units heat may
+     * move), without the working slots and the residents that cannot move. `slab_offer_bytes` is
+     * that capacity as the plan placed it and `slab_held_bytes` what has pages behind it now; the
+     * second falls below the first on a shrink, once the pages went back to the card, and rises
+     * above it on a regrow past the plan. */
+    int64_t slab_offer_bytes(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].n_movable0 * pools_[klass].stride : 0;
+    }
     int64_t slab_held_bytes(size_t klass) const {
         if (klass >= pools_.size()) return 0;
         const ClassPools& cp = pools_[klass];
-        return std::max<int64_t>(cp.backed - cp.n_work, 0) * cp.stride;
+        if (cp.n_movable0 == 0) return 0;
+        return std::max<int64_t>(cp.backed - cp.n_work - (cp.n_resident0 - cp.n_movable0), 0) *
+               cp.stride;
     }
     /* Whether a cap has moved the segment and not yet settled (balance() has work). */
     bool    resizing() const {

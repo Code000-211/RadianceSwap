@@ -1575,10 +1575,11 @@ void Engine::group_tick(bool idle) {
     constexpr uint32_t kGroupReportEvery = 10;           /* heat summaries once a second */
     /* A heat engine decays once a step, so an engine nobody asks anymore keeps the heat of its last
      * step and holds its bytes against a model that is busy. What an idle engine reports cools with
-     * the time since its last step instead (half-life 10 s). */
-    constexpr double kHeatHalfLifeS = 10.0;
-    const float cool = idle ? (float)std::exp2(-(double)(now - group_busy_ns_) * 1e-9 / kHeatHalfLifeS)
-                            : 1.0f;
+     * the time since its last step instead (half-life 4 s) and is cold after 20 s: it keeps its
+     * minimum share and nothing more until it has requests again. */
+    constexpr double kHeatHalfLifeS = 4.0, kColdAfterS = 20.0;
+    const double idle_s = idle ? (double)(now - group_busy_ns_) * 1e-9 : 0.0;
+    const float cool = idle_s >= kColdAfterS ? 0.0f : (float)std::exp2(-idle_s / kHeatHalfLifeS);
     if (group_ticks_++ % kGroupReportEvery == 0)
         for (size_t i = 0; i < ranks_.size(); ++i)
             if (ranks_[i]->heat.enabled())
@@ -1590,11 +1591,17 @@ void Engine::group_tick(bool idle) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         const Rank& r = *ranks_[i];
         if (!r.mover.slab_elastic()) continue;
-        int64_t held = 0;
-        for (int32_t k : group_classes(r.plan)) held += r.mover.slab_held_bytes((size_t)k);
+        int64_t held = 0, offer = 0;
+        for (int32_t k : group_classes(r.plan)) {
+            held += r.mover.slab_held_bytes((size_t)k);
+            offer += r.mover.slab_offer_bytes((size_t)k);
+        }
         if (held == group_held_[i]) continue;
+        if (group_held_[i] >= 0)
+            RAD_INFO("group: '%s' rank %d: expert slab holds %s (%+lld MiB)", id.c_str(), r.index,
+                     humanb(held).c_str(), (long long)((held - group_held_[i]) >> 20));
         group_held_[i] = held;
-        group_->update_held(id, i, held);
+        group_->update_held(id, i, held, offer);
     }
 
     const GroupBudget want = group_->target(id);
@@ -1608,6 +1615,11 @@ void Engine::group_tick(bool idle) {
             int64_t& last = group_cap_.try_emplace({ i, k }, -2).first->second;
             if (cap >= 0 && last >= 0 && std::llabs(cap - last) < std::max<int64_t>(4, last / 100))
                 continue;
+            if (cap == last) continue;
+            RAD_INFO("group: '%s' rank %d class %d: target %lld resident units (was %lld; -1 is "
+                     "no limit); the group's target for the rank is %s, its slab holds %s",
+                     id.c_str(), r.index, (int)k, (long long)cap, (long long)last,
+                     humanb(want[i].bytes).c_str(), humanb(std::max<int64_t>(group_held_[i], 0)).c_str());
             last = cap;
             (void)r.mover.set_resident_cap((size_t)k, cap);
         }

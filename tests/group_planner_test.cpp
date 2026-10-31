@@ -135,6 +135,19 @@ TEST(equal_worth_shares_the_room_in_proportion_to_bytes) {
     CHECK_EQ(got[1][0].bytes, (int64_t)16 * MiB);
 }
 
+TEST(the_classes_of_one_model_fill_together_when_their_worth_is_equal) {
+    /* An expert's two halves live in two slab classes (gate_up 2 MiB, down 1 MiB) with the same
+     * heat. The minimum is shared between them in proportion to their bytes, so the counts stay in
+     * step: an expert with one half resident is no use. */
+    for (float heat : { 0.0f, 3.0f }) {
+        const auto got = allocate(60, { one_rank(60, { bin(20, 2, heat, 0), bin(20, 1, heat, 1) }),
+                                        one_rank(60, { bin(40, 1, 9.0f) }) }, 0, 0.5);
+        const int64_t a = got[0][0].class_units.at(0), b = got[0][0].class_units.at(1);
+        CHECK(a >= 1 && b >= 1);
+        CHECK(std::abs(a - b) <= 1);
+    }
+}
+
 TEST(classes_of_one_model_are_filled_hottest_first_and_counted) {
     /* One rank holding an uneven slice: two slab classes of different strides. */
     const auto got = allocate(17, { one_rank(17, { bin(4, 2, 1.0f, 0), bin(4, 3, 4.0f, 1) }),
@@ -626,4 +639,20 @@ TEST(a_sole_elastic_engine_is_unchanged) {
     CHECK(b[0].class_units.empty());
     g.update_held("only", 0, 4 * MiB);
     CHECK_EQ(mib(g.target("only")), 12);
+}
+
+TEST(an_elastic_models_classes_move_together_whatever_their_heat) {
+    /* gate_up (2 MiB) and down (1 MiB) halves of 20 experts; the down halves look hotter. A plain
+     * model fills the hotter class first; an elastic one keeps the classes in step, since each
+     * grows or shrinks physical pages. */
+    std::vector<HeatBin> bins = { bin(20, 2, 1.0f, 0), bin(20, 1, 5.0f, 1) };
+    std::vector<GroupMember> m = { { "a", one_rank(30, bins) }, { "b", one_rank(30, { bin(20, 3, 0.0f) }) } };
+    const auto plain = group_allocate({ 60 * MiB }, m, 0, 0.5);
+    CHECK(plain[0][0].class_units.at(1) > plain[0][0].class_units.at(0));
+    m[0].facts[0].elastic = m[1].facts[0].elastic = true;
+    const auto got = group_allocate({ 60 * MiB }, m, 0, 0.5);
+    const int64_t a = got[0][0].class_units.at(0), b = got[0][0].class_units.at(1);
+    CHECK(a >= 1);
+    CHECK(std::abs(a - b) <= 1);
+    CHECK_EQ(got[0][0].bytes, a * 2 * MiB + b * MiB);
 }

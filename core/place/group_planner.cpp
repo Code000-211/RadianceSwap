@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <set>
 
@@ -107,10 +108,28 @@ std::vector<RankBudget> allocate_rank(int64_t pool, const std::vector<const Rank
         granted += units * l.slot;
     };
 
-    /* 1. each model's minimum, from its own hottest units. */
-    for (size_t i = 0; i < n; ++i)
-        for (Left& l : own[i])
-            take(l, std::min(l.units, (keep[i] - out[i].bytes) / l.slot));
+    /* 1. each model's minimum, from its own hottest units. A model's bins of equal worth (its
+     * experts' halves in different slab classes, or a cold start) share the minimum in proportion
+     * to their bytes instead of the first in order taking all of it: an expert is useful only
+     * with every half resident, so the classes of a model fill together. */
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<Left>& v = own[i];
+        for (size_t lo = 0; lo < v.size();) {
+            size_t hi = lo;
+            int64_t tier = 0;
+            while (hi < v.size() && v[hi].worth == v[lo].worth) {
+                if (room(v[hi]) > 0) tier += v[hi].units * v[hi].slot;
+                ++hi;
+            }
+            const int64_t remaining = keep[i] - out[i].bytes;
+            for (size_t k = lo; k < hi && remaining > 0; ++k) {
+                Left& l = v[k];
+                if (tier <= remaining) take(l, l.units);
+                else take(l, (int64_t)((__int128)remaining * (l.units * l.slot) / tier) / l.slot);
+            }
+            lo = hi;
+        }
+    }
 
     /* 2. the rest by worth. A tier of equal worth that does not fit whole is shared in proportion
      * to its bytes, each share rounded down to whole units. */
@@ -141,6 +160,35 @@ std::vector<RankBudget> allocate_rank(int64_t pool, const std::vector<const Rank
                 }
             }
             lo = hi;
+        }
+    }
+
+    /* An elastic model's classes move together. An expert is two halves in two slab classes (gate_up,
+     * down), each with its own heat buckets, and the worth order above would grow one class while
+     * the other shrinks; the slots each class gives or takes are physical pages, so that churn is
+     * paid in commits and copies for no gain. The model's bytes are cut across its classes in
+     * proportion to the classes' planes instead. */
+    for (size_t i = 0; i < n; ++i) {
+        if (!facts[i]->elastic || out[i].bytes <= 0) continue;
+        std::map<int32_t, std::pair<int64_t, int64_t>> plane;   /* class -> units, slot bytes */
+        int64_t total = 0;
+        for (const HeatBin& b : facts[i]->bins)
+            if (unit_slot(b) > 0) {
+                auto& p = plane[b.slab_class];
+                p.first += b.units;
+                p.second = unit_slot(b);
+                total += b.units * unit_slot(b);
+            }
+        if (total <= 0 || plane.size() < 2) continue;
+        const int64_t bytes = out[i].bytes;
+        out[i].bytes = 0;
+        for (const auto& kv : plane) {
+            const int64_t units = std::min<int64_t>(
+                kv.second.first,
+                (int64_t)((__int128)bytes * (kv.second.first * kv.second.second) / total) /
+                    kv.second.second);
+            out[i].class_units[kv.first] = units;
+            out[i].bytes += units * kv.second.second;
         }
     }
     return out;
@@ -331,10 +379,13 @@ void GroupPlanner::update(const std::string& id, size_t rank, std::vector<HeatBi
     recompute();
 }
 
-void GroupPlanner::update_held(const std::string& id, size_t rank, int64_t held) {
+void GroupPlanner::update_held(const std::string& id, size_t rank, int64_t held, int64_t offer) {
     std::lock_guard<std::mutex> lk(mu_);
     for (GroupMember& m : members_)
-        if (m.id == id && rank < m.facts.size()) m.facts[rank].held = held;
+        if (m.id == id && rank < m.facts.size()) {
+            m.facts[rank].held = held;
+            if (offer >= 0) m.facts[rank].offer = offer;
+        }
     recompute();
 }
 
@@ -343,6 +394,18 @@ void GroupPlanner::update_kv(const std::string& id, size_t rank, const KvPartiti
     for (GroupMember& m : members_)
         if (m.id == id && rank < m.facts.size()) m.facts[rank].kv = kv;
     recompute();
+}
+
+std::vector<GroupPlanner::RankView> GroupPlanner::view(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<RankView> out;
+    for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i) {
+        if (members_[i].id != id) continue;
+        for (size_t r = 0; r < members_[i].facts.size() && r < targets_[i].size(); ++r)
+            out.push_back({ targets_[i][r].bytes, members_[i].facts[r].held, members_[i].facts[r].offer,
+                            members_[i].facts[r].elastic });
+    }
+    return out;
 }
 
 GroupBudget GroupPlanner::target(const std::string& id) const {
