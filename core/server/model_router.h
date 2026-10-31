@@ -225,6 +225,9 @@ private:
      * router answers itself, so they never activate a model. */
     HttpResponse answer_unattached(const HttpRequest& q) const;
     std::string status_json_locked(const HostMemoryStats& host) const;
+    /* An active model's static weight bytes and the part not on the card (ticket #19). */
+    void static_weights(const std::string& id, const WeightLoadReport& load, int64_t* total,
+                        int64_t* streamed) const;
     /* What a request gets while the group is unhealthy: the probes and the scrape are answered,
      * everything else is refused. Under m_ for the reason only. */
     HttpResponse answer_unhealthy(const HttpRequest& q) const;
