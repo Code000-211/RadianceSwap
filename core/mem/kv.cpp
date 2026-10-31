@@ -1041,6 +1041,19 @@ int64_t KVManager::buf_blocks(size_t i) const {
     return peak > floor_b ? peak : floor_b;
 }
 
+int64_t KVManager::tokens_beyond_carve(int64_t unplaced_tokens) const {
+    int64_t over = 0;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        const KVGroupPlan& p = plans_[i];
+        if (!lendable(p.index)) continue;
+        /* Blocks only the prefix cache holds are not demand: an eviction frees them on the spot. */
+        const int64_t need = held_blocks(p.index) - cache_only_blocks(p.index) + buf_blocks(i) +
+                             blocks_for(p.index, unplaced_tokens);
+        over = std::max(over, (need - p.carve_blocks) * p.block_size);
+    }
+    return over;
+}
+
 int64_t KVManager::buffer_bytes() const {
     int64_t b = 0;
     for (size_t i = 0; i < plans_.size(); ++i)

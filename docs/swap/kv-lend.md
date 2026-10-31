@@ -1,6 +1,6 @@
 # Modellübergreifende KV-Leihe (#17)
 
-Stand: Teil 1 (#36) Analyse und Planner-Schicht, Teil 2 die Anbindung an die Engine (unten ab „Teil 2“).
+Stand: Teil 1 (#36) Analyse und Planner-Schicht, Teil 2 die Anbindung an die Engine (unten ab „Teil 2“), GPU-Abnahme am Ende („GPU-Abnahme“, `gpu-acceptance.md` §12).
 Begriffe: `GLOSSARY.md` (KV-Partition, KV-Leihe). Vorgänger: `docs/swap/slot-release.md` (#15),
 `docs/swap/elastic-slab.md` (#35).
 
@@ -108,14 +108,27 @@ wirkt nicht; zwei Adressen läsen dieselbe Seite.
 
 Alle 100 ms, zwischen Steps und unter dem Scheduler-Lock (wie die Leihe):
 
-1. **Melden.** `KvPartition{carve = Σ pool_bytes_carved, held = Σ pool_bytes_used, want = held + buffer_bytes(),
-   cap = ceiling(max_ctx), growable = (Stücke + freie Stücke) * Stückgröße, grown = Stücke * Stückgröße}`. `want` und
-   `cap` über dem Carve in ganzen Stücken aufgerundet (ein Anspruch von ein paar Blöcken soll nicht auf 0 Stücke
-   abrunden). Gemeldet wird, wenn sich ein Wert um ein Stück bewegt.
+1. **Melden.** `KvPartition{carve = Σ pool_bytes_carved, held = Σ pool_bytes_used, want, cap = ceiling(max_ctx),
+   growable = (Stücke + freie Stücke) * Stückgröße, grown = Stücke * Stückgröße}`. `want` ist der Carve plus die Stücke, die
+   der Bedarf über den Carve hinaus braucht (`KVManager::tokens_beyond_carve`): über die wachsenden Gruppen das
+   Größte von *gehaltene Blöcke − Blöcke, die nur der Prefix-Cache hält + Puffer + Blöcke der noch nicht platzierten
+   Prompts* minus Carve-Blöcke, in ganzen Stücken aufgerundet (ein Anspruch von ein paar Blöcken soll nicht auf 0 Stücke
+   abrunden). Drei Regeln, die die GPU-Abnahme erzwang:
+   - **Wartende Prompts sind Bedarf.** Ein Prompt nimmt seine Blöcke erst Chunk für Chunk, ein wartender Request hält
+     keine; weder `held` noch der Fehlbetrag (`short_peak_`) zeigen den Rest der Prompts. `Scheduler::unplaced_tokens_locked`
+     zählt Sequenzlänge minus berechnete Token aller laufenden und wartenden Requests.
+   - **Der Carve ist nicht die Blockzahl.** Er enthält auch die Zustände je Sequenz (Slots für `--max-num-seqs`), die nie
+     wachsen; `held + Puffer` gegen den Carve zu halten verbarg, dass die Block-Seite längst voll war. Verglichen wird je
+     Gruppe in Blöcken.
+   - **Blöcke nur des Prefix-Cache sind kein Bedarf**: eine Räumung gibt sie sofort frei (`cache_only_blocks`). Hielte
+     der Cache eines fertigen Gesprächs das oberste Stück fest, ginge es nie zurück.
+   Gemeldet wird, wenn sich ein Wert um ein Stück bewegt.
 2. **Anwenden.** Ziel = `kv_grow / Stückgröße`, das Kleinste über die Ranks. Über den Stücken: eines pro Tick
    backen, sofern keine Leihe offen ist und die Karte danach `gpu_headroom_mib` frei behält (wie
    `MoverConfig::grow_floor`). Unter den Stücken: nach 5 s das oberste zurückgeben, sobald jeder Block darin frei
-   ist (Streams werden vorher gedraint). Ein Block, den eine Sequenz oder der Prefix-Cache hält, hält das Stück.
+   ist (Streams werden vorher gedraint). Ein Block, den eine Sequenz hält, hält das Stück. Hält nur der Prefix-Cache
+   Blöcke darin, räumt die Engine bei jedem Versuch (jede Sekunde) bis zu 4096 Einträge (`Scheduler::evict_cache_locked`,
+   dieselbe Räumung wie bei einem vollen Pool) und versucht es beim nächsten Mal wieder.
 
 ### Der Planner: nie VRAM doppelt verplanen (`group_gate`)
 
@@ -130,6 +143,15 @@ frei sind** (`Pool − Σ gehalten`), genau wie der Wachstumsanspruch eines elas
 - `KvPartition::grown` sind die Bytes, hinter denen das Pool Seiten hat. Sie zählen als gehalten, bis die Engine sie
   zurückgegeben hat und es meldet. Fällt der Anspruch unter `grown`, bekommt der Geber die Bytes **nicht** schon
   jetzt; `kv_grow` unter `grown` ist das Signal an die Engine, Stücke zurückzugeben.
+- **Reihenfolge der freien Bytes: Statik, KV-Anspruch, Expert-Wachstum** (seit dem Zusammenführen mit #19, `group_statics`
+  und `group_gate`). Die Statik zuerst, weil jedes Token sie liest: ein gestreamter Anteil kostet jeden Schritt PCIe-Zeit
+  (ADR 0002), ein fehlender Cache-Block einen Request, ein fehlender Experts-Slot nur eine Cache-Zeile. Dann der Anspruch
+  einer Partition mit wartenden Sequenzen, deren Fehlen alle Wartenden anhält, und erst zuletzt das Wachstum eines
+  Expert-Slabs. Jeder Schritt nimmt von dem, was der vorige übrig ließ: `group_gate` zieht die Statik-Zusagen
+  (`static_pending`) von den freien Bytes des Pools ab, bevor es die Ansprüche bedient, und `group_statics` zählt einen
+  gewährten, noch nicht gebackten KV-Anspruch (`kv_grow − grown`) wie den eines elastischen Slabs als vergeben. Eine
+  Zusage, die schon gemacht ist, bleibt reserviert, auch wenn später etwas Dringlicheres kommt; die Reihenfolge gilt für
+  *neu* frei gewordene Bytes. Test: `free_bytes_go_to_statics_then_the_kv_claim_then_the_experts_and_never_twice`.
 - Laufende Sequenzen: `held` ist die Untergrenze von `want`; kein Ausgang nennt Bytes, die eine Partition abgeben
   soll. Die Rückgabe trifft nur freie Blöcke.
 
@@ -154,8 +176,9 @@ Arena-Adressraum und ändert sich nicht. `RADIANCE_ELASTIC_SLAB=off` schaltet es
 - **Latenz.** Die Kette Anspruch → Geber schrumpft (Stück für Stück) → Meldung → Backen dauert Sekunden. Wächst B's Last schneller, lehnt `ensure` ab und der
   Scheduler präemptiert wie bei jedem vollen Pool (Neuberechnung, kein Verlust von KV-Daten einer laufenden
   Sequenz, aber Rechenzeit); `buffer_bytes()` plus die Aufrundung auf ein Stück halten den Anspruch dem Bedarf voraus.
-- Das oberste Stück bleibt, solange es einen Block hält, auch einen des Prefix-Cache. Darunter liegende freie Stücke
-  werden erst frei, wenn es geht.
+- Das oberste Stück bleibt, solange eine Sequenz einen Block darin hält. Blöcke nur des Prefix-Cache hält es nicht fest: die
+  Rückgabe räumt sie (siehe „Wie die Engine es treibt“). Darunter liegende freie Stücke werden erst frei, wenn das oberste
+  zurück ist.
 - Ein Model, das als einziges in der Gruppe aktiv ist, bekommt wie bisher sein Angebot (Single-Engine unverändert),
   keinen KV-Anspruch. Der Anspruch entsteht erst mit einem zweiten Mitglied.
 - Die Anzahl der Stücke je Rank ist endlich (Arena). Ist sie verbraucht, wächst der Cache nicht mehr
@@ -173,6 +196,18 @@ Arena-Adressraum und ändert sich nicht. `RADIANCE_ELASTIC_SLAB=off` schaltet es
   Zurückgeben, Leihe) mit Buchführung jedes Blocks, und das Protokoll der Engine gegen den echten Planner
   (`a_partition_grows_out_of_the_slab_another_model_gave_back_and_returns_it`: Summe aus A's Slab und B's Stücken
   übersteigt den Pool nie).
-- GPU-Abnahme (`kvgrow.py`, `m_kv.json`, `docs/TOOLS.md`) steht aus; sie misst auf der Karte, was die Host-Tests
-  nicht können: B bekommt KV, A's Slab sinkt, `lpstress`-artige Logprobs ohne nicht endliche Logits, laufende
-  Sequenzen ungestört.
+- `tests/mem_test.cpp`: `the_demand_beyond_the_carve_counts_held_blocks_and_unplaced_prompts_but_not_cache_only_blocks`.
+- `tests/group_planner_test.cpp`: `free_bytes_go_to_statics_then_the_kv_claim_then_the_experts_and_never_twice`
+  (Statik vor KV-Anspruch vor Expert-Wachstum; ein gewährter, noch nicht gebackter KV-Anspruch nimmt der Statik die
+  freien Bytes der Karte).
+
+## GPU-Abnahme (2× R9700, TP=2)
+
+`kvgrow.py` mit `m_kv.json` (A = `m1`, 4096 × 4; B = `m2`, 16 384 × 16, `--host-pool-mib 20500`, beide Flash-Next-MoE),
+Ergebnisse und Fehler in `gpu-acceptance.md` §12. Kurz: B's Carve (1916 MiB je Rank, davon 1,7 GiB Zustände für 16
+Sequenzen) wuchs bei 12 Sequenzen × ~6000 Token um 2 Stücke (468 MiB je Rank), bei 16 × ~8000 um 3 (702 MiB); A's
+committed Slab sank von 10,0 GiB auf 6,5–7,1 GiB (B's Experts wachsen dabei auch), die Summe aus beiden Slabs und B's
+Stücken blieb bei jedem Sample (alle 2 s) unter dem Pool; 0 nicht endliche Logits bei 4 Läufen mit `rocm-smi` alle
+2 s als Beobachter; nach dem Ende ging B's Wachstum binnen 13–20 s auf 0 zurück und die Bytes gingen an die Experts.
+Ein Wert, den die Host-Tests nicht zeigen konnten: die Anspruchsregeln oben (wartende Prompts, Carve ohne Zustände,
+Prefix-Cache) entstanden erst auf der Karte.

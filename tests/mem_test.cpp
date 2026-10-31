@@ -8250,6 +8250,24 @@ TEST(a_sequence_fills_the_carve_and_runs_on_into_the_chunk) {
              (int32_t)(((g.p().carve_blocks + g.p().chunk_align - 1) / g.p().chunk_align) * g.p().chunk_align));
 }
 
+TEST(the_demand_beyond_the_carve_counts_held_blocks_and_unplaced_prompts_but_not_cache_only_blocks) {
+    Grower g;
+    CHECK_OK(g.build());
+    const int64_t carve = g.p().carve_blocks, bs = g.p().block_size;
+    CHECK_EQ(g.kv.tokens_beyond_carve(0), 0);
+    /* Prompts not placed yet are demand; the buffer (one prefill chunk) is on top. */
+    const int64_t buf = g.kv.buffer_bytes() / g.p().bytes_per_block;
+    CHECK_EQ(g.kv.tokens_beyond_carve(carve * bs), buf * bs);
+    /* Blocks a sequence holds count; those only the cache holds do not. */
+    CHECK_OK(g.kv.add_sequence(1));
+    CHECK_OK(g.kv.ensure(1, 10 * bs));
+    CHECK_EQ(g.kv.tokens_beyond_carve(carve * bs), (buf + 10) * bs);
+    for (int32_t b : std::vector<int32_t>(g.kv.block_table(1, G_FULL))) CHECK_OK(g.kv.retain_block(G_FULL, b));
+    g.kv.free_sequence(1);
+    CHECK_EQ(g.kv.cache_only_blocks(G_FULL), 10);
+    CHECK_EQ(g.kv.tokens_beyond_carve(carve * bs), buf * bs);
+}
+
 TEST(a_chunk_goes_back_only_when_every_block_of_it_is_free_and_loses_no_sequence) {
     Grower g;
     CHECK_OK(g.build());

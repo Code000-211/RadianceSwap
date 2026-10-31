@@ -544,6 +544,10 @@ public:
     /* Bytes one chunk backs on this rank, over every growing group; the tokens it adds to each. */
     int64_t chunk_bytes() const { return chunk_bytes_; }
     int64_t chunk_tokens() const { return chunk_tokens_; }
+    /* Tokens the cache needs beyond its carve: over the lendable groups, the most any group's held
+     * blocks, buffer and `unplaced_tokens` (prompts still to be placed) exceed its carve. Rank 0
+     * only; 0 while everything fits. */
+    int64_t tokens_beyond_carve(int64_t unplaced_tokens) const;
     /* Chunks backed now, and chunks the address space still has. */
     int     chunks() const { return (int)chunks_.size(); }
     int     chunks_left() const;

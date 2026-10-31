@@ -1702,7 +1702,13 @@ void Engine::kv_growth_tick(const std::vector<int64_t>& grant, uint64_t now) {
             kp.carve += lead.pool_bytes_carved(p.index);
             kp.held += lead.pool_bytes_used(p.index);
         }
-        kp.want = kp.held + lead.buffer_bytes();
+        /* What the cache needs beyond its carve, in chunks. Not `held + buffer` against the carve: the
+         * carve also holds the per-sequence states of every slot, which never grow, so it hides
+         * how full the paged blocks are. A prompt takes its blocks a chunk at a time and a waiting
+         * request holds none: neither `held` nor the shortfall peak shows the rest of the prompts in
+         * flight, so they count as demand. */
+        const int64_t over = lead.tokens_beyond_carve(sched_.unplaced_tokens_locked());
+        kp.want = std::max(kp.held, kp.carve + (over > 0 ? (over + lead.chunk_tokens() - 1) / lead.chunk_tokens() * cb : 0));
         /* The shortfall peak decays once a tick, here when the loan does not do it. */
         if (!lending_) (void)lead.spare_tokens();
         chunks = lead.chunks();
@@ -1778,7 +1784,10 @@ void Engine::kv_growth_tick(const std::vector<int64_t>& grant, uint64_t now) {
             (void)rad_stream_sync(r->ctx.stream());
         }
         const auto lk = sched_.hold();
-        if (rad_dev_set(ranks_[0]->device) < 0 || lead.retire_chunk(true) < 0) return;
+        if (rad_dev_set(ranks_[0]->device) < 0) return;
+        /* A finished conversation the prefix cache keeps holds blocks of the chunk; the claim is over,
+         * so the cache gives them up (a block a sequence holds stays, and so does its chunk). */
+        if (lead.retire_chunk(true) < 0) { (void)sched_.evict_cache_locked(4096); return; }
         for (size_t i = 1; i < ranks_.size(); ++i) {
             if (rad_dev_set(ranks_[i]->device) < 0) continue;
             (void)ranks_[i]->kv.retire_chunk(false);

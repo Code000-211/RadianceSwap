@@ -84,6 +84,13 @@
  * can grow (Engine::group_tick); the bytes follow the expert slab's rule (group_gate): the experts
  * give theirs back first, the partition's chunks are backed after that (`KvPartition::grown`), and
  * a grant not yet used stays reserved.
+ *
+ * The order of the card's free bytes (group_statics, group_gate): streamed statics first (every token
+ * reads them), then a KV partition's claim (a partition with waiting sequences stalls them all when
+ * it cannot grow), then the growth of expert slabs (a cache line). Each step takes from what the
+ * one before left and a grant not yet used stays reserved against all three, so no byte is planned
+ * twice: group_statics counts a KV grant not yet backed as taken, group_gate counts the statics'
+ * grants (`static_pending`) before it cuts the claims.
  */
 #pragma once
 #include "heat.h"
