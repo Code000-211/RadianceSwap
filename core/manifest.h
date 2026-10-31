@@ -12,8 +12,10 @@
  * `engine` is an argv-style list handed to config_parse over the command line's own options, so
  * there is one option parser and one validation. Every model is its own Engine on the same GPU
  * group (main.cpp, server/model_router.h): the default model is started at once, the others on
- * their first request. `cache.max_queued_requests` bounds the requests waiting for one cold model
- * (0: 64). The gpu_group section and the other cache values are only parsed and checked here.
+ * their first request. Each has a fixed VRAM share, and the group planner (place/group_planner.h)
+ * divides the experts between them inside those shares. `cache.max_queued_requests` bounds the
+ * requests waiting for one cold model (0: 64). The gpu_group section and the other cache values
+ * are only parsed and checked here.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
 #pragma once

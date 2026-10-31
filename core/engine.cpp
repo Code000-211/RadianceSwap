@@ -10,6 +10,7 @@
 #include "manifest.h"
 #include "mm/processor.h"
 #include "mm/media.h"
+#include "place/group_planner.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -65,6 +66,7 @@ Engine::Readback::~Readback() {
 
 Engine::~Engine() {
     stop_execution(StopMode::Immediate);
+    if (group_) group_->leave(cfg_.served_model_name);
 
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the

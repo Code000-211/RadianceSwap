@@ -5,6 +5,7 @@
 #include "build/startup.h"
 #include "hf_model.h"
 #include "manifest.h"
+#include "place/group_planner.h"
 #include "server/model_router.h"
 #include "util/stallwatch.h"
 
@@ -21,10 +22,18 @@
  * (server/model_router.h). Only the default model is started here; the others are cold and the
  * router starts them on their first request, each on its own activation thread. The registry and
  * the router belong to the process; an Engine belongs to the thread that serves it and is destroyed
- * when that thread returns. */
+ * when that thread returns.
+ *
+ * The fixed share caps a model's KV cache and static weights until KV is lent between models
+ * (#17). The group planner (place/group_planner.h) divides only the experts, inside those shares:
+ * every engine, the default one and a cold one at its activation, joins it when it plans and
+ * leaves it when it is destroyed. */
 static int serve_manifest(rad::ModelRegistry& registry) {
     const std::vector<rad::ModelRecord>& models = registry.models();
     const size_t n = models.size();
+    /* Shares are fixed, so no model reserves pool for one not started (to_start 0). Declared before
+     * the engines and the router: both end before it. */
+    rad::GroupPlanner group(0);
 
     /* The free VRAM of the group's tightest card, in MiB; -1 where no card reports a capacity. */
     auto free_mib = [](int tp) {
@@ -62,6 +71,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         if (!rad::resolve_hf_model(cfg)) return (int)RAD_E_NOTFOUND;
         auto engine = std::make_unique<rad::Engine>(std::move(cfg));
         engine->set_registry(&registry);
+        engine->set_group_planner(&group);
 
         /* A startup that stops logging reports where it waits (util/stallwatch.h). */
         rad::StallWatch watch(("startup " + models[i].id).c_str(), 120000);
