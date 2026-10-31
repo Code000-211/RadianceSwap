@@ -234,7 +234,8 @@ TEST(stopping_releases_every_attached_model_after_the_listener_is_down) {
     ModelRouter mr("a", 2);
     std::thread ta([&] { rc_a = mr.serve_model("a", p.a.srv.get()); a_back = true; });
     std::thread tb([&] { rc_b = mr.serve_model("b", p.b.srv.get()); });
-    CHECK(eventually([&] { return mr.router().routes().size() > 10; }));
+    /* Not mr.router().routes(): attach() is adding to that table. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(!a_back.load());
     mr.stop();
     ta.join();
