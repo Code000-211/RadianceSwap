@@ -2970,8 +2970,12 @@ int Engine::load_weights() {
             capture_checked = true;
             int64_t need = 0;
             for (auto& r : ranks_)
-                for (size_t i = 1; i < r->program.weights.size(); ++i)
-                    need += r->program.weights[i].stored_bytes;
+                for (size_t i = 1; i < r->program.weights.size(); ++i) {
+                    /* The mapped and file tiers are read where they lie and never captured (a
+                     * 47.7 GiB n-gram table counted per rank made a 67 GiB model "not fit"). */
+                    const Tier t = r->plan.weight[i].tier;
+                    if (t != Tier::Mapped && t != Tier::SSD) need += r->program.weights[i].stored_bytes;
+                }
             std::string why;
             /* A weight is read from the source: the load's staging is host memory beside the copy
              * for as long as it runs, so it is counted before the copy asks for room. */
