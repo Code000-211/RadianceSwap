@@ -1737,6 +1737,9 @@ int Engine::plan() {
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
             if (!r->arena_levels.empty() && !cfg_.deterministic) f.expert_layer_max = wf.expert_layer_max;
+            /* The statics' ring needs no smaller level: where the arena has none it is not lent, and
+             * the stager owns the region (init_contexts). A deterministic plan moves nothing. */
+            if (!cfg_.deterministic) f.static_layer_max = wf.static_layer_max;
             /* A throwaway manager: plan_groups is configure()'s pure-arithmetic half and touches no
              * memory, and the real pool does not exist yet. */
             KVManager probe;
@@ -1883,6 +1886,48 @@ int Engine::plan() {
         if (cfg_.tower_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i)
                 facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
+        /* Static weights that do not fit beside one sequence of cache stream from the pinned host
+         * pool (vram_budget.h), so the pool must hold them, and with no card room left for any
+         * expert, every expert too. The pool grows by what it lacks before the split, as for the
+         * drafter above; the planner places within it. */
+        {
+            VramBudget trial;
+            if (vram_budget_trial(cfg_, facts, &trial) == RAD_OK && trial.statics_streamed > 0) {
+                /* --deterministic has no stager, so a prefill would read the streamed statics over
+                 * the link in place; ADR 0002 allows that only through the ring. */
+                if (cfg_.deterministic) {
+                    RAD_ERR("--deterministic: %s of the static weights do not fit the card beside one "
+                            "sequence of cache and would stream from the pinned host pool, but a "
+                            "deterministic plan has no prefill stager to copy them ahead; drop "
+                            "--deterministic, or free VRAM (--gpu-headroom-mib, --max-model-len, "
+                            "another model)", humanb(trial.statics_streamed).c_str());
+                    return RAD_E_NOMEM;
+                }
+                const int64_t MiB = (int64_t)1 << 20;
+                int64_t experts = 0, unit = 0;
+                for (const WeightFootprint& wf : wfs) {
+                    experts = std::max(experts, wf.experts);
+                    unit = std::max(unit, wf.static_unit_max);
+                }
+                int64_t pool = cfg_.host_pool_mib * MiB, reserve = 0;
+                if (cfg_.weights_disk_tier)
+                    for (const WeightFootprint& wf : wfs)
+                        reserve = std::max(reserve, file_stage_reserve(wf.layer_unit_max, wf.routed));
+                pool -= reserve;
+                /* Plus a unit of first-fit slack, and each pool class's alignment. */
+                const int64_t want = trial.statics_streamed + experts + unit + 8 * MiB;
+                const int64_t add = want > pool ? align_up(want - pool, MiB) / MiB : 0;
+                if (add > 0) {
+                    cfg_.host_pool_mib += add;
+                    claim_host((int64_t)cfg_.tp * add * host_MiB);
+                    RAD_INFO("placement: %s of the static weights do not fit the card beside one "
+                             "sequence of cache and stream from the pinned host pool; "
+                             "--host-pool-mib grows by %lld to hold them%s",
+                             humanb(trial.statics_streamed).c_str(), (long long)add,
+                             experts > 0 ? " and the experts the card has no room for" : "");
+                }
+            }
+        }
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -3424,7 +3469,16 @@ int Engine::load_weights() {
     const int64_t io1 = proc_io_read_bytes();
     rep.disk_read_bytes = io0 >= 0 && io1 >= 0 ? io1 - io0 : -1;
     rep.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count();
+    for (auto& r : ranks_) {
+        rep.static_bytes += r->plan.static_bytes;
+        rep.static_streamed_bytes += r->plan.static_streamed_bytes;
+    }
     weight_load_ = rep;
+    if (rep.static_streamed_bytes > 0)
+        RAD_INFO("load: %s of the %s of static weights (%.1f%%) are read from the pinned host pool "
+                 "at run time: the card had no room for them", humanb(rep.static_streamed_bytes).c_str(),
+                 humanb(rep.static_bytes).c_str(),
+                 100.0 * (double)rep.static_streamed_bytes / (double)rep.static_bytes);
     RAD_INFO("load: %s activation: %lld weights, %s (%s from the prepared store), %s read from the "
              "source, %s read from disk by the process, %.2f s%s",
              rep.warm ? "warm" : "cold", (long long)rep.weights, humanb(rep.bytes).c_str(),
@@ -3937,7 +3991,8 @@ int Engine::init_contexts() {
 
         /* The prefill stager, where the budget made room. Only a step larger than every smaller
          * arena level finds the ring unlent, so that is the smallest pass it arms for. */
-        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
+        if (r->program.arena_stage_bytes > 0 && r->plan.dynamic &&
+            (!r->arena_levels.empty() || r->plan.static_streamed_bytes > 0)) {
             /* The smallest pass is one past every level that lends the ring. The span's shared
              * level does not: it keeps its own place for it, right above its buffers and the
              * guard, wherever that is below the region at the top (stager.h). */
@@ -3949,15 +4004,24 @@ int Engine::init_contexts() {
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_low_off = std::min(off, r->program.arena_stage_off);
             }
+            /* No smaller level: nothing lends the ring, so no step is too small to find it, and
+             * the smallest pass is chosen by size instead. Decode steps and short chunks read the
+             * streamed statics in place, as the levels' lower bound does (probe_arena_levels:
+             * at least 256 rows); a prompt chunk above it copies them ahead. The ring is where
+             * the full plan has it from the first step. */
+            if (r->arena_levels.empty())
+                top_level = std::max<int64_t>(256, cfg_.max_seqs * (1 + std::max(cfg_.n_spec, 0)));
             char* const base = (char*)r->ctx.arena_base();
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
                                    r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
                                    r->program.arena_stage_bytes, top_level + 1));
+            r->stager.set_ring(r->stager.ring_full());
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
-                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
-                         "the card up to %d layers ahead of the layers that read them",
+                         "than %lld tokens copies the host-pool weights (pooled experts, streamed "
+                         "statics) of %zu layers onto the card up to %d layers ahead of the "
+                         "layers that read them",
                          humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }

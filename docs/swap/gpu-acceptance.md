@@ -342,3 +342,60 @@ eine `rad_dev_alloc`; der Mover reserviert wie zuvor.
 C1 und C8 liegen im dichten Fall innerhalb 1 %. Prefill streut bei beiden Builds von Lauf zu Lauf um
 ±5 % (Basis allein 57 257–65 110); ein systematischer Unterschied ist nicht messbar. Die MoE-Läufe
 streuen durch die Heat (dynamisch) und die Kartenlage stärker als 2 %; ein Unterschied zwischen den Builds ist darin nicht zu erkennen (nicht statistisch geprüft).
+
+## 10 Streaming statischer Gewichte (#18)
+
+`scripts/swap-acceptance/static_streaming.py MODEL --seqs 8 --pct 25|50|100` (Port 18080, GPUs
+exklusiv, `--max-model-len 4096`). Phasen: `ref` (alles auf der Karte, bzw. beim MoE der Normalfall mit
+Pool), `stream` (Headroom so, dass `pct` % der Statik streamen; Greedy-Text und -Tokens wie `ref`),
+`status` (Ein-Model-Manifest: Anteil in `/radiance/models` und `/metrics`), `full` (Model `a` hält die
+Karten, `b` aktiviert sich bei vollem VRAM). Dicht = Qwen3.5-0.8B (`a` dasselbe Model, 262144/64);
+MoE = Flash-Next (`--host-pool-mib 12288 --ngram-placement disk`, `a` = die 0,8B, weil zwei MoE nicht in
+den Host-RAM passen). Die Statik je Rank: 910 MiB (dicht), 3666 MiB (MoE).
+
+| Prüfpunkt | Dicht (25 / 50 / 100 %) | MoE (25 / 50 / 100 %) |
+|---|---|---|
+| Anteil gestreamt (`stream`; `status` = Plan) | 25,6 / 50,8 / 85,5 % (100 %: Obergrenze mit 8 Sequenzen, ein Cache und der Ring bleiben; mit 1 Sequenz 99,998 %) | 15,4 / 42,7 / 96,5 % |
+| Ausgabe = Referenz (stream, Manifest, full) | ja, 9 von 9 | ja, 9 von 9 |
+| `/radiance/models`, `/metrics` zeigen den Anteil | ja (`static_streamed_fraction` 0,256 / 0,508 / 0,855) | ja (0,154 / 0,427 / 0,965) |
+| Aktivierung bei vollem VRAM | gelingt, `b` streamt (6 / 33 / 84 %), `a` läuft weiter und antwortet gleich | gelingt, `b` streamt (15,8 / 43,0 / 96,7 %), `a` ebenso |
+| Aktivierung / erste Antwort von `b` | 2,1–2,3 s / 2,2–2,6 s | 35,5–37,0 s / 36,2–37,7 s |
+
+Kosten (drei Wiederholungen, Spanne; C8 = acht gleichzeitig; Prefill 3,6k Token):
+
+| Model | Anteil | C1 tok/s | C8 tok/s | Prefill tok/s (TTFT ms) |
+|---|---|---|---|---|
+| dicht | 0 % | 323–330 | 1970–2001 | 67 500–68 600 (53) |
+| | 25,6 % | 198–199 | 1337–1345 | 60 800–61 700 (59–61) |
+| | 50,8 % | 62,6–62,9 | 474–476 | 42 200–43 200 (84–86) |
+| | 85,5 % | 32,4–32,5 | 226–247 | 31 500–34 500 (105–115) |
+| dicht, 1 Sequenz | 52,4 % / 26,3 % / 99,998 % | 55,6 / 167 / 25,6 | = C1 (eine Sequenz) | 40 500 / 57 000 / 26 000–26 700 |
+| MoE | 0 % (Experts teils im Pool; Heat wärmt sich: 139 → 181) | 139–181 | 569–656 | 5715–6279 (579–631) |
+| | 15,4 % | 36,5–37,4 | 61–74 | 2713–2846 (1273–1327) |
+| | 42,7 % | 23,5–25,0 | 48–70 | 2245–2485 (1447–1590) |
+| | 96,5 % | 11,2–11,5 | 42–65 | 2067–2212 (1665–1755) |
+
+Beim MoE ist der Einbruch Statik plus Experts: sobald die Statik streamt, bekommt die Karte keinen
+Platz mehr für Experts (sie liegen alle im Pool), der Vergleich zur Referenz mischt beides.
+
+### Gefundene Fehler und Fixes
+
+1. **`--deterministic` ließ gestreamte Statik zu** (ADR 0002). Ohne Stager liest der Prefill die
+   Statik über PCIe an Ort und Stelle. Jetzt Startfehler: `--deterministic: 438.05 MiB of the static
+   weights do not fit the card beside one sequence of cache … has no prefill stager to copy them
+   ahead` (Exit 1, VRAM danach auf der Basis; Test `deterministic_refuses_streaming_statics`).
+2. **`static_streaming.py` Phase `full` bei 100 %** zielte auf 34 MiB Rest für `b`; die festen Kosten
+   von `b` (Arena, Staging, Queues) fehlten um 19 MiB, `b` scheiterte mit „VRAM does not cover the fixed
+   costs“ und der Druckpfad deaktivierte `a` (korrekt, aber nicht das, was die Phase prüft). Das Ziel hat
+   jetzt 64 MiB Reserve. Neu: `--seqs` (C8 braucht 8 Sequenzen, mit 1 war C8 = C1), `--extra`, `--hog`, `--hog-extra`
+   (ein kleines `a` neben dem MoE); `start.sh` wartet bis zu 60 s, bis ein eben beendeter Server
+   (großer MoE gibt seinen gepinnten Speicher langsam frei) weg ist, statt „REFUSE“ zu melden.
+
+Rebase auf `origin/main` (#44, elastischer Slab): keine Textkonflikte; Build, `ctest -L unit` (nur die
+8 bekannten rot) und alle Läufe oben auf dem rebasierten Stand. Im Manifest (`status`, `full`) läuft
+der GroupPlanner des Slabs mit: ein streamendes `b` tritt mit „offering 0 B of experts“ bei (die Karte
+hat nach der Statik keinen Platz für Experts), `a` bleibt unverändert. Nicht gemessen: zwei MoE, bei
+denen `a` Experts im Slab hält und `b` streamt. Der Versuch (`a` = MoE mit 20 GB Pool, `b` = MoE, 50 %)
+scheiterte am Host-RAM: `a` allein belegt 138 GiB, die Pool-Erhöhung von `b` (+20 282 MiB je Rank) kam
+dazu, der Kernel beendete den Server (Exit 137, ohne Meldung, `host budget` warnte nicht). Dieselbe
+Grenze wie „Host-RAM ist die Grenze großer Models (#13)“ oben; nicht behoben.

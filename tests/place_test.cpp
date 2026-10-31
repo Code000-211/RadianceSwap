@@ -360,6 +360,237 @@ TEST(planner_spills_experts_before_dense_weights) {
     CHECK_EQ(zero_copy, 6);
 }
 
+/* ================================================================== RAM-Streaming of statics (#18) */
+
+/* A dense model whose static weights do not fit the card: what fits stays, in execution order,
+ * and the rest is pinned in the host pool at the zero-copy site, read in place at decode and
+ * staged through the prefill ring. Nothing is staged through the slab, no run goes to the host
+ * site, and the token embedding (a lookup of a few rows) leaves the card before any layer. */
+TEST(static_weights_that_do_not_fit_are_planned_host_resident) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup", {emb}, true);
+    for (int l = 0; l < 8; ++l)
+        f.op("gemm", { f.weight("blk." + std::to_string(l) + ".ffn_down.weight", 1 * MiB,
+                                RAD_ACCESS_PER_TOKEN, l, -1) }, true);
+    Config c = base_config();
+    c.vram_weights_mib = 5;          /* 9 MiB of statics */
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    CHECK(p.strategy == Strategy::StaticStream);
+    CHECK(p.fits());
+    CHECK_EQ(p.totals.bytes[(int)Tier::VRAM], 5 * MiB);
+    CHECK_EQ(p.totals.bytes[(int)Tier::HostPinned], 4 * MiB);
+    CHECK_EQ(p.totals.bytes[(int)Tier::HostPageable], (int64_t)0);
+    CHECK_EQ(p.slab_overhead, (int64_t)0);             /* no staging ring in the slab */
+    CHECK(p.prefetch.empty());                          /* and no exact schedule */
+    CHECK(p.host_runs.empty());                         /* a device kernel reads every layer */
+    CHECK_EQ(p.static_bytes, 9 * MiB);
+    CHECK_EQ(p.static_streamed_bytes, 4 * MiB);
+    /* The embedding first, then the layers that run last. */
+    CHECK(p.weight[emb].tier == Tier::HostPinned);
+    CHECK(p.weight[emb].site == Site::DeviceZeroCopy);
+    for (const MoveUnit& mu : p.units) {
+        if (mu.layer < 0) continue;
+        CHECK(mu.movable == false);
+        if (mu.layer < 5) { CHECK(mu.tier == Tier::VRAM); CHECK(mu.site == Site::Device); }
+        else              { CHECK(mu.tier == Tier::HostPinned); CHECK(mu.site == Site::DeviceZeroCopy); }
+    }
+    CHECK(p.report(f.prog).find("static stream") != std::string::npos);
+
+    /* The same plan on every rank: nothing in the order is rank-local. */
+    Plan q;
+    PlannerInput in1{&f.prog, &c, 1, 2, nullptr, 0};
+    CHECK_OK(Planner(in1).plan(&q));
+    CHECK_EQ(digest(f.prog, p).substr(digest(f.prog, p).find('\n')),
+             digest(f.prog, q).substr(digest(f.prog, q).find('\n')));
+}
+
+/* The card is spent on what a step reads most: the drafter's weights first, a weight read every
+ * token before one read once a request, and a unit that does not fit is skipped, so a smaller one
+ * behind it still takes the room. */
+TEST(the_card_keeps_the_statics_a_step_reads_most_and_fills_what_a_big_unit_leaves) {
+    Fixture f;
+    const rad_weight tower = f.weight("v.blk.0.attn.weight", 2 * MiB, RAD_ACCESS_PER_REQUEST, 0, -1);
+    f.op("gemm", {tower}, true);
+    const rad_weight big = f.weight("blk.1.ffn_down.weight", 3 * MiB, RAD_ACCESS_PER_TOKEN, 1, -1);
+    f.op("gemm", {big}, true);
+    const rad_weight mtp = f.weight("mtp.blk.2.ffn_down.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, 2, -1);
+    f.op("gemm", {mtp}, true);
+    const rad_weight small = f.weight("blk.3.ffn_down.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, 3, -1);
+    f.op("gemm", {small}, true);
+    Config c = base_config();
+    c.vram_weights_mib = 4;          /* 7 MiB of statics */
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.weight[mtp].tier == Tier::VRAM);            /* drafter first */
+    CHECK(p.weight[big].tier == Tier::VRAM);            /* then the layers, in execution order */
+    CHECK(p.weight[small].tier == Tier::HostPinned);    /* 1 + 3 filled the card: no room left */
+    CHECK(p.weight[tower].tier == Tier::HostPinned);    /* read once a request: off the card */
+    CHECK_EQ(p.totals.bytes[(int)Tier::VRAM], 4 * MiB);
+
+    /* A unit that does not fit is skipped: with 3.5 MiB the 3 MiB unit stays and the 1 MiB ones
+     * wait, but the drafter's still goes first. */
+    Config d = c;
+    d.vram_weights_mib = 2;
+    Plan q;
+    PlannerInput din{&f.prog, &d, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(din).plan(&q));
+    CHECK(q.weight[mtp].tier == Tier::VRAM);
+    CHECK(q.weight[small].tier == Tier::VRAM);          /* skipped the 3 MiB unit, took this */
+    CHECK(q.weight[big].tier == Tier::HostPinned);
+    CHECK_EQ(q.totals.bytes[(int)Tier::VRAM], 2 * MiB);
+}
+
+/* A model with routed experts whose statics overflow: the statics stream, and the experts take
+ * whatever the card has left and the rest of the host pool. */
+TEST(experts_and_streamed_statics_share_the_card_and_the_host_pool) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    for (int l = 0; l < 4; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        f.op("gemm", { f.weight(b + "ffn_down.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, l, -1) }, false);
+        f.op("moe_gemm", { f.weight(b + "ffn_gate_exps.0.weight", 1 * MiB, RAD_ACCESS_CONDITIONAL, l, 0),
+                           f.weight(b + "ffn_gate_exps.1.weight", 1 * MiB, RAD_ACCESS_CONDITIONAL, l, 1) },
+             false);
+    }
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 6;          /* 9 MiB of statics */
+    c.host_pool_mib = 64;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    (void)stderr_of([&] { CHECK_OK(Planner(in).plan(&p)); });
+    CHECK(p.fits());
+    CHECK_EQ(p.static_bytes, 9 * MiB);
+    CHECK(p.static_streamed_bytes >= 3 * MiB);
+    for (const MoveUnit& mu : p.units) {
+        if (mu.tier == Tier::VRAM) continue;
+        CHECK(mu.tier == Tier::HostPinned);
+        CHECK(mu.site == Site::DeviceZeroCopy);         /* statics and experts alike, never staged */
+    }
+    CHECK(p.prefetch.empty());
+    CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead <= p.vram_budget);
+}
+
+/* What the pool cannot hold is listed as unfit with the plan filled in, not placed past it. */
+TEST(streamed_statics_the_host_pool_cannot_hold_are_listed_as_unfit) {
+    Fixture f;
+    build_dense(f, 8, 1 * MiB, /*host_kernel=*/false);
+    Config c = base_config();
+    c.vram_weights_mib = 5;
+    c.host_pool_mib = 2;             /* 4 MiB must stream */
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_NOMEM);
+    CHECK(!p.fits());
+    CHECK(p.totals.bytes[(int)Tier::HostPinned] <= 2 * MiB);
+    CHECK(p.report(f.prog).find("DID NOT FIT") != std::string::npos);
+}
+
+/* Without a need, nothing changes: statics that fit are all on the card, whichever strategy runs,
+ * and an explicit layer_offload keeps staging whole layers. */
+TEST(statics_that_fit_stream_nothing_and_layer_offload_still_stages) {
+    for (const char* strategy : { "auto", "expert_tiered", "all_vram" }) {
+        Fixture f;
+        build_dense(f, 4, 1 * MiB, false);
+        Config c = base_config();
+        c.placement = strategy;
+        c.vram_weights_mib = 64;
+        c.host_pool_mib = 64;
+        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK(p.strategy == Strategy::AllVram || std::string(strategy) == "expert_tiered");
+        CHECK_EQ(p.static_streamed_bytes, (int64_t)0);
+        CHECK_EQ(p.static_bytes, 5 * MiB);
+        CHECK_EQ(p.totals.bytes[(int)Tier::HostPinned], (int64_t)0);
+    }
+    Fixture g;
+    build_dense(g, 8, 1 * MiB, /*host_kernel=*/false);
+    Config c = base_config();
+    c.placement = "layer_offload";
+    c.vram_weights_mib = 5;
+    c.host_pool_mib = 64;
+    PlannerInput in{&g.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.strategy == Strategy::LayerOffload);
+    for (const MoveUnit& mu : p.units)
+        if (mu.tier == Tier::HostPinned) CHECK(mu.site == Site::DeviceStaged);
+    CHECK(!p.prefetch.empty());
+}
+
+/* The prefill stager copies a streamed layer's statics ahead like pooled experts, and gives them
+ * back when the next layer starts: prefill never reads them across the link inside a GEMM. A
+ * model-level unit (the output head) has no layer and is left in place. */
+TEST(the_stager_copies_streamed_static_layers_ahead_and_gives_them_back) {
+    Fixture f;
+    const rad_weight head = f.weight("output.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    std::vector<rad_weight> layer;
+    for (int l = 0; l < 4; ++l)
+        layer.push_back(f.weight("blk." + std::to_string(l) + ".ffn_down.weight", 2 * MiB,
+                                 RAD_ACCESS_PER_TOKEN, l, -1));
+    for (rad_weight w : layer) f.op("gemm", {w}, false);
+    f.op("head", {head}, false);
+    Config cfg = base_config();
+    cfg.vram_weights_mib = 5;        /* the head and one layer on the card: 9 MiB of statics */
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+    REQUIRE(plan.strategy == Strategy::StaticStream);
+    CHECK(plan.weight[head].tier == Tier::VRAM);
+    std::vector<rad_weight> streamed;
+    for (rad_weight w : layer)
+        if (plan.weight[w].tier == Tier::HostPinned) streamed.push_back(w);
+    REQUIRE_EQ(streamed.size(), (size_t)2);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    const int64_t each = align_up(2 * MiB, RAD_ALIGN_UNIT);
+    std::vector<char> region((size_t)(4 * each));
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), nullptr, 2 * each, 64));
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.n_layers(), streamed.size());           /* the layers on the card are not staged */
+
+    auto in_ring = [&](rad_weight w) {
+        const char* p = (const char*)m.residency()->lookup(w)->ptr;
+        return p >= region.data() && p < region.data() + 2 * each;
+    };
+    RadBatch b{};
+    b.n_tok = 128;
+    st.set_ring(st.ring_full());
+    CHECK(st.begin_pass(&b));
+    bool resync = false;
+    CHECK_OK(st.before_op(0, compute, &resync));        /* the first layer's op: both copied */
+    CHECK(resync);
+    CHECK(in_ring(streamed[0]));
+    CHECK(in_ring(streamed[1]));
+    CHECK_OK(st.after_op(0, compute));
+    CHECK_OK(st.end_pass(compute));
+    for (rad_weight w : streamed) CHECK(m.residency()->lookup(w)->ptr == home[w]);
+    CHECK(m.residency()->lookup(head)->ptr == home[head]);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
 /* A re-split rank's Config reaches both readers of the pool sizes. Engine::plan gives a rank whose
  * cache costs less per token its own Config (vram_budget_rank_split); Pools::configure sizes the
  * weights pool and Budgets::from the slab from the same copy, or the pool is wasted or overrun.
@@ -3639,7 +3870,7 @@ TEST(a_tower_lookup_table_the_embedding_pins_leaves_the_card_once) {
     cfg.vram_weights_mib = (fp.statics - emb - fp.tower) / MiB;
     Plan plan2;
     CHECK(Planner(in).plan(&plan2) < 0);
-    CHECK(plan2.strategy == Strategy::LayerOffload);
+    CHECK(plan2.strategy == Strategy::StaticStream);
 
     /* The embedding on the card: pin_towers pins the table with the rest of the tower. */
     const int64_t whole = tower_pin_bytes(fp, TablePlacement::Vram);
@@ -3959,15 +4190,16 @@ TEST(planner_spreads_residents_over_the_layers_and_follows_a_profile) {
     CHECK(spread(hot, 0, 3) <= 1);
 }
 
-/* `auto`, the default, is one of the three named strategies: everything on the card when it fits
- * (or no budget caps it), routed experts spilled when there are any, whole layers otherwise; the
- * plan says which and why. */
+/* `auto`, the default, picks everything on the card when it fits (or no budget caps it), routed
+ * experts spilled when there are any, and otherwise the static weights that do not fit read from
+ * the pinned host pool (static_stream, which only `auto` can choose); the plan says which and
+ * why. */
 TEST(auto_placement_picks_the_strategy_the_model_and_budget_call_for) {
     struct Case { const char* what; bool moe; int64_t mib; Strategy want; };
     for (const Case& k : { Case{ "fits", true, 64, Strategy::AllVram },
                            Case{ "no budget", true, 0, Strategy::AllVram },
                            Case{ "routed experts spill", true, 4, Strategy::ExpertTiered },
-                           Case{ "dense layers spill", false, 3, Strategy::LayerOffload } }) {
+                           Case{ "dense statics stream", false, 3, Strategy::StaticStream } }) {
         Fixture f;
         if (k.moe) build_moe(f, 8, 1 * MiB, nullptr);
         else       build_dense(f, 4, 1 * MiB, /*host_kernel=*/true);
@@ -4008,10 +4240,10 @@ TEST(layer_offload_spills_the_layers_that_run_last_not_the_highest_numbered) {
     CHECK_EQ(p.host_runs[0].last_layer, 3);
 }
 
-/* When the dense weights alone overflow the budget, expert_tiered spills layers first and then
- * places the routed experts. The host pool is spent once across both: the experts get what the
- * spilled dense units left, the rest are listed as unfit, and nothing past the pool is placed,
- * which the mover would refuse at reserve. */
+/* When the dense weights alone overflow the budget, expert_tiered streams the statics that do not
+ * fit first and then places the routed experts. The host pool is spent once across both: the
+ * experts get what the streamed dense units left, the rest are listed as unfit, and nothing past
+ * the pool is placed, which the mover would refuse at reserve. */
 TEST(an_expert_fill_after_a_layer_spill_spends_the_host_pool_once) {
     Fixture f;
     const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
@@ -4026,9 +4258,9 @@ TEST(an_expert_fill_after_a_layer_spill_spends_the_host_pool_once) {
     Config c = base_config();
     c.placement = "expert_tiered";
     c.vram_weights_mib = 5;          /* below the 9 MiB of dense weights */
-    /* What the layer spill places: three layers' dense units and experts. The expert fill
-     * that follows keeps none resident, so it has the six dense MiB left over for eight experts. */
-    c.host_pool_mib = 12;
+    /* The streamed dense units are the two layers that run last (4 MiB); the expert fill that
+     * follows keeps none resident, so it has the six MiB left for eight experts. */
+    c.host_pool_mib = 10;
     PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
     Plan p;
     (void)stderr_of([&] { (void)Planner(in).plan(&p); });

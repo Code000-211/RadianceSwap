@@ -20,7 +20,12 @@
  *      --embedding-placement puts in the pinned host pool, which weight_footprint then excludes.
  *      Under tensor parallelism each rank's share is already divided (declare runs per rank,
  *      spec §9). They are a floor, not a share, so the cache can never push attention weights to
- *      host memory. If they do not fit, startup refuses with the shortfall named.
+ *      host memory. If they do not fit beside one full-length sequence of cache, a placement that
+ *      can stream (`auto`, `expert_tiered`) puts on the card what fits after that sequence and the
+ *      prefill staging ring, and the planner streams the rest from the pinned host pool
+ *      (RAM-Streaming, docs/swap/static-streaming.md): a transition, since the link is 20-60x
+ *      slower than VRAM. `all_vram` and `layer_offload` keep the floor and the cache gets what is
+ *      left, which configure_kv refuses if it cannot hold that sequence.
  *
  *   2. The rest is divided between the expert plane and the KV cache. When the cache lends idle
  *      blocks to the expert slab, the experts get what the pinned host pool cannot hold and the
@@ -70,6 +75,10 @@ struct VramFacts {
     int64_t kv_fixed   = 0;   /* KVManager::fixed_bytes(): the part of the ceiling that is state */
     /* weight_footprint() for this rank; under tensor parallelism already this card's share. */
     int64_t statics    = 0;   /* non-expert weights -- the floor, not a share of anything */
+    /* The most static bytes one layer holds, for the staging ring of streamed statics. 0 where no
+     * ring can run (no smaller arena level, --deterministic): a streamed static is then read in
+     * place by every step. */
+    int64_t static_layer_max = 0;
     int64_t experts    = 0;   /* the expert plane: what trades against the KV cache */
     int64_t expert_layer_max = 0;   /* the most expert bytes one routed layer holds */
     /* Experts the pinned host pool cannot hold, plus the slab's spare slots: the expert slab's
@@ -100,7 +109,10 @@ struct VramBudget {
     int     n_queues = 0;
     int64_t queue_bytes = 0;
     int64_t claimable = 0;            /* after the fixed terms above */
-    int64_t statics = 0;              /* off the top, before the split sees anything */
+    int64_t statics = 0;              /* off the top, before the split sees anything: what the card
+                                       * holds of the static weights */
+    int64_t statics_total = 0;        /* all the static weights of the dearest rank */
+    int64_t statics_streamed = 0;     /* statics_total - statics: read from the pinned host pool */
     int64_t elastic = 0;              /* claimable - statics: what experts and cache share */
     int64_t expert_floor = 0;         /* the experts the host pool cannot hold */
     bool    lends = false;            /* every rank's cache lends its idle blocks */
@@ -113,6 +125,9 @@ struct VramBudget {
      * top of the activation arena (core/place/stager.h). Zero when every expert is resident or the
      * placement cannot move any. */
     int64_t stage = 0;
+    /* True when `stage` was funded by streaming statics (not by experts or the cache): two layers'
+     * share of the static weights that left the card. */
+    bool    stage_from_statics = false;
     int64_t weights = 0;              /* statics + experts: what vram_weights is set to */
     std::string report;       /* the block the engine prints at startup */
 };

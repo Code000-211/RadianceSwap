@@ -49,14 +49,23 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     layers_.clear();
     if (!mover || !region || bytes <= 0) return RAD_OK;
 
-    /* A routed layer is its expert units; its op span is their declared uses. The first op must
-     * find the copies; after the last (once the block's last pass of rows issued it) nothing reads
-     * them. A draft head's layer, numbered past the trunk's, is excluded (see stager.h). */
+    /* A routed layer is its expert units, and the static units the planner streams from the host
+     * pool (a layer's attention, GDN or dense feed-forward weights, ticket #18); its op span is
+     * their declared uses. The first op must find the copies; after the last (once the block's
+     * last pass of rows issued it) nothing reads them. A draft head's layer, numbered past the
+     * trunk's, is excluded (see stager.h). A model-level unit (the output head) has no layer: a
+     * prefill reads it for a few rows, as a decode step does, and it stays read in place. */
     const int32_t trunk = prog.drafter.kind != RAD_DRAFT_NONE && prog.meta.n_layers > 0
                               ? (int32_t)prog.meta.n_layers : INT32_MAX;
     size_t c = 0;
     layers_ = routed_layers(
-        plan, [&](const MoveUnit& mu) { return mu.expert >= 0 && mu.layer < trunk; }, &c);
+        plan,
+        [&](const MoveUnit& mu) {
+            const bool streamed = mu.expert < 0 && mu.tier == Tier::HostPinned &&
+                                  mu.site == Site::DeviceZeroCopy && !mu.host_forced;
+            return (mu.expert >= 0 || streamed) && mu.layer < trunk;
+        },
+        &c);
     /* Two layers' spans must not overlap: a layer's copies are given back at the next layer's
      * first op, which must be past every op that reads them. */
     if (c > 0) {

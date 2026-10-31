@@ -2509,11 +2509,41 @@ Measured with `r4d_selftest --perfmoe 2048 5 512 10 <pooled %>`: a 2048-token ga
 and 3.2 ms with the coldest 13 % in the host pool. That is what `--host-pool-mib` costs per pooled
 expert (§4.3).
 
-**Static weights from RAM: not yet available.** Streaming the *non-expert* weights (attention, GDN, dense
-MLP, embeddings, head) from host RAM, so that a model could start while the cards are full and move into
-VRAM as slots free up, is not in this build (#18, #19). A model whose static weights do not fit its share
-fails its activation (`not enough VRAM`) and is handled as pressure above. The prototype measurement
-that decided the design (`swap/measure-static-streaming.md`, prototype outside the engine):
+**Static weights from RAM.** A model also activates when its *non-expert* weights (attention, GDN, dense
+MLP, head, embeddings) do not fit the VRAM it is left, e.g. a second model while the cards are full. What does
+not fit beside the cache of one sequence (`--max-model-len`, at most 1 GiB) stays in the pinned host pool: decode
+reads it in place across the link, and a prompt chunk of 256 rows or more is copied ahead through the prefill
+stager's ring, never read in place. The bytes are the same: greedy output is bit-identical to a model with every
+weight on the card. With `--placement auto` or `expert_tiered` nothing needs configuring, and a model whose statics
+fit beside a sequence of cache is untouched. The startup log says `N of the M of static weights (P%) are read from
+the pinned host pool at run time`; `--host-pool-mib` grows by what the pool lacks (the log says by how much), and a
+MoE whose card has no room left gives all its experts to the pool too. Under `--deterministic` there is no stager,
+so a model that would stream refuses to start (`--deterministic: … has no prefill stager to copy them ahead`); give it
+more VRAM (`--gpu-headroom-mib`, a smaller `--max-model-len`, fewer active models) or drop the flag. This is a bridge:
+moving the weights back into VRAM as slots free up is #19.
+
+What it costs, Qwen3.5-0.8B (dense) and Flash-Next (MoE) on two R9700 at TP=2, `--max-num-seqs 8`, a 3.6k-token
+prompt (`swap/static-streaming.md`, `swap/gpu-acceptance.md` §10):
+
+| Model | static weights streamed | decode C1 tok/s | decode C8 tok/s | prefill tok/s (TTFT) |
+|---|---|---|---|---|
+| 0.8B | 0 % | 323–330 | 1970–2001 | 67 500–68 600 (53 ms) |
+| | 26 % | 198–199 | 1337–1345 | 60 800–61 700 (60 ms) |
+| | 51 % | 63 | 474–476 | 42 200–43 200 (85 ms) |
+| | 85 % (the most 8 sequences leave) | 32 | 226–247 | 31 500–34 500 (110 ms) |
+| Flash-Next | 0 % (some experts in the pool) | 139–181 | 569–656 | 5700–6300 (0.6 s) |
+| | 15 % | 37 | 61–74 | 2700–2850 (1.3 s) |
+| | 43 % | 24–25 | 48–70 | 2250–2490 (1.5 s) |
+| | 97 % | 11 | 42–65 | 2070–2210 (1.7 s) |
+
+Decode falls with the streamed share (a tenth of the speed at 85 %); prefill loses less (dense -50 % at 85 %, MoE -65 % at 97 %), because the ring
+overlaps the copy with compute. For the MoE the figures also include that the card has no room for experts once the
+statics stream. Activating a model next to one that holds the VRAM: 2.1–2.6 s (0.8B), 36–38 s (Flash-Next). The share
+is in `GET /radiance/models` (`static_bytes`, `static_streamed_bytes`, `static_streamed_fraction`) and in
+`/metrics` (`radiance:model_static_bytes`, `…_streamed_bytes`, `…_streamed_fraction`), for active models only.
+
+The prototype measurement that decided the design, kept for the per-operation figures
+(`swap/measure-static-streaming.md`, prototype outside the engine):
 
 | | VRAM | streamed from host RAM |
 |---|---|---|
@@ -2525,7 +2555,7 @@ that decided the design (`swap/measure-static-streaming.md`, prototype outside t
 
 So streaming static weights is meant as a bridge only: it lets a model answer its first requests at once
 while its weights move to the card, and prefill goes through the staging ring, never in place. As a steady state
-it is not usable. The figures from the finished engine path will replace the projected row.
+it is not usable. The engine path above measured -90 % decode at 85 % streamed (dense), -93 % at 97 % (MoE).
 
 #### Status and metrics
 
@@ -2570,8 +2600,8 @@ steps after an activation that were already on the card (also `early_hit=…%` i
   equal shares).
 - **No cross-model KV loan** (#17 open): a model's KV partition cannot grow at another's expense. The loan runs
   inside one model.
-- **No RAM streaming of static weights** (#18, #19 open): a model whose static weights do not fit its share
-  fails to activate or displaces an idle model.
+- **Streamed static weights stay in RAM** (#19 open): a model that streams keeps doing so until it is deactivated;
+  nothing moves them into VRAM when another model frees slots. Under `--deterministic` such a model does not start.
 - **Host RAM is the limit of large models.** Two Flash-Next on 170 GiB fill the host; the store copy of the
   second does not fit. `staging_budget_mib` is parsed only; bookings are estimates.
 - **A MoE activation takes a minute** (60 s warm, 70 s cold, with the n-gram table in RAM), because the mapped table
