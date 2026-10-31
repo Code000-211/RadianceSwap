@@ -3245,4 +3245,153 @@ TEST(manifest_mode_reactivates_a_deactivated_model_from_the_prepared_store) {
     CHECK(s.output().find("warm activation") != std::string::npos);
 }
 
+/* ================================================================== promoting streamed statics (#19) */
+
+/* Model `b` activates while `a` holds the device, so part of b's static weights stream from the
+ * pinned host pool (ticket #18). When `a` goes idle and is deactivated, the card has room again and
+ * b promotes them into VRAM, at fresh addresses, between its steps: the share it streams falls to
+ * zero, and every reply along the way is the one b gave with all its weights on the card.
+ *
+ * The device is the host backend's (RADIANCE_HOST_VRAM_MIB; its card and its pinned pool are both
+ * RAM, so placement, ring and promotion are the card's and the link is a memcpy). The headroom that
+ * makes `a` leave b the room for part of its statics is found, not fixed: the budget's reserves
+ * decide it, and a change to them should land here as a case that no longer streams, by name. */
+namespace {
+
+json model_state(int port, const std::string& id) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/radiance/models", "") || c.read(&out) != 200) return json();
+    const json all = json::parse(out, nullptr, false);
+    if (!all.is_object() || !all.contains("data")) return json();
+    for (const json& m : all["data"])
+        if (m["id"] == id) return m;
+    return json();
+}
+
+struct PromoteSetup {
+    tiny::TempDir dir{ "e2e_promote" };
+    std::string   manifest;
+    int           headroom_a = 0;
+
+    bool write(const std::string& model, int headroom) {
+        headroom_a = headroom;
+        manifest = dir / "manifest.json";
+        const json m = {
+            { "cache", { { "idle_timeout_ms", 2500 } } },
+            { "models", json::array({
+                { { "id", "a" }, { "path", model }, { "default", true },
+                  { "engine", { "--max-model-len", "32768", "--max-num-seqs", "64",
+                                "--gpu-headroom-mib", std::to_string(headroom) } } },
+                { { "id", "b" }, { "path", model },
+                  { "engine", { "--max-model-len", "1024", "--max-num-seqs", "1",
+                                "--max-num-batched-tokens", "512", "--gpu-headroom-mib", "0" } } } }) } };
+        return tiny::write_text(manifest, m.dump());
+    }
+};
+
+/* The server up with `a` active and `b` activated by its first request; `b`'s reply and the share of
+ * its statics it streams then. -2 when the server did not start, -1 when b did not answer. */
+double start_promote_run(Server& s, PromoteSetup& su, const json& req, const std::vector<std::string>& kernels,
+                         std::vector<int32_t>* first) {
+    s.quiet = true;
+    s.manifest = su.manifest;
+    if (!s.start("", kernels)) return -2;
+    json b = req;
+    b["model"] = "b";
+    *first = tokens_of(post(s.port, "/completion", b));
+    const json st = model_state(s.port, "b");
+    if (first->empty() || !st.is_object() || !st.contains("static_streamed_fraction")) return -1;
+    return st["static_streamed_fraction"].get<double>();
+}
+
+}  /* namespace */
+
+static void check_statics_are_promoted(const std::vector<std::string>& kernels) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const json req = completion(prompt_ids(7, 300), 8);
+
+    /* The reply with everything on the card: b alone. */
+    std::vector<int32_t> expect;
+    {
+        Server one;
+        std::vector<std::string> args = { "--max-model-len", "1024", "--max-num-seqs", "1",
+                                          "--max-num-batched-tokens", "512" };
+        args.insert(args.end(), kernels.begin(), kernels.end());
+        REQUIRE(one.start(w.g31, args));
+        expect = tokens_of(post(one.port, "/completion", req));
+        REQUIRE_EQ(expect.size(), (size_t)8);
+        CHECK_EQ(one.stop(), 0);
+    }
+
+    /* Find a's headroom: more of it leaves b more room. */
+    PromoteSetup su;
+    REQUIRE(su.dir.ok());
+    int lo = 0, hi = 512, found = -1;
+    double share = -1;
+    while (hi - lo > 1 && found < 0) {
+        const int mid = (lo + hi) / 2;
+        REQUIRE(su.write(w.g31, mid));
+        Server s;
+        std::vector<int32_t> first;
+        share = start_promote_run(s, su, req, kernels, &first);
+        s.stop();
+        if (share == -1 || share > 0.9) lo = mid;          /* b did not start, or streams nearly all */
+        else if (share == -2 || share < 0.1) hi = mid;     /* a did not start, or b streams (almost) nothing */
+        else found = mid;
+    }
+    if (found < 0) fprintf(stderr, "    no headroom of a between %d and %d MiB makes b stream a tenth to nine tenths\n", lo, hi);
+    REQUIRE(found >= 0);
+
+    REQUIRE(su.write(w.g31, found));
+    Server s;
+    std::vector<int32_t> first;
+    const double before = start_promote_run(s, su, req, kernels, &first);
+    REQUIRE(before >= 0.1);
+    CHECK(first == expect);
+
+    /* b keeps working while a idles out; each reply is the reference. Its share must reach 0. */
+    json b = req;
+    b["model"] = "b";
+    double after = before;
+    int replies = 0;
+    bool same = true;
+    for (int i = 0; i < 400 && after > 0.0; ++i) {
+        const std::vector<int32_t> t = tokens_of(post(s.port, "/completion", b));
+        same = same && t == expect;
+        ++replies;
+        after = model_state(s.port, "b")["static_streamed_fraction"].get<double>();
+    }
+    fprintf(stderr, "    a's headroom %d MiB: b streamed %.1f%% and %.1f%% after %d replies\n", found,
+            100.0 * before, 100.0 * after, replies);
+    if (after > 0.0 || !same)
+        fprintf(stderr, "    share %.3f -> %.3f after %d replies (same: %d); a: %s\n%s\n", before, after,
+                replies, (int)same, model_state(s.port, "a").dump().c_str(), tail(s.output(), 30).c_str());
+    CHECK(same);
+    CHECK_EQ(after, 0.0);
+    CHECK(model_state(s.port, "a")["state"] != "active");
+    CHECK(model_state(s.port, "b")["state"] == "active");
+    CHECK_EQ(model_state(s.port, "b")["static_streamed_bytes"].get<int64_t>(), (int64_t)0);
+    CHECK(model_state(s.port, "b")["static_bytes"].get<int64_t>() > 0);
+    /* The same reply once more, now from the card. */
+    CHECK(tokens_of(post(s.port, "/completion", b)) == expect);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(s.output().find("promoted static weights into VRAM") != std::string::npos);
+}
+
+TEST(streamed_statics_are_promoted_into_vram_when_another_model_frees_the_card_on_libref) {
+    check_statics_are_promoted({ "--kernels", "libref", "--debug-accept-reference-kernels" });
+}
+
+TEST(streamed_statics_are_promoted_into_vram_when_another_model_frees_the_card_on_libavx) {
+#if defined(__x86_64__)
+    NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
+#else
+    SKIP("libavx is x86-64 only");
+#endif
+    check_statics_are_promoted({ "--kernels", "libavx" });
+}
+
+
 RAD_TEST_MAIN()

@@ -82,6 +82,7 @@ Mover::~Mover() {
     for (Move& m : moves_) if (m.ev) rad_event_destroy(m.ev);
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
+    for (StaticCopy& c : static_copies_) if (c.ev) rad_event_destroy(c.ev);
     if (gate_) rad_event_destroy(gate_);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
@@ -415,6 +416,30 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     moves_.assign((size_t)n_records, Move{});
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
 
+    /* ---- streamed statics that can come back to the card (promote_statics) ------------------
+     * Only on an elastic weights pool, which has fresh address space to back them at. */
+    static_order_.clear();
+    static_copies_.clear();
+    promoted_cost_ = remaining_cost_ = promoted_bytes_ = 0;
+    promote_after_ns_ = 0;
+    promote_ok_ = false;
+    if (elastic) {
+        for (int32_t u : static_keep_order(prog, plan)) {
+            const UnitState& us = unit_[(size_t)u];
+            if (us.tier != Tier::HostPinned || us.site != Site::DeviceZeroCopy || us.pool_slot < 0 ||
+                us.klass < 0)
+                continue;
+            static_order_.push_back(u);
+            remaining_cost_ += static_cost(us.bytes);
+        }
+        promote_ok_ = remaining_cost_ > 0;
+        if (promote_ok_) {
+            constexpr size_t kStaticCopies = 16;
+            static_copies_.assign(kStaticCopies, StaticCopy{});
+            for (StaticCopy& c : static_copies_) RAD_TRY(rad_event_create_local(&c.ev));
+        }
+    }
+
     /* ---- publish the initial addresses ------------------------------------------------------ */
     res_.init(prog);
     for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
@@ -444,6 +469,7 @@ void* Mover::unit_base(int32_t unit) const {
     if (unit < 0 || (size_t)unit >= unit_.size()) return nullptr;
     const UnitState& us = unit_[(size_t)unit];
     if (us.klass < 0) return nullptr;
+    if (us.vram) return us.vram;
     const ClassPools& cp = pools_[(size_t)us.klass];
     if (us.slab_slot >= 0 && (cp.is_flex(us.slab_slot) || cp.slab_base || cp.chunk_slots > 0))
         return cp.slot_ptr(us.slab_slot);
@@ -718,6 +744,92 @@ int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) c
     }
     if (largest) *largest = most;
     return total;
+}
+
+/* ---- promoting streamed statics (see mover.h) ---------------------------------------------- */
+int64_t Mover::static_cost(int64_t bytes) {
+    const int64_t g = std::max<int64_t>(VMem::granularity(), (int64_t)RAD_ALIGN_POOL);
+    return align_up(bytes + (int64_t)RAD_ALIGN_UNIT, g);
+}
+
+int Mover::promote_statics(int64_t cap) {
+    if (!promote_ok_) return RAD_OK;
+
+    /* Land the copies that finished: the bytes are in the new place, so the table may name it. The
+     * pool copy stays valid for every step issued before the table sync. */
+    for (StaticCopy& c : static_copies_) {
+        if (c.unit < 0) continue;
+        const int q = rad_event_query(c.ev);
+        if (q < 0) return RAD_E_DEVICE;
+        if (q == 0) continue;
+        UnitState& us = unit_[(size_t)c.unit];
+        --copying_[(size_t)c.unit];
+        us.vram = c.dst;
+        us.tier = Tier::VRAM;
+        us.site = Site::Device;
+        promoted_bytes_ += us.bytes;
+        ++stats_.static_promotions;
+        stats_.static_promoted_bytes += (uint64_t)us.bytes;
+        republish(c.unit);
+        c.unit = -1;
+    }
+
+    const uint64_t now = rad_mono_ns();
+    if (now < promote_after_ns_) return RAD_OK;
+    constexpr int64_t kBurstBytes = (int64_t)256 << 20;
+    int64_t burst = 0;
+    for (int32_t u : static_order_) {
+        UnitState& us = unit_[(size_t)u];
+        if (us.vram || us.tier != Tier::HostPinned || unit_in_flight(u)) continue;
+        const int64_t cost = static_cost(us.bytes);
+        if (promoted_cost_ + cost > cap) continue;       /* skipped: a smaller one may still fit */
+        if (burst >= kBurstBytes) break;
+        StaticCopy* rec = nullptr;
+        for (StaticCopy& c : static_copies_) if (c.unit < 0) { rec = &c; break; }
+        if (!rec) break;
+        /* The card must have the room now: a model that is starting, or a cache, may have taken
+         * what the planner counted (the grant is only a claim on free bytes). */
+        if (cfg_.grow_floor > 0) {
+            RadDeviceProps props{};
+            if (rad_dev_props(cfg_.device, &props) >= 0 && props.vram_free - cost < cfg_.grow_floor) {
+                promote_after_ns_ = now + 250000000ull;
+                break;
+            }
+        }
+        Pool& wp = budget_->weights();
+        const int64_t off = wp.va_arena(cost);
+        if (off < 0) {
+            RAD_WARN("mover: the weights pool's address arena is used up; no more static weights "
+                     "are promoted");
+            promote_ok_ = false;
+            break;
+        }
+        if (wp.commit(off, cost) < 0) {
+            promote_after_ns_ = now + 1000000000ull;
+            RAD_WARN("mover: the card would not back %s for a static weight unit; trying again in a "
+                     "second (%s)", humanb(cost).c_str(), rad_dev_last_error());
+            break;
+        }
+        char* const dst = (char*)wp.base() + off;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        const RadCopySeg seg{ (const char*)cp.pool_base + us.pool_slot * cp.stride, dst, us.bytes };
+        int rc = rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, mover_);
+        if (rc >= 0) rc = rad_event_record(rec->ev, mover_);
+        if (rc < 0) {
+            (void)rad_stream_sync(mover_);
+            (void)wp.decommit(off, cost);
+            return rc;
+        }
+        rec->unit = u;
+        rec->dst = dst;
+        rec->cost = cost;
+        ++copying_[(size_t)u];
+        promoted_cost_ += cost;
+        remaining_cost_ -= cost;
+        burst += cost;
+        stats_.h2d_bytes += (uint64_t)us.bytes;
+    }
+    return RAD_OK;
 }
 
 /* ---- a routed layer read from the container (see mover.h) ---------------------------------- */
@@ -2124,6 +2236,11 @@ std::string Mover::report() const {
                  "by a recall, %llu left past one with no free slot\n",
                  (unsigned long long)stats_.donated, (unsigned long long)stats_.relocated,
                  (unsigned long long)stats_.stranded);
+    if (stats_.static_promotions)
+        s += fmt("  static weights: %llu units promoted into VRAM (%.2f GiB); %.2f GiB still "
+                 "read from the pinned pool\n",
+                 (unsigned long long)stats_.static_promotions,
+                 (double)stats_.static_promoted_bytes * gib, (double)static_streamed_bytes() * gib);
     if (stats_.ssd_reads)
         s += fmt("  file tier: %llu demand reads (%.2f GiB), each a blocking pread in the middle "
                  "of a dispatch. Raise --host-pool-mib.\n",

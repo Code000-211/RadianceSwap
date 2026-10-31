@@ -6,7 +6,8 @@ in dem heute die Experts liegen, die nicht passen) und wird im Decode per Zero-C
 Prefill kopiert der Stager-Ring (`core/place/stager.h`) es vorab auf die Karte. Die Bytes sind
 dieselben, die Ausgabe ist bit-identisch. Das ist nach ADR 0002 nur ein Übergang: PCIe liefert
 ≈ 28 GB/s gegen 600–870 GB/s aus dem VRAM (`measure-static-streaming.md`), der Decode bricht um
-den gestreamten Anteil ein. Wer die Gewichte danach in den VRAM zurückholt, ist Ticket #19.
+den gestreamten Anteil ein. Wer die Gewichte danach in den VRAM zurückholt, ist Ticket #19 (Abschnitt
+„Zurück in den VRAM“ unten).
 
 Ohne Bedarf, also wenn die Statik neben dem Cache einer Sequenz passt, ändert sich nichts.
 
@@ -112,3 +113,67 @@ mehr für Experts hat: sie liegen alle im Pool, die Kosten sind also beides, nic
 Aktivierung bei vollem VRAM (Model `a` hält die Karten, `b` aktiviert sich): dicht 2,1–2,3 s
 Aktivierung, 2,2–2,6 s bis zur ersten Antwort; MoE 35,5–37,0 s, 36,2–37,7 s (Gewichte aus der
 Platte, `--ngram-placement disk`). `a` läuft danach unverändert weiter.
+
+## Zurück in den VRAM (#19)
+
+Gestreamte Statik ist nur eine Übergangslösung (ADR 0002). Sobald die Karte Platz hat, wandert sie in
+den VRAM: weil ein anderes Model deaktiviert wurde, ein elastischer Expert-Slab Seiten abgab (#35) oder
+ein Cache Platz hergab. Das Signal ist der **physisch freie VRAM der Karte**, nicht ein logisches
+Angebot: nur Bytes, die die Karte wirklich frei hat, werden vergeben.
+
+| Stelle | Änderung |
+|---|---|
+| `core/place/planner.*` | `static_keep_order(prog, plan)`: die Reihenfolge, in der `assign_static_stream` die Karte füllt (Drafter, modellweite Gewichte, Schichten in Ausführungsreihenfolge, Türme, Embedding), jetzt eine Funktion. Der Mover holt die gestreamten Units in derselben Reihenfolge zurück: das Sicherste zuerst. Kein zweiter Algorithmus, keine zweite Schlüsselliste. |
+| `core/place/mover.*` | `Mover::promote_statics(cap)`: kopiert je Aufruf einen Schub (bis 256 MiB) gestreamter statischer Units aus ihrem Pool-Slot in frischen VRAM und veröffentlicht die neue Adresse. Der Platz kommt aus dem Adressraum des elastischen Gewichte-Pools (`Pool::va_arena`, nie zweimal gemappt, `Pool::commit`; siehe `elastic-slab.md`, Aliasing!), die Kopie läuft als DMA-Liste (`RAD_COPY_YIELD`) auf dem Mover-Stream. Eine Unit, die nicht in `cap` passt, wird übersprungen, kleinere dahinter dürfen. Eine abgelehnte Commit-Anfrage oder weniger als `grow_floor` (96 MiB) frei lässt den Schub ausfallen und es wird später erneut versucht (250 ms bzw. 1 s). Die Pool-Kopie bleibt gehalten: jeder Schritt, der vor der Veröffentlichung ausgegeben wurde, liest weiter gültige Bytes, und die Veröffentlichung ist der normale Tabellenabgleich am Anfang des nächsten Schritts (`Ctx::sync_residency`, derselbe Weg wie beim Stager). Eine Unit mit laufender Kopie oder im VRAM stagt der Ring nicht mehr (`Mover::stageable`). |
+| `core/place/group_planner.*` | `StaticFacts` je Rang (was das Zurückholen aller noch gestreamten Units kostet, was schon gehalten wird, wie beschäftigt das Model ist), `update_free` (freie Bytes der Karte), `group_statics`: je Rang gehen die freien Bytes abzüglich der Zusagen, die noch nicht genutzt wurden (Statik und Experts), an das beschäftigteste Model zuerst, je höchstens bis zu dem, was es noch streamt (`RankBudget::statics_cap`). Eine Zusage bleibt reserviert, bis das Model sie hält: zwei Nehmende bekommen nie dieselben Bytes. Gehaltenes wird nie zurückverlangt. |
+| Vorrang vor Experts | Statik wird jeden Token gelesen, ein Expert nur, wenn er geroutet wird: die Statik-Zusagen kommen von den freien Bytes ab, bevor `group_gate` einem elastischen Model Wachstum erlaubt (`static_pending`). Eine Expert-Zusage, die schon gemacht und noch nicht gemappt ist, behält ihre Bytes. Die Reihenfolge unter mehreren Statik-Nehmern: Auslastung (`StaticFacts::heat`: 1 solange das Model läuft, abklingend im Leerlauf wie die Expert-Heat), dann Eintrittsreihenfolge. |
+| `core/engine.cpp` | `Engine::group_tick` (alle 100 ms, zwischen Steps und im Leerlauf, wenn die Rank-Threads geparkt sind): meldet freie Bytes und Statik-Zahlen, liest das Ziel und ruft `promote_statics`. Laufende Requests bleiben ungestört: die Adressen ändern sich nur an Step-Grenzen. |
+| `core/engine_bringup.cpp` | Ein Model in einer Gruppe, das Statik streamt, bekommt den elastischen Gewichte-Pool (8 TiB Adressraum, `weights_va_extra_`) auch ohne Experts. Ohne Manifest-Betrieb mit mehr als einem Model, ohne VMem oder unter `RADIANCE_ELASTIC_SLAB=off` bleibt alles wie in #18 (kein Zurückholen). |
+| Status | `/radiance/models` und `/metrics` zeigen den **aktuellen** Anteil (`static_streamed_*`): der GroupPlanner führt die Zahlen, die die Engine meldet (Summe über die Ränge), sonst gilt der Plan. Der Anteil fällt sichtbar auf 0. Der Mover-Report nennt `static weights: N units promoted into VRAM`, das Log je Schub `promoted static weights into VRAM; X of Y still read from the pinned host pool`. |
+
+Grenzen:
+
+- Was einmal im VRAM ist, bleibt dort bis zur Deaktivierung des Models. Wird später ein anderes Model
+  aktiviert, sieht es weniger freien VRAM; reicht der nicht, greift der Druckpfad (`pressure-deactivation.md`:
+  das am längsten idle Model wird deaktiviert) oder das neue Model streamt selbst. Ein Zurückgeben an ein
+  anderes Model (Demote der Statik) gibt es nicht.
+- Pro Rang wird unabhängig entschieden (die Statik ist rangweise ein Shard und kein Kernel hängt davon ab, wo
+  die Bytes eines Shards liegen); der Anteil in Status und Metriken ist die Summe.
+- Der Adressraum ist endlich (8 TiB je Rang, eine Unit je Adresse, nie wiederverwendet): ein Zurückholen aller
+  Units je Aktivierung braucht ein paar GiB davon.
+- `--deterministic` streamt nicht (#18) und holt deshalb auch nichts zurück.
+- Der Prefill-Ring bleibt in der Arena, wo er war; ohne gestreamte Units stagt er nichts mehr.
+
+### Tests (Host, `ROCR_VISIBLE_DEVICES=99`)
+
+- `place_test`: `static_keep_order` ist die Reihenfolge, in der der Planner die Karte füllt; die Statik
+  wird in Reihenfolge, in frischen Arena-Adressen, byte-genau und höchstens bis `cap` zurückgeholt (eine Unit, die
+  nicht passt, wartet), der Stager kopiert sie danach nicht mehr; eine Karte ohne Platz (weniger als `grow_floor`
+  frei) und ein einfacher (nicht elastischer) Pool holen nichts zurück.
+- `group_planner_test`: die freien Bytes gehen an das beschäftigteste Model zuerst und nie über das hinaus, was es
+  streamt; eine ungenutzte Zusage bleibt reserviert und nichts Gehaltenes wird zurückverlangt (kein Doppelverplanen);
+  Statik nimmt die freien Bytes vor einem Expert-Wachstum; ein Rang entscheidet für sich (TP=2).
+- `engine_e2e_test` (libref und libavx, `RADIANCE_HOST_VRAM_MIB`): ein Manifest mit `a` und `b` (dasselbe
+  `g31`); `a` lässt `b` Platz für einen Teil seiner Statik (der Headroom von `a` wird gesucht, nicht fest), `b`
+  streamt 65,9 %; `a` wird im Leerlauf deaktiviert und `b`s Anteil fällt auf 0, `static_streamed_bytes` 0; jede
+  Antwort von `b` davor, dabei (16 bzw. 43 Anfragen am Stück) und danach ist Token für Token die der Referenz (alles
+  auf der Karte, `b` allein).
+
+- `model_deactivation_test`: Status und Metriken folgen den Zahlen, die die Engine dem GroupPlanner meldet (der
+  gestreamte Anteil fällt auf 0), sonst gilt der Plan.
+
+## GPU-Messung (#19)
+
+Siehe `gpu-acceptance.md` §11. Qwen3.5-0.8B (dicht), 2× R9700, TP=2, `--seqs 8`: `b` streamt, `a` wird im
+Leerlauf deaktiviert, der Anteil fällt innerhalb von 1–2 s nach der Deaktivierung auf 0, die Ausgabe bleibt
+bit-identisch (Greedy, `gen.py`), und der Durchsatz erholt sich auf das Niveau ohne Streaming:
+
+| gestreamter Anteil von `b` | C1 tok/s | C8 tok/s | Prefill tok/s (TTFT ms) |
+|---|---|---|---|
+| 83,9 % (Obergrenze, `a` aktiv) | 32,1 | 252,8 | 33 400 (109) |
+| nach dem Zurückholen (0 %) | 331,7 | 2016,9 | 62 700 (59) |
+| 32,7 % | 108,7 | 771,9 | 49 400 (74) |
+| nach dem Zurückholen (0 %) | 330,2 | 2013,1 | 66 800 (55) |
+| 6,4 % | 301,5 | 1862,4 | 67 000 (55) |
+| nach dem Zurückholen (0 %) | 331,3 | 2017,6 | 66 500 (56) |
+| Referenz: ein Model, alles auf der Karte | 333,3 | 2053,3 | 70 000 (52) |

@@ -2520,7 +2520,8 @@ the pinned host pool at run time`; `--host-pool-mib` grows by what the pool lack
 MoE whose card has no room left gives all its experts to the pool too. Under `--deterministic` there is no stager,
 so a model that would stream refuses to start (`--deterministic: … has no prefill stager to copy them ahead`); give it
 more VRAM (`--gpu-headroom-mib`, a smaller `--max-model-len`, fewer active models) or drop the flag. This is a bridge:
-moving the weights back into VRAM as slots free up is #19.
+in manifest mode with more than one model the streamed weights move back into VRAM as soon as the card has room
+(see below).
 
 What it costs, Qwen3.5-0.8B (dense) and Flash-Next (MoE) on two R9700 at TP=2, `--max-num-seqs 8`, a 3.6k-token
 prompt (`swap/static-streaming.md`, `swap/gpu-acceptance.md` §10):
@@ -2541,6 +2542,23 @@ overlaps the copy with compute. For the MoE the figures also include that the ca
 statics stream. Activating a model next to one that holds the VRAM: 2.1–2.6 s (0.8B), 36–38 s (Flash-Next). The share
 is in `GET /radiance/models` (`static_bytes`, `static_streamed_bytes`, `static_streamed_fraction`) and in
 `/metrics` (`radiance:model_static_bytes`, `…_streamed_bytes`, `…_streamed_fraction`), for active models only.
+
+**Back into VRAM.** In manifest mode with more than one model, a model that streams static weights moves them into
+VRAM whenever its card has room again: another model was deactivated (idle timeout or VRAM pressure), a model's
+elastic expert slab gave pages back, or a cache did. Nothing to configure. Every 100 ms (between steps, and while
+idle) the model reports what it still streams and the card's free VRAM to the group planner; the planner grants
+free bytes to static weights before any expert may grow into them (a static weight is read on every token, an expert
+only when routed), the busiest model first, and no byte twice. The mover copies the granted units into fresh
+address space of the model's weights pool (one burst of up to 256 MiB per tick, in the order the planner would have
+kept them on the card: the draft head, the output head, layers in execution order, the embedding last) and
+publishes the new addresses at the next step boundary; running requests are not interrupted and the output
+stays bit-identical. The streamed share in `GET /radiance/models` and `/metrics` is the live one and falls to 0.
+On Qwen3.5-0.8B (two R9700, TP=2) a model streaming 84 % of its statics (C1 32 tok/s, C8 253 tok/s, prefill
+33 400 tok/s) is back at 332 tok/s, 2017 tok/s and 62 700 tok/s 1–2 s after the model that held the cards is
+deactivated (33 %: 109 → 330 tok/s C1; baseline with everything on the card 333 / 2053 / 70 000;
+`swap/gpu-acceptance.md` §11). Limits: what is in VRAM stays there until the model is deactivated (a model activated
+later sees less free VRAM and the pressure path applies); it needs the elastic weights pool, so not with
+`RADIANCE_ELASTIC_SLAB=off`, a single model, or `--deterministic`.
 
 The prototype measurement that decided the design, kept for the per-operation figures
 (`swap/measure-static-streaming.md`, prototype outside the engine):

@@ -30,6 +30,7 @@ Freigabe-Zahlen unten.
 | 8 | Durchsatz / TTFT | gemessen; zwei gleichzeitig aktive Models bremsten sich stark, nach Fix 2 auf rund die Hälfte statt ein Zehntel; TTFT-Aufteilung nur abgeleitet (keine Metrik) |
 | – | #13 Host-Budget mit großem Model | bestanden nach Fix 3; Host-RAM ist dabei der Engpass (siehe unten) |
 | – | Issue-Kriterien Sampling, MTP, Streaming, Abbruch, lange Prompts | bestanden |
+| 11 | Gestreamte Statik zurück in den VRAM (#19) | bestanden, siehe §11 |
 
 ## Gefundene Fehler und Fixes
 
@@ -399,3 +400,65 @@ denen `a` Experts im Slab hält und `b` streamt. Der Versuch (`a` = MoE mit 20 G
 scheiterte am Host-RAM: `a` allein belegt 138 GiB, die Pool-Erhöhung von `b` (+20 282 MiB je Rank) kam
 dazu, der Kernel beendete den Server (Exit 137, ohne Meldung, `host budget` warnte nicht). Dieselbe
 Grenze wie „Host-RAM ist die Grenze großer Models (#13)“ oben; nicht behoben.
+
+## 11 Gestreamte Statik zurück in den VRAM (#19)
+
+`scripts/swap-acceptance/static_streaming.py MODEL --seqs 8 --pct 25|50|100 --phases promote --idle-ms 30000`
+(Port 18080, GPUs exklusiv; `ref` muss vorher gelaufen sein). Design: `static-streaming.md`, Abschnitt
+„Zurück in den VRAM“. Dicht = Qwen3.5-0.8B (910 MiB Statik je Rang); `a` dasselbe Model (262144/64) hält die
+Karten und lässt `b` Platz für `pct` % der Statik (wie Phase `full`); `cache.idle_timeout_ms` 30 000.
+
+Ablauf der Phase: `b` aktiviert sich bei vollem VRAM und streamt, Greedy-Ausgabe (`gen.py`) gleich der
+Referenz; vier gleichzeitige `logprobs`-Anfragen 15 s lang (Last auf den gestreamten Gewichten); `bench.py`
+(C1, C8, Prefill 3,6k Token, je drei Wiederholungen) mit `a` aktiv, das ein winziger Request alle 7,5 s wach hält;
+dann bekommt `a` keine Requests mehr und `b` genau eine `logprobs`-Anfrage nach der anderen (Keep-alive und
+Genauigkeitsprobe: allein im Batch muss dasselbe Prompt zu jedem Zeitpunkt denselben Text geben); `a` läuft nach dem
+Timeout in die Deaktivierung, der Anteil von `b` wird jede Sekunde gelesen; danach wieder vier gleichzeitige
+`logprobs`-Anfragen, `gen.py` gegen die Referenz, `bench.py`.
+
+| Prüfpunkt | 83,9 % | 32,7 % | 6,4 % |
+|---|---|---|---|
+| `b` streamt, während `a` die Karten hält (Ausgabe = Referenz) | ja | ja | ja |
+| Anteil nach der Deaktivierung von `a` (`/radiance/models`, `/metrics`) | **0** (`static_streamed_bytes` 0) | **0** | **0** |
+| Sekunden von der Deaktivierung von `a` bis Anteil 0 | 2,0 | 1,0 | 1,0 |
+| VRAM je Karte, `a` und `b` aktiv → `b` allein, zurückgeholt | 31 831 → 1760 / 1789 MiB | 31 377 → 1720 / 1749 | 31 149 → 1698 / 1727 |
+| `gen.py` nach dem Zurückholen = Referenz, Text und Tokens | ja | ja | ja |
+| Anfragen während des Übergangs (eine nach der anderen, `logprobs`) | 135, 0 Fehler, 0 nicht endlich, alle Texte gleich | 198, 0, 0, gleich | 309, 0, 0, gleich |
+| vier gleichzeitige `logprobs`-Anfragen, streamend / zurückgeholt (je 15 s) | 60 / 516 Anfragen, 0 Fehler, 0 nicht endlich | 188 / 508, 0, 0 | 472 / 508, 0, 0 |
+| „no finite logit“ im Server-Log | 0 | 0 | 0 |
+
+Ohne Fehler und ohne nicht endliche Logits: das Zurückholen mappt nur frische Adressen und gibt keine
+frei (`Pool::va_arena`); anders als der Expert-Slab (#35) entmappt es nichts, das Aliasing-Problem der
+Wiederverwendung entsteht nicht. Mehrere gleichzeitige Anfragen liefern dieselbe Prompt gelegentlich anders
+(vier Threads, Batch-Zusammensetzung wechselt): 1–2 abweichende Antworten je 500 Anfragen, auf der Basis ohne
+Streaming 2 in 1028 (`--phases ctl`); die Probe auf Bit-Gleichheit ist deshalb die einzelne Anfrage und `gen.py`.
+
+Durchsatz (Median von drei; C8 = acht gleichzeitig; Prefill 3,6k Token; Referenz = ein Model, alles auf der
+Karte, Phase `ref`):
+
+| Anteil von `b` | Zustand | C1 tok/s | C8 tok/s | Prefill tok/s (TTFT ms) |
+|---|---|---|---|---|
+| – | Referenz (ein Model, kein Streaming) | 333,3 | 2053,3 | 70 000 (52) |
+| 83,9 % | streamt, `a` aktiv | 32,1 | 252,8 | 33 400 (109) |
+| 0 % | zurückgeholt, `a` deaktiviert | 331,7 | 2016,9 | 62 700 (59) |
+| 32,7 % | streamt, `a` aktiv | 108,7 | 771,9 | 49 400 (74) |
+| 0 % | zurückgeholt | 330,2 | 2013,1 | 66 800 (55) |
+| 6,4 % | streamt, `a` aktiv | 301,5 | 1862,4 | 67 000 (55) |
+| 0 % | zurückgeholt | 331,3 | 2017,6 | 66 500 (56) |
+| 0 % | Kontrolle: `b` streamt nichts, `a` aktiv (Manifest) | 302,5 | 1873,0 | 67 600 (56) |
+
+Der Decode erholt sich auf das Niveau ohne Streaming (99 % der Referenz bei C1, 98 % bei C8): 3,0× bei 33 %,
+10,3× bei 84 % (C1). Der Prefill erholt sich auf 89–95 % der Referenz (nach 84 %: 62 700 gegen 70 000, nach 33 %
+und 6 %: 66 500–66 800); der Rest der Lücke ist nicht aufgeklärt (die Kontrolle mit `a` aktiv liegt bei 67 600, der
+Streaming-Zustand selbst kostet ihn also nicht; die Lücke ist beim höchsten gestreamten Anteil am größten). Mit `a`
+aktiv kostet das Manifest allein rund 9 % im Decode (die Kontrolle: 302,5 / 1873 gegen 333 / 2053), das ist die
+Mehr-Model-Last aus §8 und kein Effekt des Zurückholens: nach der Deaktivierung von `a` ist sie weg.
+
+Beobachtungen:
+
+- Die Zeit bis Anteil 0 ist die Länge der H2D-Kopie je Rang (0,9 GiB; DMA-Liste mit `RAD_COPY_YIELD`) plus
+  ein `group_tick` (100 ms); der Anteil fällt in 1–2 s nach der Deaktivierung. Der Schub je Tick ist 256 MiB.
+- Schon beim Start nutzt `b` die wenigen MiB, die über dem Boden frei sind (10 MiB je Rang bei 32,7 %): das Log
+  zeigt den ersten `promoted static weights`-Schub vor der Deaktivierung von `a`.
+- Nicht gemessen: ein MoE (Host-RAM ~170 GiB; zwei MoE führen zum OOM-Kill, Issue #46) und der Fall „Expert-Slab
+  gibt Seiten ab“ auf der Karte (Host-Test: `group_planner_test`, kein Doppelverplanen mit den Expert-Zusagen).

@@ -11,7 +11,10 @@ Klasse wird in Stücken von etwa 128 MiB (`MoverConfig::slab_chunk_bytes`, `Move
 Arena-Adressraum gemappt und stückweise wieder entmappt; ein Stück, das zurückgegeben wurde, bekommt beim
 nächsten Wachstum eine neue Adresse (`ClassPools::slot_ptr`). Eine Adresse wird nie ein zweites Mal gemappt. Ohne Manifest, mit einem Model, ohne
 Experts oder ohne VMem bleibt der Pool eine einzige `rad_dev_alloc` wie bisher (Einzel-Engine
-unverändert, siehe Messung in `gpu-acceptance.md`).
+unverändert, siehe Messung in `gpu-acceptance.md`). Ausnahme (#19): ein Model in einer Gruppe, das statische
+Gewichte streamt, bekommt den elastischen Pool auch ohne Experts; die Arena nimmt dort die Statik auf, die
+`Mover::promote_statics` in den VRAM zurückholt (`static-streaming.md`), ebenfalls auf frischen Adressen und ohne je
+etwas zu entmappen.
 
 - **Mover** (`Mover::set_resident_cap`, `resize`): Ein Shrink gibt die obersten Slots logisch ab (wie #15)
   und `shrink_backing` entmappt das oberste Stück (`Pool::decommit`), sobald kein Slot darin mehr belegt oder

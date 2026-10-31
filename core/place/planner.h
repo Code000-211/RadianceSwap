@@ -359,6 +359,13 @@ private:
     void note_unfit(Plan* p, const MoveUnit& mu, const char* why) const;
 };
 
+/* The static (non-expert, not preplaced) units in the order the card keeps them: what a step reads
+ * most surely first (the drafter's weights, model-level weights read every token, layers in
+ * execution order, per-request towers, a token embedding last). Planner::assign_static_stream
+ * fills the card in it; the mover promotes the streamed ones in it (Mover::promote_statics),
+ * the surest first. Every key comes from the model. */
+std::vector<int32_t> static_keep_order(const Program& prog, const Plan& p);
+
 /* Bytes of a declared weight as this rank holds them: the stored size once the layout pass has
  * run, the logical size before it. Shared so the mover and the report agree on budgets. */
 int64_t weight_bytes(const WeightInfo& w);
