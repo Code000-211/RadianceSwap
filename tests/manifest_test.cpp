@@ -185,4 +185,11 @@ TEST(manifest_load_reads_a_file_and_names_a_missing_one) {
     CHECK_EQ(st, (int)RAD_E_INVAL);
     CHECK(log.find("cannot read") != std::string::npos);
 }
+TEST(a_models_headroom_leaves_its_share_and_never_less_than_the_default) {
+    /* 20000 MiB free, 8000 for this model: leave 12000 unclaimed. */
+    CHECK_EQ(manifest_headroom_mib(20000, 8000, 96), (int64_t)12000);
+    /* A share the card cannot spare keeps the model's own headroom. */
+    CHECK_EQ(manifest_headroom_mib(5000, 8000, 96), (int64_t)96);
+}
+
 RAD_TEST_MAIN()

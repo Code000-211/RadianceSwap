@@ -198,6 +198,10 @@ bool read_model(const json& m, size_t n, const Config& base, int group_tp, Model
 
 }  /* namespace */
 
+int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_mib) {
+    return std::max(base_mib, free_mib - share_mib);
+}
+
 int manifest_parse(const std::string& text, const Config& base, ModelRegistry* out) {
     *out = ModelRegistry();
     const json j = json::parse(text, nullptr, false);

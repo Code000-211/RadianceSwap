@@ -23,6 +23,7 @@
 #include "server/server.h"
 #include "server/sink.h"
 #include "server/liveview.h"
+#include "server/model_router.h"
 #include "text/tokenizer.h"
 #include "util/stallwatch.h"
 #include "runtime/collective_sequencer.h"
@@ -2114,7 +2115,7 @@ int Engine::stop_execution(StopMode mode) {
     return RAD_OK;
 }
 
-int Engine::serve(std::unique_ptr<StallWatch> watch) {
+int Engine::serve(std::unique_ptr<StallWatch> watch, server::ModelRouter* router) {
     startup_watch_ = std::move(watch);
     const int st = start_execution();
     if (st < 0) {
@@ -2126,7 +2127,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.kld() ? run_kld() : run_server(router);
     startup_watch_.reset();
 
     stop_execution(StopMode::Immediate);
@@ -2406,7 +2407,7 @@ std::string request_overrides(const Config& c) {
  * no chat template: a guessed template is a guessed prompt format. With one, the template's
  * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
  * IChatTemplate::apply. */
-int Engine::run_server() {
+int Engine::run_server(server::ModelRouter* router) {
     /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
      * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
      * hold the session table the sessions view reads. */
@@ -2672,7 +2673,7 @@ int Engine::run_server() {
     o.model_path = cfg_.model;
     if (registry_)
         for (const ModelRecord& m : registry_->models()) {
-            if (m.is_default) continue;
+            if (m.id == cfg_.served_model_name) continue;
             server::ModelCard card;
             card.id = m.id;
             card.root = m.path;
@@ -3316,7 +3317,10 @@ int Engine::run_server() {
     }
     print_startup_report(RAD_OK);
     const char* const keyed = o.api_key.empty() ? "" : "; a bearer key is required";
-    if (embedding_)
+    if (router)
+        RAD_INFO("model '%s' is attached to the shared listener on http://%s:%d%s",
+                 o.model_id.c_str(), o.host.c_str(), o.port, keyed);
+    else if (embedding_)
         RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501%s)",
                  o.host.c_str(), o.port, keyed);
     else if (aud_gen_)
@@ -3356,7 +3360,7 @@ int Engine::run_server() {
         while (watching.load(std::memory_order_relaxed)) {
             if (g_signalled.load(std::memory_order_relaxed)) {
                 RAD_INFO("stopping: draining in-flight requests");
-                srv.stop();
+                if (router) router->stop(); else srv.stop();
                 return;
             }
             /* The step loop died and its requests were already failed (Engine::fail_loop); stop
@@ -3364,7 +3368,7 @@ int Engine::run_server() {
             if (loop_status_.load(std::memory_order_acquire) < 0) {
                 RAD_ERR("stopping: the step loop failed with %s",
                         rad_strerror(loop_status_.load(std::memory_order_acquire)));
-                srv.stop();
+                if (router) router->stop(); else srv.stop();
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -3375,7 +3379,9 @@ int Engine::run_server() {
     startup_watch_.reset();
     srv.note_ready(startup_begin_ns_);
     active_server_ = &srv;
-    const int rc = srv.run();
+    /* With a router the process listens, not this server: it is attached under the model's id and
+     * held there until the router has stopped (ModelRouter::serve_model). */
+    const int rc = router ? router->serve_model(cfg_.served_model_name, &srv) : srv.run();
     active_server_ = nullptr;
     /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
      * run() has already torn the transport down. Joining costs up to one sleep interval. */

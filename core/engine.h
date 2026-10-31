@@ -49,7 +49,7 @@ namespace rad {
 class Kld;
 class ModelRegistry;   /* manifest.h */
 class StallWatch;
-namespace server { class Server; }
+namespace server { class Server; class ModelRouter; }
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
@@ -78,8 +78,10 @@ public:
      * in-process, so it exits non-zero rather than serving from a wedged queue (spec §17).
      * `watch`, when given, is the startup's stall watch (util/stallwatch.h): held until the
      * server listens, or the KL mode starts scoring, so the stretch from start() to there
-     * reports where it waits like start() itself. */
-    int serve(std::unique_ptr<StallWatch> watch);
+     * reports where it waits like start() itself.
+     * `router`, in manifest mode, is the process's listener: this engine's Server is attached to
+     * it instead of binding a port, and serve() returns when the router stops. */
+    int serve(std::unique_ptr<StallWatch> watch, server::ModelRouter* router = nullptr);
 
     /* Start execution (step loop, rank threads, scheduler).
      * Returns negative on error. Idempotent if already started. */
@@ -107,7 +109,7 @@ public:
     const Config&  config()  const { return cfg_; }
 
     /* Manifest mode: the process's registry (manifest.h), whose other models /v1/models lists.
-     * Only the model this Engine was built from is started. */
+     * Each model is its own Engine; this one runs the model it was built from. */
     void set_registry(const ModelRegistry* r) { registry_ = r; }
 
     /* The startup report (core/diag/diag.h): every option with its value and source, the
@@ -611,7 +613,7 @@ private:
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
-    int  run_server();
+    int  run_server(server::ModelRouter* router);
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
      * block per rank, holding a step's tokens of that rank's logits columns. */

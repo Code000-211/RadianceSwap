@@ -92,7 +92,8 @@ struct ServerOptions {
      * (the served name says nothing about the file behind it). Empty omits the field. */
     std::string model_path;
     /* Manifest mode: the other configured models, listed by /v1/models beside the served one
-     * (id and root only; only model_id is started and answered). Empty without a manifest. */
+     * (id and root only; each is answered by its own Server, behind a ModelRouter). Empty without
+     * a manifest. */
     std::vector<ModelCard> other_models;
     std::string host = "0.0.0.0";
     int         port = 8000;
@@ -195,6 +196,8 @@ public:
     FrontendLease frontend() const { return frontend_; }
 
     int  run();            /* binds, serves, blocks. RAD_OK or negative. */
+    /* What run() hands the transport; a ModelRouter listens with the default model's. */
+    TransportOptions transport_options() const;
 
     /* Renders the deployment's template defaults once at startup, since a default the template
      * refuses would 400 every request relying on it. A one-message chat is parsed as a request

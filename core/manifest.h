@@ -10,8 +10,9 @@
  *
  * JSON because nlohmann/json is already a dependency and the project parses no YAML. A model's
  * `engine` is an argv-style list handed to config_parse over the command line's own options, so
- * there is one option parser and one validation. The gpu_group and cache sections are only parsed
- * and checked here; nothing reads the cache values yet.
+ * there is one option parser and one validation. Every model is started at once as its own Engine on
+ * the same GPU group (main.cpp, server/model_router.h). The gpu_group and cache sections are only
+ * parsed and checked here; nothing reads the cache values yet.
  *
  * The registry belongs to the process (ADR 0001), not to an Engine. */
 #pragma once
@@ -62,6 +63,13 @@ public:
 private:
     std::vector<ModelRecord> models_;
 };
+
+/* The fixed VRAM share of a model started while its siblings are not (ticket #8). The budget
+ * resolver (mem/vram_budget.h) claims everything free above --gpu-headroom-mib, so a model's share
+ * is set by the headroom it is started with: the card's free memory now less the share, never
+ * below `base_mib` (the --gpu-headroom-mib the model would have had). The last model starts with
+ * its own headroom and takes what the others left. */
+int64_t manifest_headroom_mib(int64_t free_mib, int64_t share_mib, int64_t base_mib);
 
 /* Fills `out` from the manifest, each model's Config layered on `base` (the parsed command line).
  * RAD_E_INVAL, after logging what is wrong, for a malformed or inconsistent manifest. */
