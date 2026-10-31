@@ -1567,22 +1567,50 @@ void Engine::loan_tick(bool idle) {
 void Engine::group_tick(bool idle) {
     if (!group_ || ranks_.empty()) return;
     const uint64_t now = rad_mono_ns();
+    if (!idle || group_busy_ns_ == 0) group_busy_ns_ = now;
     if (now - group_last_ns_ < 100000000ull) return;    /* 100 ms */
     group_last_ns_ = now;
 
     const std::string& id = cfg_.served_model_name;
     constexpr uint32_t kGroupReportEvery = 10;           /* heat summaries once a second */
+    /* A heat engine decays once a step, so an engine nobody asks anymore keeps the heat of its last
+     * step and holds its bytes against a model that is busy. What an idle engine reports cools with
+     * the time since its last step instead (half-life 10 s). */
+    constexpr double kHeatHalfLifeS = 10.0;
+    const float cool = idle ? (float)std::exp2(-(double)(now - group_busy_ns_) * 1e-9 / kHeatHalfLifeS)
+                            : 1.0f;
     if (group_ticks_++ % kGroupReportEvery == 0)
         for (size_t i = 0; i < ranks_.size(); ++i)
             if (ranks_[i]->heat.enabled())
-                group_->update(id, i, group_heat_bins(ranks_[i]->plan, ranks_[i]->heat));
+                group_->update(id, i, group_heat_bins(ranks_[i]->plan, ranks_[i]->heat, cool));
+
+    /* What each elastic slab holds, so the planner grants its bytes to another model only once this
+     * one's pages went back to the card (GroupPlanner::update_held). */
+    group_held_.resize(ranks_.size(), -1);
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const Rank& r = *ranks_[i];
+        if (!r.mover.slab_elastic()) continue;
+        int64_t held = 0;
+        for (int32_t k : group_classes(r.plan)) held += r.mover.slab_held_bytes((size_t)k);
+        if (held == group_held_[i]) continue;
+        group_held_[i] = held;
+        group_->update_held(id, i, held);
+    }
 
     const GroupBudget want = group_->target(id);
     for (size_t i = 0; i < ranks_.size() && i < want.size(); ++i) {
         Rank& r = *ranks_[i];
         if (!r.heat.enabled()) continue;
-        for (int32_t k : group_classes(r.plan))
-            (void)r.mover.set_resident_cap((size_t)k, group_resident_cap(want[i], k));
+        for (int32_t k : group_classes(r.plan)) {
+            const int64_t cap = group_resident_cap(want[i], k);
+            /* Between two limits, a change under 1% of the cap (at least 4 units) is noise of the
+             * heat buckets: moving it would cost link copies for nothing. */
+            int64_t& last = group_cap_.try_emplace({ i, k }, -2).first->second;
+            if (cap >= 0 && last >= 0 && std::llabs(cap - last) < std::max<int64_t>(4, last / 100))
+                continue;
+            last = cap;
+            (void)r.mover.set_resident_cap((size_t)k, cap);
+        }
         if (!idle || !r.mover.resizing() || rad_dev_set(r.device) < 0) continue;
         const int st = r.mover.idle_tick(&r.heat);
         if (st < 0) RAD_WARN("rank %d: resizing the expert slab while idle: %s", r.index,

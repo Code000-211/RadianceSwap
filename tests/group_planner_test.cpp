@@ -11,6 +11,8 @@
  *   Shares      no model is granted or owed more than it offered (its fixed VRAM share)
  *   Cold start  a model activated later joins the running group; leaving frees its room
  *   KV claims   a partition that needs room takes it from the experts of any model (ticket #17)
+ *   Elastic     a model with an elastic slab may hold more than its offer, and is granted the
+ *               bytes only after the giver physically released them (ticket #35)
  *
  * Pure host arithmetic: no device, no model.
  */
@@ -494,3 +496,134 @@ TEST(a_claim_is_decided_per_rank_at_world_size_2) {
 }
 
 RAD_TEST_MAIN()
+
+/* ---- elastic slabs (ticket #35): the pool is the sum of the offers, growth waits for the giver. */
+namespace {
+GroupFacts elastic_rank(int64_t offer_mib, std::vector<HeatBin> bins) {
+    GroupFacts f = one_rank(offer_mib, std::move(bins));
+    f[0].elastic = true;
+    return f;
+}
+int64_t mib(const GroupBudget& b) { return b[0].bytes / MiB; }
+}  /* namespace */
+
+TEST(an_elastic_model_may_be_allocated_more_than_its_offer) {
+    /* Two 20 MiB offers make a 40 MiB pool. A is hot, B cold: A is allocated past its own offer. */
+    std::vector<GroupMember> m = { { "a", elastic_rank(20, { bin(30, 2, 9.0f) }) },
+                                   { "b", elastic_rank(20, { bin(30, 2, 0.0f) }) } };
+    const auto got = group_allocate({ 40 * MiB }, m, 0, 0.5);
+    CHECK_EQ(mib(got[0]), 30);      /* B keeps 0.5 * (40 / 2) = 10 */
+    CHECK_EQ(mib(got[1]), 10);
+    /* The same facts without the elastic flag stay at the offer, as before. */
+    m[0].facts[0].elastic = m[1].facts[0].elastic = false;
+    const auto old = group_allocate({ 40 * MiB }, m, 0, 0.5);
+    CHECK_EQ(mib(old[0]), 20);
+}
+
+TEST(a_taker_is_granted_bytes_only_after_the_giver_released_them) {
+    GroupPlanner g(0);
+    const GroupBudget a0 = g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    CHECK_EQ(mib(a0), 20);           /* a starts with its offer */
+    const GroupBudget b0 = g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    CHECK_EQ(mib(b0), 20);           /* and so does b: both hold their offers physically */
+
+    /* a turns hot, b cold. The allocation says 30 / 10, but the bytes are b's until it lets go. */
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    CHECK_EQ(mib(g.target("b")), 10);   /* the giver is told at once */
+    CHECK_EQ(mib(g.target("a")), 20);   /* the taker waits: nothing is free */
+
+    /* b's slab gives back 6 MiB of pages: a is granted exactly those. */
+    g.update_held("b", 0, 14 * MiB);
+    CHECK_EQ(mib(g.target("b")), 10);
+    CHECK_EQ(mib(g.target("a")), 26);
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    /* a takes the pages: nothing changes, the grant was a's own. */
+    g.update_held("a", 0, 30 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    CHECK_EQ(mib(g.target("b")), 10);
+}
+
+TEST(two_takers_are_never_granted_the_same_free_bytes) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("c", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    /* c is hot and wants most of the 60 MiB pool; a and b are cold at 20 MiB each. */
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    g.update("c", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    CHECK_EQ(mib(g.target("c")), 20);
+    /* a gives 6, b gives 4: c may take 10, not the 10 + 10 it would if each grant were counted
+     * against the other's release. */
+    g.update_held("a", 0, 14 * MiB);
+    g.update_held("b", 0, 16 * MiB);
+    CHECK_EQ(mib(g.target("c")), 30);
+    /* Two takers want the same free bytes: c and d are equally hot, a cold. */
+    GroupPlanner h(0);
+    (void)h.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)h.join("c", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)h.join("d", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    h.update("c", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update("d", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update_held("a", 0, 18 * MiB);       /* 2 MiB free, and both want more */
+    CHECK_EQ(mib(h.target("c")) + mib(h.target("d")), 42);    /* the 2 shared, not 2 + 2 */
+    CHECK_EQ(mib(h.target("c")), 21);
+    /* What the three hold or are granted never exceeds the pool. */
+    CHECK(18 + mib(h.target("c")) + mib(h.target("d")) <= 60);
+}
+
+TEST(a_grant_not_yet_used_stays_reserved_while_it_is_wanted) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update_held("a", 0, 10 * MiB);       /* a released 10 */
+    CHECK_EQ(mib(g.target("b")), 30);
+    /* b has not committed the pages yet; a heat update must not hand the same 10 to anyone. */
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 8.0f) } });
+    CHECK_EQ(mib(g.target("b")), 30);
+    g.update_held("b", 0, 24 * MiB);
+    CHECK_EQ(mib(g.target("b")), 30);
+}
+
+TEST(an_elastic_model_that_leaves_gives_the_pool_back_to_the_others_offers) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    g.leave("b");
+    /* A sole engine is back to its offer: what b's share held is b's again when it returns. */
+    CHECK_EQ(mib(g.target("a")), 20);
+    CHECK(g.target("a")[0].class_units.empty());
+}
+
+TEST(elastic_targets_are_gated_per_rank_at_world_size_2) {
+    GroupPlanner g(0);
+    GroupFacts fa(2), fb(2);
+    for (size_t r = 0; r < 2; ++r) {
+        fa[r] = elastic_rank(20, { bin(30, 2, 0.0f) })[0];
+        fb[r] = elastic_rank(20, { bin(30, 2, 0.0f) })[0];
+    }
+    (void)g.join("a", fa);
+    (void)g.join("b", fb);
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) }, { bin(30, 2, 9.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) }, { bin(30, 2, 0.0f) } });
+    g.update_held("b", 1, 12 * MiB);       /* only rank 1 has released */
+    const GroupBudget a = g.target("a");
+    CHECK_EQ(a[0].bytes, 20 * MiB);
+    CHECK_EQ(a[1].bytes, 28 * MiB);
+}
+
+TEST(a_sole_elastic_engine_is_unchanged) {
+    GroupPlanner g(1);
+    const GroupBudget b = g.join("only", elastic_rank(12, { bin(30, 2, 5.0f) }));
+    CHECK_EQ(mib(b), 12);
+    CHECK(b[0].class_units.empty());
+    g.update_held("only", 0, 4 * MiB);
+    CHECK_EQ(mib(g.target("only")), 12);
+}

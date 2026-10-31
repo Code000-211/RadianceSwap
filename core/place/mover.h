@@ -641,16 +641,47 @@ public:
      *   - A raised cap regrows the segment, and fill() promotes the hottest pooled units into
      *     the slots that came back.
      *
-     * The slots are released logically only: the slab is one reservation in the weights pool
-     * (a bump allocator over a plain device allocation, mem/pools.h), so no byte goes back to the
-     * card and another engine's pool cannot use it. A cap above what the plan placed regrows no
-     * further than the slots that exist. */
+     * Whether the bytes go back to the card depends on the weights pool. On a plain pool the slots
+     * are released logically only (the slab is one reservation in a bump allocator over one
+     * device allocation, mem/pools.h). On an elastic pool (Pools::configure with address space
+     * past the budget: manifest mode with several models, docs/swap/elastic-slab.md) the slab
+     * is backed by pages the mover commits and decommits:
+     *
+     *   - Once nothing holds a slot above the shrunk segment, the pages behind those slots are
+     *     decommitted (Pool::decommit), a burst a call. The card has the bytes free as soon as
+     *     the call returns; backed_slots() and slab_held_bytes() report it.
+     *   - A cap above what the plan placed regrows the segment past its original size, into
+     *     address space reserved at init (n_grow slots a class): the mover commits the pages in
+     *     bursts, raises the segment's target only over backed slots, and fill() promotes into
+     *     them. A refused commit (the card has no room) stops the growth where it stands and
+     *     backs off for a second.
+     *   - No table is edited here beyond the ordinary moves; they publish at the next step's table
+     *     sync, and a slot is decommitted only after the retire/quarantine that freed it. */
     /* `units` < 0 lifts the cap. A class with no movable resident, or no spare pool slot, is kept
      * at the size it can reach. Cheap: bookkeeping only, applied by the next balance(). */
     int     set_resident_cap(size_t klass, int64_t units);
-    /* Slab slots of the class's budgeted segment currently given back. */
+    /* Slab slots of the class's budgeted segment currently given back (below the plan's size). */
     int64_t released_slots(size_t klass) const {
-        return klass < pools_.size() ? pools_[klass].n_fixed - pools_[klass].slab.target(0) : 0;
+        return klass < pools_.size()
+            ? std::max<int64_t>(pools_[klass].n_base - pools_[klass].slab.target(0), 0) : 0;
+    }
+    /* Whether the slab sits on elastic pages (the weights pool was made with address space to
+     * grow into). Without, backed_slots() is the plan's size for good. */
+    bool    slab_elastic() const {
+        for (const ClassPools& cp : pools_) if (cp.slab_off >= 0) return true;
+        return false;
+    }
+    /* Slots of the class's budgeted range with pages behind them, working slots included. */
+    int64_t backed_slots(size_t klass) const {
+        return klass < pools_.size() ? pools_[klass].backed : 0;
+    }
+    /* Bytes of resident-capable slab with pages behind them in the class: backed slots less the
+     * working reserve. This is what the class costs the card as expert slots, and what the group
+     * planner is told the model holds (GroupPlanner::update_held). */
+    int64_t slab_held_bytes(size_t klass) const {
+        if (klass >= pools_.size()) return 0;
+        const ClassPools& cp = pools_[klass];
+        return std::max<int64_t>(cp.backed - cp.n_work, 0) * cp.stride;
     }
     /* Whether a cap has moved the segment and not yet settled (balance() has work). */
     bool    resizing() const {
@@ -794,7 +825,15 @@ private:
         void*    pool_base = nullptr;
         void*    pool_dev = nullptr;   /* the pinned pool as the device addresses it */
         int64_t  stride = 0;
-        int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
+        int64_t  n_fixed = 0;          /* slots in the budgeted range, growth slots included; the flex ones start here */
+        /* The plan's slots (resident, shadow, staging): backed at init. The `n_fixed - n_base` after
+         * them exist as address space only and are backed when a cap grows the segment into them
+         * (elastic weights pool, `slab_off` >= 0). */
+        int64_t  n_base = 0;
+        int64_t  slab_off = -1;        /* the slab's offset in the weights pool; -1: not elastic */
+        int64_t  backed = 0;           /* slots [0, backed) have pages behind them (elastic only) */
+        int64_t  want_target = 0;      /* the segment size the cap asks for; slab.target(0) follows it */
+        uint64_t grow_after_ns = 0;    /* a refused commit backs growth off until then */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */
         int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
                                         * of them and balance() drops lent units to rebuild them
@@ -911,7 +950,8 @@ private:
     int  retire(HeatEngine* heat);
     int  record_gate();
     void republish(int32_t unit);
-    void* reserve(const char* what, int64_t bytes, int kind);
+    void* reserve(const char* what, int64_t bytes, int kind, int64_t va_tail = 0,
+                  int64_t* off_out = nullptr);
     int  free_move_record() const;
     int  start_stage(int32_t unit, int64_t slab_slot);
     void release_slot(int32_t unit);
@@ -936,6 +976,15 @@ private:
     int  fill(size_t klass, int64_t room, HeatEngine* heat, int64_t lo = -1);
     /* Carries out the class's resident cap; true when it moved something. */
     bool resize(size_t klass, HeatEngine* heat);
+    /* The pages behind the elastic slab, a burst a call (resize()). */
+    bool grow_backing(ClassPools& cp);
+    bool shrink_backing(ClassPools& cp);
+    /* The pool offset where slot `s`'s pages begin, and the end of the backing for `slots` slots: the
+     * tail pad is kept so a wide read at the last slot's end stays on backed pages. */
+    int64_t slot_off(const ClassPools& cp, int64_t s) const { return cp.slab_off + s * cp.stride; }
+    int64_t backing_end(const ClassPools& cp, int64_t slots) const {
+        return slot_off(cp, slots) + (int64_t)RAD_ALIGN_UNIT;
+    }
     void count_flex();
 };
 

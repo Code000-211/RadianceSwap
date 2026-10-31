@@ -45,6 +45,16 @@
  * What a shrink frees is logical: the engine's slab stays one reservation in its own weights
  * pool, so the bytes are not another engine's to use (Mover::set_resident_cap).
  *
+ * ---- elastic slabs (ticket #35, docs/swap/elastic-slab.md) -------------------------------------
+ *
+ * A model whose slab is elastic (RankFacts::elastic) is not held to its offer. The group's expert
+ * pool is the sum of the members' offers, and the heat-based allocation above may give a hot model
+ * more than its offer, a cold one less (never below its minimum). The target is what the model is
+ * entitled to; what it may take now is group_gate's: a growth is paid out of the bytes no member
+ * holds, so it waits for the giver's pages to go back to the card. The model reports what it holds
+ * (update_held) and the planner recomputes; the first tick after a physical release raises the
+ * taker's target, and its mover commits the pages (Mover::set_resident_cap).
+ *
  * ---- KV partitions (ticket #17, docs/swap/kv-lend.md) -------------------------------------------
  *
  * A model's KV partition is its pool's carve. When a partition needs more than it has, it claims
@@ -93,6 +103,13 @@ struct KvPartition {
 /* One rank's side of an engine's report. */
 struct RankFacts {
     int64_t offer = 0;   /* expert bytes the single-engine resolver gave it: VramBudget::experts */
+    /* The model's slab is elastic (ticket #35, docs/swap/elastic-slab.md): it can hold more than
+     * its offer when another model has physically given bytes up, and it gives bytes back to the
+     * card on a shrink. Such a model may be allocated up to the group's whole expert pool, but is
+     * granted growth only out of bytes that no member holds (group_gate). Otherwise the offer is
+     * its ceiling, as before. */
+    bool    elastic = false;
+    int64_t held = 0;    /* expert bytes its slab has pages behind now (Mover::slab_held_bytes) */
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
     KvPartition kv;
@@ -120,9 +137,24 @@ std::vector<GroupBudget> group_allocate(const std::vector<int64_t>& pool,
                                         const std::vector<GroupMember>& members, int pending,
                                         double min_share);
 
+/* What a model may take now, from what the heat-based allocation wants for it. An elastic
+ * model's growth is paid only out of the pool's free bytes, those that no member holds: a
+ * member that must give bytes up (its want is below what it holds) is told so at once, and the
+ * bytes a taker is granted exist only after the giver's pages went back to the card (the giver
+ * reports a lower `held`). A grant not yet used (`prev`, the budgets handed out last time) stays
+ * reserved while the member still wants it, so two takers are never granted the same free bytes.
+ * `want` is group_allocate's result; `prev` is by member (empty: none given yet). Non-elastic
+ * members pass through. VRAM is never planned twice: per rank, the sum of what elastic members
+ * hold or are granted does not exceed the pool. */
+std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
+                                    const std::vector<GroupMember>& members,
+                                    std::vector<GroupBudget> want,
+                                    const std::vector<GroupBudget>& prev);
+
 /* A running engine's expert plane as bins: its conditional units with a slab slot, by class and by
- * the power of two their heat is near. Without a heat engine running every unit has heat 0. */
-std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat);
+ * the power of two their heat is near. Without a heat engine running every unit has heat 0. `scale`
+ * multiplies every heat first (an idle engine's cooling, Engine::group_tick). */
+std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat, float scale = 1.0f);
 
 /* The slab classes of a plan whose units the group planner counts (group_heat_bins). */
 std::vector<int32_t> group_classes(const Plan& plan);
@@ -152,6 +184,10 @@ public:
     void update(const std::string& id, const std::vector<std::vector<HeatBin>>& bins);
     /* The same for one rank, which reports on its own: the other ranks' bins stay as they were. */
     void update(const std::string& id, size_t rank, std::vector<HeatBin> bins);
+    /* How many expert bytes a rank's slab has pages behind now; targets are recomputed. This is the
+     * giver's receipt: only after it falls can a taker be granted the bytes. Ignored for an
+     * unknown id or rank. */
+    void update_held(const std::string& id, size_t rank, int64_t held);
     /* A rank's KV partition; targets are recomputed. Ignored for an unknown id or rank. */
     void update_kv(const std::string& id, size_t rank, const KvPartition& kv);
     /* What the engine is entitled to now (empty when it is not registered). */
@@ -167,6 +203,7 @@ private:
     std::vector<GroupBudget> granted_;   /* by member: what each started with */
     std::vector<GroupBudget> targets_;   /* by member */
     std::vector<int64_t>     pool_;      /* by rank */
+    std::map<std::string, GroupBudget> given_;   /* by member: the last targets handed out (group_gate) */
 };
 
 }  /* namespace rad */

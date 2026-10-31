@@ -1894,13 +1894,26 @@ int Engine::plan() {
          * it does not grant stay unclaimed, free for the next model's budget. Only the weights
          * pool shrinks (the cache and the staging region keep their share), and by whole MiB
          * rounded down, so the pool never falls under what was granted. */
+        weights_va_extra_.assign(facts.size(), 0);
         if (group_) {
+            /* Several models share the group's expert pool: this one's slab sits on elastic pages
+             * (docs/swap/elastic-slab.md), with address space for the whole plane to grow into.
+             * A lone model keeps the plain allocation: nothing could use what it would give back. */
+            const bool shared = registry_ && registry_->models().size() > 1;
+            if (shared && rad_dev_set(ranks_[0]->device) >= 0 && !VMem::supported())
+                RAD_INFO("group planner: this device layer has no virtual memory management, so "
+                         "the expert slab is not elastic: '%s' keeps its share's bytes",
+                         cfg_.served_model_name.c_str());
             GroupFacts gf(facts.size());
             for (size_t i = 0; i < facts.size(); ++i) {
                 const int64_t unit = wfs[i].expert_unit_max;
                 const int64_t n = unit > 0 ? facts[i].experts / unit : 0;
                 gf[i].offer = vb.experts;
                 gf[i].floor = facts[i].expert_floor;
+                if (shared && n > 0 && VMem::supported()) {
+                    gf[i].elastic = true;
+                    weights_va_extra_[i] = facts[i].experts + facts[i].experts / 4 + ((int64_t)64 << 20);
+                }
                 /* No heat yet: one cold bin for the plane. */
                 if (n > 0) gf[i].bins.push_back({ 0.0f, n, n * unit, n * unit, 0 });
             }
@@ -2032,7 +2045,8 @@ int Engine::plan() {
 
         /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
          * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
-        int s = r->pools.configure(rc, props.vram_bytes);
+        int s = r->pools.configure(rc, props.vram_bytes, nullptr, nullptr,
+                                   ri < weights_va_extra_.size() ? weights_va_extra_[ri] : 0);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
             report_pool_refusal(r->index, r->device, r->pools, rc);

@@ -1569,6 +1569,8 @@ struct Loan {
 
 struct LoanRig {
     HeatFixture hf;
+    /* Declared before the mover: the slab lives in its weights pool. */
+    Pools       pools;
     HeatEngine  h;
     Mover       m;
     Loan        loan;
@@ -1583,8 +1585,12 @@ struct LoanRig {
      * not lend at all (the resident-cap tests run on a bare slab). */
     bool        shrinkable = false;
     bool        lend = true;
+    /* The mover takes its slab from a weights pool made elastic with this much address space past
+     * its budget (ticket #35); 0: the mover allocates directly, as the other rigs do. */
+    int64_t     va_extra = 0;
+    bool        use_pools = false;      /* a plain (not elastic) weights pool, as an engine without a group */
 
-    explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
+    explicit LoanRig(int n_expert = 8, int64_t vram_mib = 7) : hf(n_expert, vram_mib) {}
 
     int build() {
         HeatParams hp;
@@ -1592,7 +1598,13 @@ struct LoanRig {
         MoverConfig mc;
         mc.turnover_slots = turnover;
         mc.shrinkable = shrinkable;
-        RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
+        if (va_extra > 0 || use_pools) {
+            Config c = hf.cfg;
+            c.vram_kv_mib = 16;
+            c.gpu_headroom_mib = 1;
+            RAD_TRY(pools.configure(c, 0, &rad_malloc_allocator(), &rad_malloc_allocator(), va_extra));
+        }
+        RAD_TRY(m.init(hf.f.prog, hf.plan, mc, va_extra > 0 || use_pools ? &pools : nullptr));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
         if (lend) RAD_TRY(m.lend_from(Mover::kLendKV, loan.strips));
@@ -2322,6 +2334,120 @@ TEST(a_mover_not_made_shrinkable_ignores_a_resident_cap) {
     CHECK_EQ(r.m.stats().demotions, (uint64_t)0);
     /* A class that does not exist is refused. */
     CHECK_EQ(r.m.set_resident_cap(99, 1), RAD_E_INVAL);
+}
+
+/* ---- the elastic slab (ticket #35): the pages behind the slab follow the cap. A fake device layer
+ * is the host backend's VMem (mmap): reserve, commit and decommit are real calls there, and the
+ * pool reports what is backed. */
+namespace {
+int64_t backed_bytes(LoanRig& r) { return r.pools.weights().committed(); }
+}  /* namespace */
+
+/* A cap below the resident set returns the pages of the top slots to the card once nothing holds
+ * them; a cap above the plan commits new pages and fills them with the hottest pooled units. Every
+ * unit's bytes stay where its table entry says throughout. */
+TEST(an_elastic_slab_gives_pages_back_on_a_shrink_and_backs_new_ones_on_a_regrow_past_the_plan) {
+    if (!VMem::supported()) return;
+    LoanRig r(64, 40);
+    r.shrinkable = true;
+    r.lend = false;
+    r.va_extra = 128 * MiB;
+    CHECK_OK(r.build());
+    CHECK(r.m.slab_elastic());
+    const size_t cls = expert_class(r);
+    const std::vector<int32_t> res = resident_units(r);
+    const int64_t before = (int64_t)res.size();
+    REQUIRE(before >= 20);
+    CHECK_OK(stamp_units(r, false, nullptr));
+    const int64_t plan_backed = backed_bytes(r);
+    const int64_t plan_slots = r.m.backed_slots(cls);
+    const int64_t stride = r.hf.plan.classes[cls].stride;
+    CHECK_EQ(r.m.slab_held_bytes(cls), (plan_slots - r.hf.plan.classes[cls].n_shadow -
+                                         r.hf.plan.classes[cls].n_stage) * stride);
+
+    /* Shrink by 12 slots (12 MiB): at least 8 MiB of whole granules go back, the slab's high end. */
+    CHECK_OK(r.m.set_resident_cap(cls, before - 12));
+    CHECK_OK(settle(r, 8));
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 12);
+    CHECK(backed_bytes(r) <= plan_backed - 8 * MiB);
+    CHECK(r.m.backed_slots(cls) <= plan_slots - 12);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+    const int64_t shrunk = backed_bytes(r);
+
+    /* Back to the plan: the pages return. */
+    CHECK_OK(r.m.set_resident_cap(cls, before));
+    CHECK_OK(settle(r, 16));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+    CHECK(backed_bytes(r) > shrunk);
+
+    /* Past the plan: 10 pooled units take slots in address space that was reserved and not backed. */
+    CHECK_OK(r.m.set_resident_cap(cls, before + 10));
+    CHECK_OK(settle(r, 16));
+    CHECK_EQ((int64_t)resident_units(r).size(), before + 10);
+    CHECK(backed_bytes(r) >= plan_backed + 8 * MiB);
+    CHECK_EQ(r.m.released_slots(cls), (int64_t)0);
+    CHECK(r.m.backed_slots(cls) >= plan_slots + 10);
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* The giver's receipt: held bytes fall only after the pages went back. */
+    const int64_t grown_held = r.m.slab_held_bytes(cls);
+    CHECK_OK(r.m.set_resident_cap(cls, before - 4));
+    CHECK_OK(settle(r, 16));
+    CHECK(r.m.slab_held_bytes(cls) < grown_held);
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 4);
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    /* Lifting the cap returns to the plan's size and settles. */
+    CHECK_OK(r.m.set_resident_cap(cls, -1));
+    CHECK_OK(settle(r, 16));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+    CHECK_EQ(r.m.backed_slots(cls), plan_slots);
+    CHECK(!r.m.resizing());
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* The slab grows only into the address space the pool reserved: a cap past that clamps. */
+TEST(an_elastic_slab_grows_no_further_than_the_address_space_it_was_given) {
+    if (!VMem::supported()) return;
+    LoanRig r(64, 40);
+    r.shrinkable = true;
+    r.lend = false;
+    r.va_extra = 6 * MiB;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    CHECK_OK(r.m.set_resident_cap(cls, before + 100));
+    CHECK_OK(settle(r, 16));
+    const int64_t now = (int64_t)resident_units(r).size();
+    CHECK(now > before);
+    CHECK(now <= before + 6);
+}
+
+/* Without a group (a plain weights pool) the cap stays bookkeeping: nothing is backed or given
+ * back, and the pool reports its whole budget as before. */
+TEST(a_plain_weights_pool_keeps_every_page_whatever_the_cap) {
+    LoanRig r(64, 40);
+    r.shrinkable = true;
+    r.lend = false;
+    r.use_pools = true;
+    CHECK_OK(r.build());
+    CHECK(!r.pools.weights().elastic());
+    CHECK(!r.m.slab_elastic());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    const int64_t slots = r.m.backed_slots(cls);
+    CHECK_OK(r.m.set_resident_cap(cls, before - 12));
+    CHECK_OK(settle(r, 8));
+    CHECK_EQ((int64_t)resident_units(r).size(), before - 12);
+    CHECK_EQ(r.m.backed_slots(cls), slots);
+    CHECK_OK(r.m.set_resident_cap(cls, before + 12));       /* past the plan: no further */
+    CHECK_OK(settle(r, 8));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
 }
 
 /* The same placement sequence gives the same placement: two movers fed the same heat and the same

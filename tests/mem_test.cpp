@@ -248,6 +248,55 @@ TEST(pool_reservation_never_falls_through) {
     CHECK_EQ(p.kv().used(), 512ll << 10);
 }
 
+/* An elastic weights pool (ticket #35) has address space past its budget for slab tails. A tail is
+ * not charged to the budget, so the budget check stays what it was for everything reserved after
+ * it, and a pool without virtual memory management or without the extra refuses tails. */
+TEST(a_growing_reservation_charges_only_its_backed_part_to_the_budget) {
+    if (!VMem::supported()) return;
+    Config c = small_config();
+    Pools p;
+    const int64_t MiB = 1 << 20;
+    CHECK_OK(p.configure(c, 0, nullptr, nullptr, 8 * MiB));
+    Pool& w = p.weights();
+    CHECK(w.elastic());
+    const int64_t budget = w.bytes();
+    CHECK_EQ(w.va_bytes(), budget + 8 * MiB);
+    CHECK_EQ(w.va_spare(), 8 * MiB);
+    CHECK_EQ(w.committed(), 0ll);
+
+    int64_t off = -1;
+    void* a = w.reserve_growing("slab", 256 << 10, 6 * MiB, RAD_ALIGN_UNIT, &off);
+    REQUIRE(a != nullptr);
+    CHECK_EQ(off, 0ll);
+    CHECK_EQ(w.used(), 256ll << 10);                  /* the tail is not budget */
+    CHECK_EQ(w.avail(), budget - (256ll << 10));
+    CHECK_EQ(w.va_spare(), 2 * MiB);
+    /* What follows sits past the tail, at an address no kernel of the slab can reach. */
+    int64_t off2 = -1;
+    void* b = w.reserve("static", 128 << 10, RAD_ALIGN_UNIT, &off2);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(off2, (256ll << 10) + 6 * MiB);
+    CHECK_EQ(w.used(), (256ll << 10) + (128ll << 10));
+    /* Backing is the caller's: only what it commits costs the card. */
+    CHECK_OK(w.commit(0, 256 << 10));
+    CHECK(w.committed() > 0 && w.committed() <= 2 * MiB);
+    CHECK_OK(w.commit(256 << 10, 3 * MiB));
+    CHECK_OK(w.decommit(256 << 10, 3 * MiB));
+    /* A tail beyond the address space left is refused, and the pool stays as it was. */
+    CHECK(w.reserve_growing("more", 4 << 10, 4 * MiB, RAD_ALIGN_UNIT) == nullptr);
+    CHECK_EQ(w.va_spare(), 2 * MiB);
+    /* Budget overrun is still a shortfall by name. */
+    CHECK(w.reserve("too big", budget, RAD_ALIGN_UNIT) == nullptr);
+    CHECK(!w.ok());
+
+    /* A plain pool takes no tails. */
+    Pools plain;
+    CHECK_OK(configure_pools(plain, c));
+    CHECK(!plain.weights().elastic());
+    CHECK(plain.weights().reserve_growing("slab", 4 << 10, 4 << 10, RAD_ALIGN_UNIT) == nullptr);
+    CHECK_EQ(plain.weights().va_bytes(), plain.weights().bytes());
+}
+
 /* A refused backing allocation is reported as a refusal, with the allocator's reason, not as
  * "0 B available", which would read as a measurement of the card. */
 TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {

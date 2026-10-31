@@ -101,12 +101,24 @@ Mover::~Mover() {
 
 /* The one place the mover asks for memory. Device and pinned memory come out of the resolved
  * budgets (spec §6); the direct allocation is for the placement test, which runs without a Pools
- * (init() warns). */
-void* Mover::reserve(const char* what, int64_t bytes, int kind) {
+ * (init() warns). `va_tail` is address space after the reservation for a slab that may grow
+ * (elastic weights pool); the reservation itself is backed here, the tail by resize(). */
+void* Mover::reserve(const char* what, int64_t bytes, int kind, int64_t va_tail, int64_t* off_out) {
     if (bytes <= 0) return nullptr;
     if (budget_) {
         Pool& p = kind == RAD_MEM_DEVICE ? budget_->weights() : budget_->host_pinned();
-        return p.reserve(what, bytes, RAD_ALIGN_UNIT);
+        int64_t off = 0;
+        void* const q = p.reserve_growing(what, bytes, va_tail, RAD_ALIGN_UNIT, &off);
+        if (q && kind == RAD_MEM_DEVICE && p.elastic()) {
+            const int rc = p.commit(off, bytes);
+            if (rc < 0) {
+                RAD_ERR("mover: the card would not back %s of '%s': %s", humanb(bytes).c_str(),
+                        what, rad_dev_last_error());
+                return nullptr;
+            }
+        }
+        if (off_out) *off_out = off;
+        return q;
     }
     owns_memory_ = true;
     return rad_dev_alloc(bytes, kind);
@@ -179,6 +191,24 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         }
     }
 
+    /* ---- room for the slab to grow ------------------------------------------------------
+     * On an elastic weights pool (a model in a group) each class gets address space after its
+     * slab for as many more slots as it has pooled units, so a cap above the plan can take bytes
+     * another model gave up. Scaled down together if the pool reserved less address space than
+     * that (Pools::configure); backed only when a cap grows into it. */
+    const bool elastic = budget_ && budget_->weights().elastic() && cfg.shrinkable && plan.dynamic;
+    std::vector<int64_t> n_grow(plan.classes.size(), 0);
+    if (elastic) {
+        int64_t want = 0;
+        for (size_t c = 0; c < plan.classes.size(); ++c)
+            if (n_movable[c] > 0) want += n_pool[c] * plan.classes[c].stride;
+        const int64_t room = budget_->weights().va_spare() -
+                             (int64_t)RAD_ALIGN_UNIT * ((int64_t)plan.classes.size() + 8);
+        for (size_t c = 0; c < plan.classes.size() && want > 0 && room > 0; ++c)
+            if (n_movable[c] > 0)
+                n_grow[c] = want <= room ? n_pool[c] : (int64_t)((__int128)n_pool[c] * room / want);
+    }
+
     /* ---- allocate ------------------------------------------------------------------------- */
     int64_t total_shadow = 0, total_turn = 0, total_slab = 0, total_pool = 0;
     for (size_t c = 0; c < plan.classes.size(); ++c) {
@@ -193,12 +223,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          * nothing reads. */
         const int64_t slab_slots = n_slab[c] + shadow + sc.n_stage;
         /* Flex slots are added later by lend_from(), once the lender's memory is carved. */
-        cp.n_fixed = slab_slots;
+        cp.n_base = slab_slots;
+        cp.want_target = slab_slots;
+        cp.backed = slab_slots;
+        cp.n_fixed = slab_slots + (slab_slots > 0 ? n_grow[c] : 0);
         cp.n_work = shadow + sc.n_stage;
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
         total_turn += cp.n_turn;
-        cp.slab.init(slab_slots, sc.stride);
+        cp.slab.init(slab_slots, sc.stride, cp.n_fixed);
         cp.n_pool0 = n_pool[c];
         cp.n_resident0 = n_resident[c];
         cp.n_movable0 = n_movable[c];
@@ -208,8 +241,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             /* Tail padding: a kernel assembling a packed code window from a wide read may read a
              * few bytes past the last slot; without padding that runs off the allocation and
              * faults the card. */
+            int64_t slab_off = 0;
             cp.slab_base = reserve(sc.name.c_str(), slab_slots * sc.stride + RAD_ALIGN_UNIT,
-                                   RAD_MEM_DEVICE);
+                                   RAD_MEM_DEVICE, (cp.n_fixed - slab_slots) * sc.stride,
+                                   &slab_off);
+            if (elastic) cp.slab_off = slab_off;
             if (!cp.slab_base) {
                 RAD_ERR("mover: no VRAM for the '%s' slab: %lld slots of %s",
                         sc.name.c_str(), (long long)slab_slots, humanb(sc.stride).c_str());
@@ -1499,15 +1535,69 @@ int Mover::set_resident_cap(size_t klass, int64_t units) {
     ClassPools& cp = pools_[klass];
     if (cp.n_movable0 == 0) return RAD_OK;
     /* A segment keeps the working slots, the residents that cannot move, and no fewer slots than
-     * the spare pool capacity can host the rest of. */
+     * the spare pool capacity can host the rest of. It grows past the plan's size only into the
+     * address space init reserved (n_fixed - n_base slots, elastic weights pool). */
     const int64_t spare = cp.pool.capacity() - cp.n_pool0;
-    const int64_t least = std::max(cp.n_work + cp.n_resident0 - cp.n_movable0, cp.n_fixed - spare);
-    const int64_t t = units < 0 ? cp.n_fixed : std::clamp(units + cp.n_work, least, cp.n_fixed);
-    if (t == cp.slab.target(0)) return RAD_OK;
-    cp.slab.set_target(0, t);
-    cp.pool.set_target(cp.n_pool0 + (cp.n_fixed - t));
+    const int64_t least = std::max(cp.n_work + cp.n_resident0 - cp.n_movable0, cp.n_base - spare);
+    const int64_t t = units < 0 ? cp.n_base : std::clamp(units + cp.n_work, least, cp.n_fixed);
+    if (t == cp.want_target) return RAD_OK;
+    cp.want_target = t;
     cp.resized = true;
+    /* A shrink is bookkeeping and takes effect now, and so does a growth into slots whose pages
+     * are still there (every slot, on a plain pool); a growth past them waits for resize() to
+     * back the pages before the segment covers them. */
+    if (t <= cp.backed) cp.slab.set_target(0, t);
+    cp.pool.set_target(cp.n_pool0 + std::max<int64_t>(cp.n_base - t, 0));
     return RAD_OK;
+}
+
+/* The pages behind a growing elastic slab, one burst a call (a commit costs the driver tens of
+ * microseconds a granule, and a step must not stall behind a whole regrow). The segment covers
+ * a slot only once its pages exist. A refused commit keeps what mapped and backs off. */
+bool Mover::grow_backing(ClassPools& cp) {
+    const int64_t have = cp.slab.target(0);
+    if (cp.want_target <= have || rad_mono_ns() < cp.grow_after_ns) return false;
+    constexpr int64_t kBurstBytes = (int64_t)128 << 20;
+    const int64_t to = std::min(cp.want_target,
+                                std::max(cp.backed, have) + std::max<int64_t>(kBurstBytes / cp.stride, 1));
+    if (to > cp.backed) {
+        Pool& wp = budget_->weights();
+        const int64_t from = backing_end(cp, cp.backed);
+        const int rc = wp.commit(from, (to - cp.backed) * cp.stride);
+        if (rc < 0) {
+            /* What mapped before the refusal is untracked by `backed`: give it back. */
+            (void)wp.decommit(from, (to - cp.backed) * cp.stride);
+            cp.grow_after_ns = rad_mono_ns() + 1000000000ull;
+            RAD_WARN("mover: the card would not back %lld more slab slots of %s; the cap stays at "
+                     "%lld slots for a second (%s)", (long long)(to - cp.backed),
+                     humanb(cp.stride).c_str(), (long long)have, rad_dev_last_error());
+            return false;
+        }
+        cp.backed = to;
+    }
+    const int64_t t = std::min(cp.backed, cp.want_target);
+    if (t <= have) return false;
+    cp.slab.set_target(0, t);
+    return true;
+}
+
+/* Gives the card the pages above the highest slot anything holds or the segment covers. A slot
+ * is free only after the retire/quarantine that released it, so no kernel reads these pages and no
+ * copy writes them. */
+bool Mover::shrink_backing(ClassPools& cp) {
+    const int64_t need = std::max(cp.slab.target(0), cp.slab.top_held(0) + 1);
+    if (cp.backed <= need) return false;
+    constexpr int64_t kBurstBytes = (int64_t)256 << 20;
+    const int64_t to = std::max(need, cp.backed - std::max<int64_t>(kBurstBytes / cp.stride, 1));
+    Pool& wp = budget_->weights();
+    /* The tail pad moves down with the end: the last slot's wide read stays on backed pages. */
+    if (wp.decommit(backing_end(cp, to), (cp.backed - to) * cp.stride) < 0) {
+        RAD_WARN("mover: giving back slab slots %lld..%lld failed: %s", (long long)to,
+                 (long long)cp.backed, rad_dev_last_error());
+        return false;
+    }
+    cp.backed = to;
+    return true;
 }
 
 /* One step of the resident cap, from the units' own state rather than the slot counts, so a swap
@@ -1519,6 +1609,7 @@ int Mover::set_resident_cap(size_t klass, int64_t units) {
 bool Mover::resize(size_t c, HeatEngine* heat) {
     constexpr int64_t kBurst = 16;
     ClassPools& cp = pools_[c];
+    bool moved = cp.slab_off >= 0 && grow_backing(cp);
     const int64_t cap = cp.slab.target(0) - cp.n_work;
     int64_t resident = 0;
     std::vector<int32_t> stranded;
@@ -1541,7 +1632,6 @@ bool Mover::resize(size_t c, HeatEngine* heat) {
         if (m.kind == Move::Kind::Promote) ++resident;
     }
     const int64_t excess = resident - cap;
-    bool moved = false;
 
     /* Stranded units go down into free slots beyond the working reserve. */
     int64_t spare = cp.slab.n_free_below(cp.n_fixed) - cp.n_work;
@@ -1566,9 +1656,11 @@ bool Mover::resize(size_t c, HeatEngine* heat) {
     } else if (excess < 0) {
         const int64_t room = std::min(-excess, spare);
         if (room > 0 && fill(c, room, heat, 0) >= 0) moved = true;
-    } else if (stranded.empty() && cp.slab.target(0) == cp.n_fixed) {
+    } else if (stranded.empty() && cp.slab.target(0) == cp.n_base && cp.want_target == cp.n_base &&
+               cp.backed == cp.n_base) {
         cp.resized = false;     /* regrown and settled: the class is as the plan placed it */
     }
+    if (cp.slab_off >= 0 && shrink_backing(cp)) moved = true;
     return moved;
 }
 
