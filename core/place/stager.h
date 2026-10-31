@@ -74,6 +74,17 @@
  * begin_pass, which the run phase calls before updating the weight tables. A draft pass in
  * between reads none of the trunk's layers and leaves them.
  *
+ * ---- static weights (RAM-Streaming, ticket #18) ------------------------------------------------
+ *
+ * A layer is staged as a whole: when the card had no room for a layer's static weights, the planner
+ * leaves them in the pinned pool at the same site (Planner::assign_static_stream), and the layer's
+ * static units join its expert units here. Decode reads them in place, a few GEMVs a step whose
+ * bytes cross the link once either way; a prefill chunk would read each weight across the link
+ * inside a GEMM that reuses it hundreds of times, 8-64x slower (docs/swap/measure-static-streaming.md),
+ * so it goes through the ring like pooled experts. The ring's size comes out of the streamed
+ * statics (vram_budget.h). A model-level weight (the output head) has no layer and is read in
+ * place: a prefill computes it for the last rows only.
+ *
  * ---- trunk only --------------------------------------------------------------------------------
  *
  * A draft head's routed layer is not staged. The head runs in its own passes; over a prefill chunk

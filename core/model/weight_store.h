@@ -61,6 +61,11 @@ struct WeightLoadReport {
     int64_t mapped_bytes = 0;          /* read in place from the container's mapping (page cache) */
     int64_t source_read_bytes = 0;     /* checkpoint or container bytes the loader read */
     int64_t disk_read_bytes = -1;      /* /proc/self/io read_bytes over the load; -1: unreadable */
+    /* RAM-Streaming (ticket #18), from the placement plan summed over ranks: the static
+     * (non-expert) weight bytes, and those of them read from the pinned host pool at run time
+     * because the card had no room. Their ratio is the model's streamed share. */
+    int64_t static_bytes = 0;
+    int64_t static_streamed_bytes = 0;
     double  seconds = 0;
 };
 

@@ -641,6 +641,16 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
         }
         m["warm_activations"] = c.loads[1];
         m["cold_activations"] = c.loads[0];
+        /* RAM-Streaming: the share of the static weights this model reads from the pinned host
+         * pool (ticket #18). Only while it is active: a deactivated model has no plan. */
+        if (c.has_load && std::string(state) == "active") {
+            m["static_bytes"] = c.last_load.static_bytes;
+            m["static_streamed_bytes"] = c.last_load.static_streamed_bytes;
+            m["static_streamed_fraction"] =
+                c.last_load.static_bytes > 0
+                    ? (double)c.last_load.static_streamed_bytes / (double)c.last_load.static_bytes
+                    : 0.0;
+        }
         if (c.has_load)
             m["last_weight_load"] = { { "kind", c.last_load.warm ? "warm" : "cold" },
                                       { "bytes", c.last_load.bytes },
@@ -747,6 +757,20 @@ std::string ModelRouter::metrics_text() const {
     o += "# HELP radiance:model_prepared_bytes Host-RAM bytes of the model's prepared weights\n"
          "# TYPE radiance:model_prepared_bytes gauge\n";
     for (const auto& [id, c] : cold_) line("radiance:model_prepared_bytes", id, "", (double)c.prepared_bytes);
+    o += "# HELP radiance:model_static_bytes Static (non-expert) weight bytes of an active model\n"
+         "# TYPE radiance:model_static_bytes gauge\n"
+         "# HELP radiance:model_static_streamed_bytes Of those, the bytes read from the pinned host pool because the card had no room\n"
+         "# TYPE radiance:model_static_streamed_bytes gauge\n"
+         "# HELP radiance:model_static_streamed_fraction The streamed share of the static weights (0 to 1)\n"
+         "# TYPE radiance:model_static_streamed_fraction gauge\n";
+    for (const auto& [id, c] : cold_) {
+        if (!c.has_load || std::string(state_locked(id, c)) != "active") continue;
+        line("radiance:model_static_bytes", id, "", (double)c.last_load.static_bytes);
+        line("radiance:model_static_streamed_bytes", id, "", (double)c.last_load.static_streamed_bytes);
+        line("radiance:model_static_streamed_fraction", id, "",
+             c.last_load.static_bytes > 0
+                 ? (double)c.last_load.static_streamed_bytes / (double)c.last_load.static_bytes : 0.0);
+    }
     static const char* const kinds[2] = { "cold", "warm" };
     o += "# HELP radiance:model_weight_loads_total Weight loads, warm (from the prepared store) or cold\n"
          "# TYPE radiance:model_weight_loads_total counter\n"

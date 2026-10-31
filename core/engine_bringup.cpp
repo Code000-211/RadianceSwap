@@ -1736,7 +1736,10 @@ int Engine::plan() {
             /* The staging region is sized only where the arena lends its top: without smaller
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
-            if (!r->arena_levels.empty() && !cfg_.deterministic) f.expert_layer_max = wf.expert_layer_max;
+            if (!r->arena_levels.empty() && !cfg_.deterministic) {
+                f.expert_layer_max = wf.expert_layer_max;
+                f.static_layer_max = wf.static_layer_max;
+            }
             /* A throwaway manager: plan_groups is configure()'s pure-arithmetic half and touches no
              * memory, and the real pool does not exist yet. */
             KVManager probe;
@@ -1883,6 +1886,38 @@ int Engine::plan() {
         if (cfg_.tower_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i)
                 facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
+        /* Static weights that do not fit beside one sequence of cache stream from the pinned host
+         * pool (vram_budget.h), so the pool must hold them, and with no card room left for any
+         * expert, every expert too. The pool grows by what it lacks before the split, as for the
+         * drafter above; the planner places within it. */
+        {
+            VramBudget trial;
+            if (vram_budget_trial(cfg_, facts, &trial) == RAD_OK && trial.statics_streamed > 0) {
+                const int64_t MiB = (int64_t)1 << 20;
+                int64_t experts = 0, unit = 0;
+                for (const WeightFootprint& wf : wfs) {
+                    experts = std::max(experts, wf.experts);
+                    unit = std::max(unit, wf.static_unit_max);
+                }
+                int64_t pool = cfg_.host_pool_mib * MiB, reserve = 0;
+                if (cfg_.weights_disk_tier)
+                    for (const WeightFootprint& wf : wfs)
+                        reserve = std::max(reserve, file_stage_reserve(wf.layer_unit_max, wf.routed));
+                pool -= reserve;
+                /* Plus a unit of first-fit slack, and each pool class's alignment. */
+                const int64_t want = trial.statics_streamed + experts + unit + 8 * MiB;
+                const int64_t add = want > pool ? align_up(want - pool, MiB) / MiB : 0;
+                if (add > 0) {
+                    cfg_.host_pool_mib += add;
+                    claim_host((int64_t)cfg_.tp * add * host_MiB);
+                    RAD_INFO("placement: %s of the static weights do not fit the card beside one "
+                             "sequence of cache and stream from the pinned host pool; "
+                             "--host-pool-mib grows by %lld to hold them%s",
+                             humanb(trial.statics_streamed).c_str(), (long long)add,
+                             experts > 0 ? " and the experts the card has no room for" : "");
+                }
+            }
+        }
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -3419,7 +3454,16 @@ int Engine::load_weights() {
     const int64_t io1 = proc_io_read_bytes();
     rep.disk_read_bytes = io0 >= 0 && io1 >= 0 ? io1 - io0 : -1;
     rep.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count();
+    for (auto& r : ranks_) {
+        rep.static_bytes += r->plan.static_bytes;
+        rep.static_streamed_bytes += r->plan.static_streamed_bytes;
+    }
     weight_load_ = rep;
+    if (rep.static_streamed_bytes > 0)
+        RAD_INFO("load: %s of the %s of static weights (%.1f%%) are read from the pinned host pool "
+                 "at run time: the card had no room for them", humanb(rep.static_streamed_bytes).c_str(),
+                 humanb(rep.static_bytes).c_str(),
+                 100.0 * (double)rep.static_streamed_bytes / (double)rep.static_bytes);
     RAD_INFO("load: %s activation: %lld weights, %s (%s from the prepared store), %s read from the "
              "source, %s read from disk by the process, %.2f s%s",
              rep.warm ? "warm" : "cold", (long long)rep.weights, humanb(rep.bytes).c_str(),

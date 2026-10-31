@@ -60,6 +60,7 @@ const char* strategy_name(Strategy s) {
         case Strategy::LayerOffload: return "layer_offload";
         case Strategy::ExpertTiered: return "expert_tiered";
         case Strategy::Auto:         return "auto";
+        case Strategy::StaticStream: return "static_stream";
     }
     return "?";
 }
@@ -215,7 +216,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     }
 
     for (U& mu : units) mu.mapped = mapped_unit(mu.mapped, container && mu.direct, host_backend);
-    std::map<int32_t, int64_t> layer_experts;
+    std::map<int32_t, int64_t> layer_experts, layer_statics;
     std::set<int64_t> expert_strides;
     bool ngram_host = true;
     for (const U& mu : units) if (mu.ngram && !mu.host) ngram_host = false;
@@ -251,7 +252,11 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
                 out->draft_unit_max = std::max(out->draft_unit_max, b);
             }
         }
-        else                     out->statics += b;
+        else {
+            out->statics += b;
+            if (mu.layer >= 0) layer_statics[mu.layer] += b;
+            out->static_unit_max = std::max(out->static_unit_max, b);
+        }
         if (mu.layer >= 0 && !mu.mapped) out->layer_unit_max = std::max(out->layer_unit_max, b);
         if (mu.expert >= 0 && mu.layer >= 0) out->routed = true;
     }
@@ -261,6 +266,8 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
                              RAD_ALIGN_UNIT;
     for (const auto& le : layer_experts)
         out->expert_layer_max = std::max(out->expert_layer_max, le.second);
+    for (const auto& ls : layer_statics)
+        out->static_layer_max = std::max(out->static_layer_max, ls.second);
     out->ngram_host = out->ngram > 0 && ngram_host;
     out->n_units = (int64_t)units.size();
 }
@@ -576,6 +583,19 @@ struct HostFall {
         }
         return false;
     }
+
+    /* A static unit the card has no room for (Planner::assign_static_stream): in the pinned pool,
+     * read over the link in place at decode and copied ahead through the prefill ring
+     * (place/stager.h). No slab slot, so it costs the card nothing; no host site and no file
+     * tier, since the streamed unit is the one a device kernel reads. */
+    bool place_static(MoveUnit& mu, const char** reason) {
+        if (host_used + mu.slot_bytes > host_budget) return false;
+        host_used += mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        *reason = "static weight over the card's budget; read from the pinned host pool";
+        return true;
+    }
 };
 
 }  /* namespace */
@@ -678,6 +698,66 @@ int Planner::assign_layer_offload(Plan* p) {
     return rc;
 }
 
+/* Static (non-expert) weights that do not fit the card (RAM-Streaming, ticket #18,
+ * docs/swap/static-streaming.md). The units that fit stay on the card; the rest are pinned in the
+ * host pool at the DeviceZeroCopy site, as a pooled expert is: the card reads them over the link
+ * in place at decode and the prefill stager copies them ahead (place/stager.h). The card is
+ * filled first-fit in the order of how surely and how much a unit is read, so what leaves it is
+ * what a step touches least:
+ *   the drafter's weights (read on every draft pass), then model-level weights read every token
+ *   (the output head: a prefill reads it for a few rows only, which the stager does not cover),
+ *   then layer units, then weights read once per request, and last a token embedding, a lookup of
+ *   a few rows a step. Ties go in execution order; a unit that does not fit is skipped, so
+ *   smaller ones behind it may still fill the card. Every key comes from the model, so every rank
+ *   decides alike (MoveUnit).
+ * No staging ring in the slab and no second algorithm: tier and site are the planner's existing
+ * axes. A unit the host pool cannot take is unfit; the file tier does not serve statics. */
+int Planner::assign_static_stream(Plan* p) {
+    std::vector<int32_t> order;
+    for (int32_t i = 0; i < (int32_t)p->units.size(); ++i) {
+        MoveUnit& mu = p->units[(size_t)i];
+        if (mu.preplaced()) continue;
+        mu.tier = Tier::VRAM;
+        mu.site = Site::Device;
+        if (mu.access != RAD_ACCESS_CONDITIONAL) {
+            mu.movable = false;
+            order.push_back(i);
+        }
+    }
+    auto tier_of = [&](const MoveUnit& mu) {
+        if (mu.draft_head) return 0;
+        if (mu.layer < 0 && !mu.weights.empty() && is_embedding_table(*in_.program, mu.weights.front()))
+            return 4;
+        if (access_strength(mu.access) < 4) return 3;
+        return mu.layer < 0 ? 1 : 2;
+    };
+    auto use_of = [](const MoveUnit& mu) { return mu.first_use_op < 0 ? INT32_MAX : mu.first_use_op; };
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+        const MoveUnit& ua = p->units[(size_t)a];
+        const MoveUnit& ub = p->units[(size_t)b];
+        if (tier_of(ua) != tier_of(ub)) return tier_of(ua) < tier_of(ub);
+        return use_of(ua) < use_of(ub);
+    });
+
+    int64_t used = 0;
+    HostFall fall{0, p->host_budget, false};
+    int rc = RAD_OK;
+    for (int32_t ui : order) {
+        MoveUnit& mu = p->units[(size_t)ui];
+        if (p->vram_budget <= 0 || used + mu.slot_bytes <= p->vram_budget) {
+            used += mu.slot_bytes;
+            continue;
+        }
+        if (!fall.place_static(mu, &mu.reason)) {
+            mu.reason = "fits in no tier";
+            note_unfit(p, mu, "the card's weights budget and the pinned host pool are full "
+                              "(raise --host-pool-mib)");
+            rc = RAD_E_NOMEM;
+        }
+    }
+    return rc;
+}
+
 /* The initial expert residency. Non-conditional units go to VRAM first, since they are read
  * every pass; conditional units take the rest in rank_units order, and heat re-ranks from real
  * routing from the first dispatch.
@@ -692,12 +772,12 @@ int Planner::assign_expert_tiered(Plan* p) {
     }
 
     if (p->vram_budget > 0 && fixed > p->vram_budget) {
-        /* The dense part alone does not fit: delegate to layer offload rather than duplicating
-         * its run-picking logic. */
+        /* The dense part alone does not fit: what the card cannot hold is streamed from the
+         * pinned host pool (assign_static_stream). */
         RAD_WARN("placement: the non-routed weights alone need %s against a %s weight budget; "
-                 "falling through to layer offload for them",
+                 "streaming what does not fit from the pinned host pool",
                  humanb(fixed).c_str(), humanb(p->vram_budget).c_str());
-        RAD_TRY(assign_layer_offload(p));
+        RAD_TRY(assign_static_stream(p));
         fixed = 0;
         for (const MoveUnit& mu : p->units)
             if (mu.access != RAD_ACCESS_CONDITIONAL && mu.tier == Tier::VRAM) fixed += mu.slot_bytes;
@@ -996,6 +1076,10 @@ void Planner::finish(const Program& prog, Plan* p) {
             p->totals.bytes[(int)mu.tier] += pl.bytes;
             if (mu.host_forced) p->forced_host_used += pl.bytes;
         }
+        if (mu.expert < 0 && !mu.preplaced()) {
+            p->static_bytes += mu.bytes;
+            if (mu.tier != Tier::VRAM) p->static_streamed_bytes += mu.bytes;
+        }
     }
 }
 
@@ -1285,7 +1369,7 @@ int Planner::assign(Plan* p) {
          * offload when there are routed experts (read only when selected), else layer offload. */
         if (p->vram_budget <= 0 || total <= p->vram_budget) s = Strategy::AllVram;
         else if (has_conditional)                           s = Strategy::ExpertTiered;
-        else                                                s = Strategy::LayerOffload;
+        else                                                s = Strategy::StaticStream;
         p->strategy = s;
         p->strategy_why =
             s == Strategy::AllVram
@@ -1296,8 +1380,8 @@ int Planner::assign(Plan* p) {
                       "selected, are what spills to host memory", humanb(total).c_str(),
                       humanb(p->vram_budget).c_str())
                 : fmt("%s of weights against a %s weights pool and no routed experts to spill: "
-                      "whole layers are offloaded", humanb(total).c_str(),
-                      humanb(p->vram_budget).c_str());
+                      "the static weights that do not fit are read from the pinned host pool",
+                      humanb(total).c_str(), humanb(p->vram_budget).c_str());
         RAD_DEBUG("placement: auto chose %s (%s of weights against a %s budget)",
                   strategy_name(s), humanb(total).c_str(), humanb(p->vram_budget).c_str());
     }
@@ -1315,6 +1399,7 @@ int Planner::assign(Plan* p) {
         case Strategy::AllVram:      return assign_all_vram(p);
         case Strategy::LayerOffload: return assign_layer_offload(p);
         case Strategy::ExpertTiered: return assign_expert_tiered(p);
+        case Strategy::StaticStream: return assign_static_stream(p);
         default:                     return RAD_E_INVAL;
     }
 }
@@ -1414,6 +1499,12 @@ std::string Plan::report(const Program& prog) const {
     if (slab_overhead)
         s += fmt("  slab overhead %12s  %12s   (shadow slots + the staging ring)\n", "-",
                  humanb(slab_overhead).c_str());
+
+    if (static_streamed_bytes)
+        s += fmt("  static stream %12s  %12s   (%.1f%% of the %s of static weights: read in place at "
+                 "decode, copied ahead in prefill)\n", "-", humanb(static_streamed_bytes).c_str(),
+                 100.0 * (double)static_streamed_bytes / (double)static_bytes,
+                 humanb(static_bytes).c_str());
 
     bool any_slab = false;
     for (const SlabClass& c : classes) if (c.movable || c.n_stage) any_slab = true;
