@@ -27,7 +27,7 @@ Freigabe-Zahlen unten.
 | 5 | GroupPlanner / Slot-Abgabe mit zwei MoE | Join-Pfad bestanden; Targets änderten sich nicht (laut Code ohnehin `target == offer`, siehe 5); Slot-Shrink/Regrow lief nicht |
 | 6 | Heat-Warmup `early_hit` | bestanden: 83,45 % ohne, 89,12 % mit Budget |
 | 7 | Parität Manifest vs. `--model` | bestanden (dicht und MoE, Greedy, Sampling mit Seed, Stream, langer Prompt) |
-| 8 | Durchsatz / TTFT | gemessen; zwei gleichzeitig aktive Models bremsten sich stark, nach Fix 2 auf rund die Hälfte statt ein Zehntel; TTFT-Aufteilung nur abgeleitet (keine Metrik) |
+| 8 | Durchsatz / TTFT | gemessen; zwei gleichzeitig aktive Models bremsten sich stark, nach Fix 2 auf rund die Hälfte statt ein Zehntel; TTFT-Aufteilung nur abgeleitet; seit §17 je Request gemessen |
 | – | #13 Host-Budget mit großem Model | bestanden nach Fix 3; Host-RAM ist dabei der Engpass (siehe unten) |
 | – | Issue-Kriterien Sampling, MTP, Streaming, Abbruch, lange Prompts | bestanden |
 | 11 | Gestreamte Statik zurück in den VRAM (#19) | bestanden, siehe §11 |
@@ -37,6 +37,7 @@ Freigabe-Zahlen unten.
 | 14 | Erschöpfte VA-Arena, Single-Engine-Perf gegen den Stand vor #44 (#45) | bestanden, ein Fehler in `Mover::resize` behoben (siehe §14) |
 | 15 | MoE im Manifest mit zwei Models gegen `--model`, die „13-%-Lücke“ (C1) | im früheren Aufbau (`--deterministic`, Headroom 5000) nicht mehr zu reproduzieren (−0,3 %); die einzige reproduzierbare Lücke (−9,2 %) ist der halbierte VRAM-Anteil ohne eigenes `--gpu-headroom-mib`, nicht behoben, Folge-Issue empfohlen (siehe §15) |
 | 16 | GroupPlanner unter Dauerlast mit wechselnder Gewichtung, Summe `committed_bytes` ≤ Pool (#51) | bestanden, nach vier Fixes: 7736 Samples, 0 Überschreitungen (vorher 3561 von 4793, bis 3,4 GiB über dem Pool); siehe §16 |
+| 17 | TTFT getrennt nach Queue, Aktivierung und Prefill, je Request (`timings`, `radiance:model_ttft_*_seconds`) | gemessen für aktiv, kalt, warm und unter Last mit Warteschlange; die drei Teile summieren sich auf 0,1–0,6 ms genau zum TTFT (siehe §17) |
 
 ## Gefundene Fehler und Fixes
 
@@ -263,8 +264,8 @@ unerklärt: `d` war dabei nie aktiv, die Optionen des MoE sind gleich.
 102 tok/s, beide zugleich 38,4 + 35,3. Ein Teil davon ist der Host-RAM (Pools und Store verdrängen
 den Page Cache), ein Teil die Collective-Reihenfolge; getrennt wurde das nicht.
 
-**TTFT nach Queue / Aktivierung / Prefill.** Es gibt keine Metrik je Request für Queue und
-Aktivierung. Abgeleitet: Request-Wanduhr = Router-Wartezeit + `activation_seconds` (aus
+**TTFT nach Queue / Aktivierung / Prefill.** Je Request gemessen steht es in §17. Hier die frühere
+Ableitung (damals gab es keine Metrik für Queue und Aktivierung): Request-Wanduhr = Router-Wartezeit + `activation_seconds` (aus
 `/radiance/models`) + `timings.ttft_ms` der Engine.
 
 | Fall | Wanduhr | Aktivierung | Prefill-TTFT (Engine) | Rest (Queue, Tokenisierung) |
@@ -748,3 +749,49 @@ jeweils mit einem weiteren Fix; „Überschreitung“ heißt Σ `committed` > Σ
 - **Der Rest ist Rundung.** Die vier Zahlen je Rank werden einzeln auf ganze MiB gekürzt, die Summe kann bis 2 MiB über
   dem Pool lesen (größter Wert 1 MiB, die Zeilen „+1“ oben). Die Prüfung in `elastic.py` und `lpstress.py` hat darum
   `POOL_SLACK_MIB = 2` und zählt Samples, Überschreitungen und die größte Überschreitung je Phase und gesamt.
+
+## 17 TTFT getrennt nach Queue, Aktivierung und Prefill, je Request (#21)
+
+Jede Antwort trägt in `timings` jetzt `activation_ms` (Wartezeit im `ModelRouter`, bis das Model aktiv war; 0, wenn es
+das schon war) und `queue_ms` (vom Einreichen beim Scheduler bis zur Admission); `prompt_ms` ist der Prefill (bis zum
+ersten Token), `ttft_ms` die Summe samt Parsen und Tokenisieren. Dieselben drei Teile als Histogramme je Model in
+`/metrics`: `radiance:model_ttft_activation_seconds`, `radiance:model_ttft_queue_seconds`,
+`radiance:model_ttft_prefill_seconds` (Label `model`, die Buckets von `vllm:time_to_first_token_seconds`; jeder Request
+mit erstem Token zählt in allen dreien, auch mit Aktivierungsanteil 0). Host-Tests:
+`model_activation_test: a_request_that_activates_its_model_reports_the_wait_as_activation_and_a_warm_one_zero`,
+`the_scheduler_queue_wait_is_reported_apart_from_the_activation`.
+
+Aufbau: `m_ttft.json` (zwei Qwen3.5-0.8B `a` (Standard, 4096 Token, 8 Seqs) und `b` (2048 Token, fp8-KV, 4 Seqs),
+`idle_timeout_ms` 3000, `--deterministic`), TP=2; `ttft_run.sh 6` (`ttft.py`) startet sechs frische Server. Jeder
+Request: Completion mit ~1700 Prompt-Tokens (zufälliger Text, kein Prefix-Treffer), 4 Token (unter Last 64), Werte aus
+`timings`. Zahlen in ms, p50 / p95 über alle Requests des Falls.
+
+| Fall | n | Queue | Aktivierung | Prefill | TTFT |
+|---|---|---|---|---|---|
+| (a) Model aktiv, ein Request nach dem anderen | 90 | 0,1 / 0,2 | 0 / 0 | 23,7 / 25,0 | 24,0 / 25,5 |
+| (b) Model kalt (erster Request an `b` im frischen Prozess, `a` aktiv) | 6 | 0,5 / 0,8 | 1968 / 2007 | 37,9 / 38,1 | 2008 / 2045 |
+| (c) Model vorbereitet (warm; `a` und `b` abwechselnd, vorher alle deaktiviert) | 48 | 0,4 / 0,8 | 2125 / 2227 | 28,8 / 29,5 | 2155 / 2256 |
+| (d) unter Last: 32 Clients auf `a` (8 Seqs), 192 Requests | 192 | 1403 / 1461 | 0 / 0 | 27,1 / 103,6 | 1431 / 1490 |
+| (d′) dieselbe Last auf `a`, dazu ein kalter Request an `b` | 5 (`b`) | 0,4 / 0,6 | 2053 / 2120 | 29,9 / 30,3 | 2083 / 2151 |
+| (d′) die Requests der Last auf `a` währenddessen | 320 | 1375 / 1480 | 0 / 0 | – | – |
+
+- **Die Teile summieren sich.** TTFT − (Queue + Aktivierung + Prefill) ist der Rest aus Parsen, Template und
+  Tokenisieren: Median 0,2–0,4 ms je Fall; Maximum 0,6 ms bei kalt und warm, 2,5–4,0 ms bei aktiv und unter Last (einzelne Ausreißer). Die Perzentile oben stehen
+  einzeln; sie summieren sich nur ungefähr.
+- **Aktivierung bestimmt den TTFT eines Models, das nicht läuft** (rund 98 %); der Prefill (1700 Token, 24–38 ms) und
+  die Queue (unter 1 ms) spielen dort keine Rolle. Kalt war hier nicht langsamer als warm (1968 gegen 2125 ms): das
+  0,8B-Model liegt im Page Cache, und die Aktivierung besteht fast nur aus dem Aufbau der Engine, nicht aus dem Lesen
+  der Gewichte (`weights` 0,25 s warm, §2). Der Unterschied kalt/warm der Gewichte ist beim MoE groß (§8: 70,2 s gegen
+  60,0 s; dort nicht erneut gemessen, eine Aktivierung dauert eine Minute, die Aufteilung dort bleibt Aktivierung ≫ 99 %).
+- **Unter Last bestimmt die Queue den TTFT.** 32 Clients bei 8 Sequenzen: 1,4 s Warten auf die Admission gegen 27 ms
+  Prefill (p95 104 ms, weil die Prefills mit dem Decode der anderen Sequenzen teilen). Die Aktivierung eines zweiten
+  Models unter dieser Last dauerte nicht länger als ohne (2053 gegen 1968 ms im p50), und die Queue von `b` blieb
+  unter 1 ms: seine Warteschlange ist die eigene, nicht die von `a`.
+- **Der erste Prefill nach einer Aktivierung ist langsamer** (38 ms im Fall b, 29 ms im Fall c, 24 ms im Fall a):
+  nicht untersucht, wahrscheinlich Kernel-Aufwärmen.
+- **Quervergleich mit den Metriken.** `/metrics` nach einem Lauf (Fall a bis d′ in einem Prozess):
+  `radiance:model_ttft_activation_seconds_count` je Model gleich der Zahl der Requests an das Model (198 für `a`, 22
+  für `b`), `_sum` für `b` 11,95 s (1 kalte, 4 warme und 1 Aktivierung unter Last), für `a` 10,3 s (fünf warme).
+- **Nicht gemessen:** MoE (siehe oben), Queue beim Streaming (der Beobachter hängt in `Server::record()`, das auch der
+  Stream-Pfad am Ende ruft; gemessen wurden nur Nicht-Stream-Antworten), Requests mit `n > 1`
+  (Queue vom frühesten Einreichen bis zur frühesten Admission, Prefill bis zum letzten ersten Token).
