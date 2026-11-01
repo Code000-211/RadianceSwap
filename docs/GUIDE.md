@@ -2217,8 +2217,10 @@ cards are needed for another model, it is **deactivated**; a **prepared** model 
 in host RAM in the form the kernels read, so the next **activation** needs no parsing, no relayout and
 no read from the drive. A **cold** model has no copy in RAM (never loaded, or pushed out when RAM was
 full) and is read from the container or the page cache. Running generations are never cut by any of
-this. The design is in `../GLOSSARY.md` and `adr/0001` to `0003`; the measurements behind the numbers
-below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md).
+this. The design is in `../GLOSSARY.md` and `adr/0001` to `0003`, and per feature in
+[`swap/elastic-slab.md`](swap/elastic-slab.md), [`swap/kv-lend.md`](swap/kv-lend.md),
+[`swap/static-streaming.md`](swap/static-streaming.md) and [`swap/host-budget.md`](swap/host-budget.md); the
+measurements behind the numbers below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md) (§1–§14).
 
 Text models only: image, audio and video endpoints, and image, audio or video parts in a text request, are
 refused with a 501 while a manifest is in use, and LoRA adapters are refused at startup (an adapter
@@ -2347,7 +2349,8 @@ load is part of the activation.)
   first failure, doubling per failure in a row up to 60 s (the two `activation_backoff` keys), reset by
   a successful activation. A request inside the backoff gets a 503 at once, with the time left in
   `Retry-After`. A request that failed for lack of VRAM is the exception: it makes room first
-  (above).
+  (above). Lack of host memory (`RAD_E_NOHOST`, see "Admission before the allocation") is not: no other model is
+  deactivated for it.
 - **Unhealthy.** A device error (`RAD_E_DEVICE`) during an activation marks the whole GPU group
   unhealthy: no activation is started again, every request is a 503 `gpu_group_unhealthy`, `/health`
   answers 503, and `/metrics` and `/radiance/models` still answer (`radiance:gpu_group_healthy` 0,
@@ -2382,7 +2385,12 @@ second time**.
 2. **Host pools of active models.** What an active model pins in RAM: `--host-pool-mib` (per rank, §4.3),
    the pinned embedding and encoder towers, the host tier of the prefix cache (§4.8), activation arenas,
    the checkpoint snapshot store, and the RAM copy of an n-gram table (`--ngram-placement ram`).
-   They end with the model's deactivation.
+   They end with the model's deactivation. **They also grow by streaming:** when a model's non-expert
+   weights do not fit the VRAM it is left (a second model beside a full card, "Static weights from RAM" below),
+   what does not fit stays in the pinned host pool, and a MoE whose card has no room left gives all its experts to
+   the pool too. `--host-pool-mib` is raised by what the pool lacks, the startup log says by how much, and that
+   growth counts against the host before anything is allocated (below). Measured: a streaming Flash-Next
+   (56 % of its statics streamed) books 65.75 GiB of host pools.
 3. **Staging.** While a load runs, an upload ring of 8 × 4 MiB pinned per load worker (a warm load
    uses at most 4 workers, 128 MiB) and, for a load from a checkpoint or container, a relayout window of at most
    4 GiB. They are released when the load ends.
@@ -2403,18 +2411,44 @@ mapping, so that "the second activation reads no checkpoint bytes" is true.
 2. then the store copy of an **active** model (it keeps running; after its deactivation it is cold);
 3. last the activating model's own copy.
 
-A model whose load is running is never dropped, and the pools of active models never are: if they
-alone exceed the budget the activation still goes ahead (it fails only on the existing host checks),
-`over_budget_claims` counts it and the log warns. A copy is made at all only when the whole model fits next
+A model whose load is running is never dropped, and the pools of active models never are: if the
+activating model's host pools still exceed the budget after that, the activation is refused (below, "Admission
+before the allocation"); `over_budget_claims` counts the claim and the log says so. Staging and the checkpoint
+store are booked the same way but only warn. A copy is made at all only when the whole model fits next
 to `--host-headroom-mib` and the cgroup and memlock limits; otherwise the model stays cold (log warning
 "not kept for a warm activation"). With the budget at 0, those host checks alone decide, and they make
 the same room by dropping the longest idle copy. The bookings are estimates from the configuration, made
 after planning and before allocating, not measured resident sizes.
 
+**Admission before the allocation.** After the plan is made (host-pool growth for streaming, experts without a
+card slot and the drafter included) and before anything is allocated, an activation asks whether its whole host
+bill fits. That bill is the sum the plan books: the host pools of all ranks, the embedding and tower pins, the
+prefix cache's host tier, the arenas and the RAM copy of an n-gram table. It is checked against
+`MemAvailable`, every memory cgroup above the process and `--host-headroom-mib`, with or without
+`cache.host_budget_mib`; and against the budget when one is set. When it does not fit:
+
+1. store copies are dropped, the prepared model idle the longest first (LRU), then the copies of active models
+   (they keep running and are cold after their deactivation), and the bill is checked again;
+2. if it still does not fit, the activation is refused with `RAD_E_NOHOST` ("not enough host memory (RAM, cgroup
+   limit or host budget)"). The engine is destroyed with all its bookings, the log names the limit and the size,
+   and the request gets a 503 `model_activation_failed` ("activation of model b failed: not enough host memory
+   (RAM, cgroup limit or host budget)"). The model is `failed` and backs off like any failed activation.
+
+A refusal touches nothing that runs: the pools of active models are never dropped, their requests go on, and no
+model is deactivated for it (it is not a VRAM shortage). At most a running model loses its store copy. Before this
+check a streaming model beside a MoE holding 138 GiB ended in a kernel kill (exit 137) of the whole process.
+Measured with two Flash-Next on 170 GiB (`a` active with 73.3 GiB of pools and a 67.5 GiB store copy, `b`
+streaming 56 %, `--host-pool-mib 26000`, budget 0): `b` is admitted (200) after `a`'s store copy was dropped,
+the host peaks at **154.6 GiB** in use (RSS 144.7 GiB), `MemAvailable` never falls under 16.3 GiB, and `a` keeps
+answering the same. With `host_budget_mib` set to `a`'s pools plus 256 MiB: 503 `not enough host memory`, `b`
+`failed`, `over_budget_claims` 3, `a` unchanged, no kill (`swap/gpu-acceptance.md` §13). The check uses the bookings
+(estimates from the configuration), not measured resident sizes; and `MemAvailable` sees what other models have
+touched so far, not what they still will.
+
 **To size a host:**
 
     RAM  ≳  Σ store copies of the models you want warm
-          + Σ host pools of the models active together
+          + Σ host pools of the models active together (a streaming model's pool is bigger by what it streams)
           + the largest load's staging (up to 4 GiB)
           + --host-headroom-mib (4096 by default)
           + whatever page cache you still want
@@ -2427,6 +2461,7 @@ GiB of weights and a 47.7 GiB mapped n-gram table), `--tp 2`, host pools of 12 2
 | Flash-Next deactivated and prepared (store 72.5 GB) | 75 GiB | |
 | one Flash-Next active, store copy kept | **153 GiB** of 170 | 17 GiB; the page cache was pushed down to 17 GB |
 | two Flash-Next entries active | **160 GiB** of 170 | 10 GiB; only the first took a store copy (72.5 GB), the second is cold after its deactivation |
+| Flash-Next `a` (73.3 GiB of pools, store copy dropped for `b`) + Flash-Next `b` streaming 56 % (`--ngram-placement disk`, `--host-pool-mib 26000`) | **154.6 GiB** peak (RSS 144.7 GiB) | at least 16.3 GiB at the lowest, 4 GiB headroom kept; 10 GiB after `b`'s deactivation |
 
 Of the 153 GiB, 67.5 GiB is the store copy and the rest is the active model's pools and the system's own use (host pool, the RAM copy
 of the n-gram table, arenas); the acceptance did not split that by kind, `host_memory` in `/radiance/models`
@@ -2451,11 +2486,44 @@ did not vary `host_budget_mib`.
 - **Experts between models (GroupPlanner).** Inside the shares, a group planner divides the expert slots of
   the MoE models by group heat: every model keeps a minimum (the larger of its expert floor and half the
   equal part), the rest goes to the hottest experts of the group, valued by heat × bytes per slot byte. A
-  model that leaves gives its budget back. A model gets no more than its share offered, so **in the
-  acceptance (two MoE models in equal shares) the first model gave up no slot** when the second was busy. A
-  slot a running model gives up at a step boundary is released **logically only**: the bytes stay in its
-  weights pool and no other model can use them. Elastic expert slabs that free them physically
-  are not yet available (#35).
+  model that leaves gives its budget back. The floor comes from `--host-pool-mib`: a model cannot shrink below
+  what its host pool does not hold. With 20 000 MiB per model the floors sit near the offers and there is nothing
+  to exchange; the measurements below use 26 000 MiB. Whether the bytes a model gives up really become free for
+  the other is the elastic slab's job (next).
+- **Elastic expert slab.** In a manifest with more than one model, on a card with virtual memory management, a MoE's
+  weights pool is elastic: the pool of the group is the sum of the models' offers, and a model can be granted up to
+  the whole pool, but growth is only paid from bytes no member holds. A model that is busy takes the pages an idle one
+  gives back (the idle model's heat halves every 4 s and counts as cold after 20 s, so it keeps only its minimum). The
+  slab is mapped in chunks of about 128 MiB, each on **fresh address space**, and given back chunk by chunk;
+  an address that was unmapped is never mapped again. The reason is the driver: on this stack (ROCr from HIP 7.x,
+  kernel 7.0.2-6-pve) `hsa_amd_vmem_map` on an address that was mapped and unmapped before has no effect, the
+  address keeps pointing at the first physical page, and once another model holds that page two addresses read and
+  write the same bytes. An expert is then overwritten by another; the symptom was an occasional request with
+  `logprobs` failing with "no finite logit" (HTTP 500), set off by anything that touches the card from outside, such
+  as `rocm-smi` every 2 s. Mapping every address once removed it: 30 load cycles with `rocm-smi` and render-node
+  opens every 2 s as observers, 5776 requests, 0 errors (`swap/elastic-slab.md`). A chunk that is partly in use
+  stays mapped, so a give-back is coarser than the byte count. The planner never hands out one byte twice: the sum
+  of the committed slabs stayed within the pool in every sample.
+  - **The effect, measured** (two Flash-Next entries, `--host-pool-mib 26000`, offers 10.3 GiB each per rank): with
+    load on `m1` alone, `m1` commits 13 448 MiB (13 GiB, 3 GiB over its offer) and `m2` falls to 7 231 MiB; with load
+    on `m2` alone it is the other way round (13 460 / 7 220). A change of load reaches its target within 20–30 s; one
+    step moves 128 MiB, and 5 GiB changes owner in a few seconds. Greedy output of both models stayed equal to the
+    reference after every phase.
+  - **Order of free bytes.** Bytes that become free on a card go first to streamed static weights (below), then
+    to the KV cache of a model with waiting prompts, and only last to the growth of an expert slab. Each step takes
+    what the one before left, and a grant already made stays reserved.
+  - **When the address arena is used up.** Each rank has 8 TiB of address space per model for this, about 65 000
+    chunk changes. When it can no longer replace a chunk the model warns once (`address arena is used up … keeps its
+    pages mapped`, `arena_spent` in the status and the gauge `radiance:model_expert_slab_arena_spent`) and the slab
+    only shrinks logically from then on: pages stay mapped, no other model gets bytes from them, and the slab does
+    not grow beyond what is mapped. The state lasts until the model is deactivated. A miscount in `Mover::resize`
+    that kept demoting experts without end was fixed with this. On a card the exhausted state was exercised only in
+    the unit test with a small arena.
+  - **Where it applies.** Only a manifest with more than one model, a MoE with experts and a card with virtual
+    memory management; a single model, a dense model and a card without it keep one plain allocation as before. (A
+    model that streams static weights gets the elastic pool too, for the weights it moves back.)
+    `RADIANCE_ELASTIC_SLAB=off` in the environment of the process keeps the plain pool in a group, as a control: no
+    slab give-back, no KV growth and no return of streamed statics (below).
 - **KV between models.** The KV loan (§4.3: idle KV blocks lent to the experts) works inside one model.
   A model's KV partition also grows physically at the expense of the group's experts (#17): the share fixes only
   the cache a model starts with (its carve), its ceiling is `--max-model-len` x `--max-num-seqs`, and when running
@@ -2463,14 +2531,15 @@ did not vary `host_budget_mib`.
   is 32 768 tokens of every growing group) from the group's expert pool. The planner takes the bytes from the
   coldest experts of any model (each keeps its minimum) and grants them once those pages are back on the card; a
   running sequence is never touched, and the cache gives a chunk back five seconds after the need ends, once no
-  sequence holds a block in it (blocks only the prefix cache holds are evicted for that). Free bytes go to streamed
-  static weights first (§4.12, "Streamed static weights"), then to a cache claim, then to the growth of expert slabs.
-  `GET /radiance/models` shows `kv_growth{grown_bytes, target_bytes}` per rank, `/metrics`
-  `radiance:model_kv_grown_bytes` and `radiance:model_kv_grow_target_bytes`. Measured on two Flash-Next MoE: a
-  cache with a 1.9 GiB carve grew by 468-702 MiB per card under 12-16 concurrent long prompts while the other model's
-  slab gave back 2.8-3.5 GiB, with no lost sequence and no non-finite logit; it returned to its carve 13-20 s after the
-  load. Only in a manifest with more than one model on a card with virtual memory management;
-  `RADIANCE_ELASTIC_SLAB=off` turns it off. Not built: lending one model's idle KV to another model's expert slab.
+  sequence holds a block in it (blocks only the prefix cache holds are evicted for that). Blocks held only by the
+  prefix cache are not demand. The cache grows only where it is elastic (the same conditions as the slab, and with
+  `RADIANCE_ELASTIC_SLAB=off` it does not); a model alone in the group gets its offer and never claims. Measured on
+  two Flash-Next MoE: a cache with a 1.9 GiB carve grew by 468-702 MiB per card under 12-16 concurrent long prompts
+  while the other model's slab gave back 2.8-3.5 GiB, with no lost sequence and no non-finite logit; it returned to
+  its carve 13-20 s after the load. The first chunk is backed 6-7 s after the claim; until then the model keeps its
+  carve and a request that does not fit waits or is preempted like on any full pool. The carve depends on
+  `--host-pool-mib` (the expert floor): a ceiling the carve already covers never grows. Not built: lending one model's
+  idle KV to another model's expert slab.
 - **Heat warmup.** A model's expert heat is saved when it is deactivated. With `cache.warmup_budget_mib` > 0
   the next activation ranks its experts by that heat and puts the hottest, within the budget (bytes of
   expert slots per rank), on the card at load time, instead of starting with the container's profile (an explicit
@@ -2565,12 +2634,55 @@ address space of the model's weights pool (one burst of up to 256 MiB per tick, 
 kept them on the card: the draft head, the output head, layers in execution order, the embedding last) and
 publishes the new addresses at the next step boundary; running requests are not interrupted and the output
 stays bit-identical. The streamed share in `GET /radiance/models` and `/metrics` is the live one and falls to 0.
-On Qwen3.5-0.8B (two R9700, TP=2) a model streaming 84 % of its statics (C1 32 tok/s, C8 253 tok/s, prefill
-33 400 tok/s) is back at 332 tok/s, 2017 tok/s and 62 700 tok/s 1–2 s after the model that held the cards is
-deactivated (33 %: 109 → 330 tok/s C1; baseline with everything on the card 333 / 2053 / 70 000;
-`swap/gpu-acceptance.md` §11). Limits: what is in VRAM stays there until the model is deactivated (a model activated
-later sees less free VRAM and the pressure path applies); it needs the elastic weights pool, so not with
-`RADIANCE_ELASTIC_SLAB=off`, a single model, or `--deterministic`.
+Measured on Qwen3.5-0.8B (two R9700, TP=2; `swap/gpu-acceptance.md` §11): model `b` streams while `a` holds the
+cards; `a` is then deactivated by its idle timeout. Median of three; C8 = eight at once; prefill 3.6k tokens.
+
+| `b` streamed | while `a` is active | after `a` is deactivated | share back to 0 |
+|---|---|---|---|
+| 83.9 % | C1 32.1, C8 252.8 tok/s, prefill 33 400 tok/s | C1 331.7, C8 2016.9, prefill 62 700 | after 2.0 s |
+| 32.7 % | C1 108.7, C8 771.9, prefill 49 400 | C1 330.2, C8 2013.1, prefill 66 800 | after 1.0 s |
+| 6.4 % | C1 301.5, C8 1862.4, prefill 67 000 | C1 331.3, C8 2017.6, prefill 66 500 | after 1.0 s |
+
+Reference (one model, nothing streamed) is C1 333.3, C8 2053.3, prefill 70 000 tok/s; with `a` active and nothing
+streamed (the cost of a second engine, see "Throughput with two models active") C1 302.5, C8 1873. Decode recovers to 99 % (C1) and 98 % (C8) of
+the reference: 10.3× at 84 % (C1), 3.0× at 33 %. Prefill recovers to 89–95 % of the reference; the rest of that gap is
+not explained (the control with `a` active is at 67 600, so the streaming state does not cost it). The output stayed
+the reference's (text and tokens) through the move; across 135–309 single requests during the move, and about 500
+concurrent ones, there were no errors and no non-finite logits. Limits: what is in VRAM stays there until the model is
+deactivated (a model activated later sees less free VRAM and the pressure path applies); it needs the elastic weights
+pool, so not with `RADIANCE_ELASTIC_SLAB=off`, a single model, or `--deterministic`; not measured on a MoE.
+
+**Cache growth and expert slab.** Costs of the VRAM exchange between two Flash-Next models (`swap/gpu-acceptance.md`
+§9, §12; per card):
+
+| | measured |
+|---|---|
+| expert slab, one step | 128 MiB (64 granules unmapped and mapped); 5 GiB changes owner in a few seconds |
+| expert slab, change of load | target reached in 20–30 s; the idle side cools to cold in 20 s |
+| KV growth, 12 × ~6000-token prompts | +468 MiB (2 chunks of 234 MiB = 32 768 tokens); first chunk backed 6–7 s after the claim; back to the carve after ~13 s |
+| KV growth, 16 × ~8000-token prompts | +702 MiB (3 chunks); back to the carve after ~20 s |
+| what the other model's slab gave | 2.8 GiB and 3.5 GiB (rank 0 / 1), including the other model's own expert growth |
+
+Without growth the same load runs only one prompt after the other on that cache (the control with
+`RADIANCE_ELASTIC_SLAB=off` gives no chunk). Under load the greedy tokens deviate from the single-request reference after
+5–83 tokens with and without growth (batch noise; the largest |Δ logprob| before the first deviation was 0.31–0.42 with
+growth, 0.33 without).
+
+**Single engine, no manifest.** The elastic pool and the cache growth exist only in a manifest with more than one
+model, so `--model` is meant to cost nothing. Measured against the build before #44, on two R9700 at TP=2, three
+repetitions, runs alternating (`swap/gpu-acceptance.md` §9, §14):
+
+| | C1 | C8 | prefill |
+|---|---|---|---|
+| dense 0.8B | -0.3 % (328.9 → 328.0 tok/s) | -0.3 % (2047 → 2042) | -0.4 % (65 213 → 64 974) |
+| Flash-Next, host pool 26 000 MiB | -0.1 % (172.3 → 172.2) | +4.4 % (599 → 625, noise) | -3.3 % (4443 → 4297, noise); median of 2 × 8 runs +1.5 % |
+
+The dense figures are within the ±2 % aim. The MoE C8 and prefill figures scatter more between runs (C8 474–806 tok/s,
+prefill 3880–5196 tok/s inside one build; bimodal with the heat state) than between builds, so a difference above
+±2 % there can neither be excluded nor shown; none was seen in any series. A first-repetition prefill deficit of 13 %
+on the MoE vanished in the repeated series; whether it is real is *measured in gpu-acceptance.md §15 once available*.
+How the GroupPlanner redistributes experts between two models under load, beyond the slab figures above, is
+*measured in gpu-acceptance.md §16 once available*.
 
 The prototype measurement that decided the design, kept for the per-operation figures
 (`swap/measure-static-streaming.md`, prototype outside the engine):
@@ -2600,10 +2712,21 @@ Per model (`data[]`): `id`, `state`, `default`, `activations`, `activation_secon
 `vram_released_mib` (of the last deactivation, right only while no other model changed the cards at the same time),
 `prepared_bytes`, `warm_activations`, `cold_activations`, `last_weight_load` (`kind` warm or cold, `bytes`,
 `bytes_from_store`, `seconds`, `source_read_bytes`, `disk_read_bytes`, `mapped_bytes`) and, when failed, `error`
-and `retry_after_seconds`. At top level: `idle_timeout_ms`, `healthy`, `unhealthy_reason`, and `host_memory`:
-`budget_bytes` (0: derived), `used_bytes`, `store_bytes`, `pool_bytes`, `staging_bytes`, `evicted_prepared`,
-`evicted_active_copies`, `evicted_bytes`, `over_budget_claims`. Not shown: a model's VRAM share, KV partition or
-share of RAM streaming.
+and `retry_after_seconds`. The group planner's view of the model, per rank (index = rank):
+
+- `expert_slab[]`: `committed_bytes` (movable expert slots with pages behind them, without the working reserve and the
+  fixed residents), `target_bytes` (what the planner entitles the slab to), `offer_bytes` (the same figure as the plan
+  placed it: the model's share of the pool), `elastic` (false: a plain pool, nothing to exchange), `arena_spent` (true
+  once the address arena ran out; the slab shrinks logically only). Σ `committed_bytes` of the models stays within the
+  pool.
+- `kv_growth[]`: `grown_bytes` (KV beyond the carve with pages behind it) and `target_bytes` (what the planner grants).
+- for an **active** model only: `static_bytes`, `static_streamed_bytes` (read from the pinned host pool because the card
+  had no room) and `static_streamed_fraction` (0 to 1; falls to 0 when the weights move back into VRAM).
+
+At top level: `idle_timeout_ms`, `healthy`, `unhealthy_reason`, and `host_memory`: `budget_bytes` (0: derived),
+`used_bytes`, `store_bytes`, `pool_bytes`, `staging_bytes`, `evicted_prepared`, `evicted_active_copies`,
+`evicted_bytes`, `over_budget_claims`. Not shown: a model's VRAM share, and the host pool it grew by for streaming
+(it is inside `pool_bytes`).
 
 `GET /metrics` carries these beside the others (§6.3), each with a `model` label:
 
@@ -2613,6 +2736,9 @@ share of RAM streaming.
 | `radiance:model_activations_total`, `_activation_seconds_total`, `_activation_failures_total` | |
 | `radiance:model_deactivations_total`, `_deactivation_seconds_total`, `_pressure_deactivations_total` | |
 | `radiance:model_vram_released_mib`, `radiance:model_prepared_bytes` | |
+| `radiance:model_expert_slab_committed_bytes`, `…_target_bytes`, `…_arena_spent` | also `rank`; `arena_spent` is 0 or 1 |
+| `radiance:model_kv_grown_bytes`, `radiance:model_kv_grow_target_bytes` | also `rank`; KV beyond the carve, and what is granted |
+| `radiance:model_static_bytes`, `…_streamed_bytes`, `…_streamed_fraction` | active models only |
 | `radiance:model_weight_loads_total{kind}`, `_load_bytes_total`, `_load_seconds_total`, `_source_read_bytes_total`, `_disk_read_bytes_total` | `kind` is `warm` or `cold` |
 | `radiance:gpu_group_healthy` | 0 once a device error took the group down |
 | `radiance:host_budget_bytes`, `radiance:host_used_bytes{kind}` | `kind` is `store`, `pools` or `staging` |
@@ -2625,28 +2751,47 @@ steps after an activation that were already on the card (also `early_hit=…%` i
 
 #### Known limits
 
-- **Slot release is logical** (#35 open): a model that gives experts away frees no VRAM another model can use,
-  and the shares stay fixed. The shrink and regrow path did not run in the acceptance (two MoE models with
-  equal shares).
-- **No lending of one model's idle KV to another model's expert slab** (#17): the loan of idle KV blocks to the
-  experts runs inside one model. What does cross models is the growth of a KV partition at the expense of the
-  experts (above); it takes seconds from the claim to the backed chunk (a request that cannot wait is queued or
-  preempted like on any full pool), and the cache's ceiling is what `--max-model-len` x `--max-num-seqs` states.
-- **Streamed static weights stay in RAM** (#19 open): a model that streams keeps doing so until it is deactivated;
-  nothing moves them into VRAM when another model frees slots. Under `--deterministic` such a model does not start.
-- **Host RAM is the limit of large models.** Two Flash-Next on 170 GiB fill the host; the store copy of the
-  second does not fit. `staging_budget_mib` is parsed only; bookings are estimates.
+- **Two active models halve each other's decode.** The collectives of all models in a group run in one order on
+  every rank (ADR 0003); two busy models do not communicate in parallel. One dense sequence made 326–332 tok/s alone and
+  154 + 154 with a second busy model; a second model that is active but idle costs about 10 %. The multi-model
+  machinery is meant to give a second model its place without waiting, not twice the work.
+- **Host RAM is the limit of large models.** One Flash-Next is 67.5 GiB of weights in the store beside its pools; two on
+  170 GiB fill the host (153 GiB with one active, 160 GiB with two entries). A streaming second MoE is admitted only
+  after the first's store copy is dropped (peak 154.6 GiB), so that first model is cold after its deactivation. When the
+  pools alone do not fit, the activation is refused (503 `not enough host memory`); a mapped n-gram table is then read
+  from the drive at every activation. `staging_budget_mib` is parsed only, and the bookings are estimates.
+- **One MoE checkpoint was available.** Every "two MoE" measurement is two entries of the same Flash-Next file. Two
+  different MoE architectures, three or more models of which two are MoE, and `--ngram-placement ram` for the streaming
+  second MoE were not measured.
+- **Streaming statics is a bridge, not a steady state.** At 85 % streamed the decode is a tenth of the speed. The
+  streamed weights move back into VRAM only when the card has room again (another model deactivated, a slab or cache
+  gave pages back), and only to what is free then; a model activated later sees less free VRAM. Under
+  `--deterministic` a model that would stream does not start.
+- **Cache growth is not instant.** From the claim to a backed chunk it takes 6–7 s per chunk, and the cache's ceiling
+  is what `--max-model-len` x `--max-num-seqs` states; a ceiling the carve already covers never grows. Idle KV of one
+  model is not lent to another model's expert slab (#17 is built as growth of the partition only).
+- **The elastic slab exists only in a manifest with more than one model** on a card with virtual memory management
+  (and gives back whole chunks of about 128 MiB). The address arena is finite: about 65 000 chunk changes per rank for
+  the slab (about 32 000 chunks for the cache); then the slab only shrinks logically (`arena_spent`). Not exercised
+  on a card with an exhausted arena.
+- **Single-engine cost.** No difference above the noise was found for `--model` against the build before the elastic
+  slab (dense within 0.5 %; MoE C8 and prefill scatter ±5 % and more between runs). The prefill deficit of 13 % seen once
+  on the MoE: *measured in gpu-acceptance.md §15 once available*.
+- **GroupPlanner under load.** How the planner redistributes experts between models under a mixed load over a longer time
+  than the acceptance's phases of 45–90 s: *measured in gpu-acceptance.md §16 once available*.
 - **A MoE activation takes a minute** (60 s warm, 70 s cold, with the n-gram table in RAM), because the mapped table
-  is copied at every activation and the store pushes the page cache out; `--ngram-placement disk` avoids it.
+  is copied at every activation and the store pushes the page cache out; `--ngram-placement disk` avoids it
+  (6.3–7.6 s of weights, 36–38 s when it streams beside a model holding the cards).
 - **`vram_released_mib` is wrong when other models change at the same time** (the log and the metric subtract
-  free memory before and after, and `-214 MiB` has been seen); it is right for a single model in motion.
-- **A failed activation can cost a healthy model.** A model that can never fit (`nomem` in the acceptance)
-  still deactivates one idle model once before it fails.
+  free memory before and after, and `-214 MiB` has been seen); it is right for a single model in motion. The same
+  goes for the per-card VRAM you read from outside: it does not say who holds the bytes (use `committed_bytes`).
+- **A failed activation can cost a healthy model.** A model that can never fit the VRAM (`nomem` in the acceptance)
+  still deactivates one idle model once before it fails. A refusal for host memory deactivates none.
 - **`gpu_group.devices` selects nothing**, and `staging_budget_mib` limits nothing (above).
 - **Ceiling on activations:** each activation creates about 46 device streams, whose ids are never reused and come
   from a table of 1 Mi entries: about 22 000 activations per process before `rad_stream_create` fails.
-- **Not measured:** `host_budget_mib` with two large models, more than two models, streaming while a second
-  model is deactivated, 120 cycles with a MoE, sampling and abort on a MoE.
+- **Not measured:** more than two models, 120 cycles with a MoE, sampling and abort on a MoE, return of streamed
+  statics on a MoE, and the exhausted address arena on a card.
 
 ---
 
