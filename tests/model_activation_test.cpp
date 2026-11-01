@@ -98,6 +98,7 @@ struct Fleet {
     std::atomic<int> fail_rc{ 0 };
     Gate* gate = nullptr;
     int delay_ms = 0;
+    int admit_delay_ms = 0;   /* the queue wait of the models the launcher builds */
     std::unique_ptr<ModelRouter> mr;
 
     explicit Fleet(ActivationOptions act = {}) {
@@ -129,6 +130,7 @@ struct Fleet {
                         ++hold.taken[rank];
                     }
                 Served s(model, model == "b" ? "beta" : "gamma");
+                s.sched.admit_delay_ms = admit_delay_ms;
                 return mr->serve_model(model, s.srv.get());
             });
         mr->attach("a", a.srv.get());
@@ -489,3 +491,55 @@ TEST(a_failure_that_is_not_a_device_error_leaves_the_group_healthy) {
 }
 
 RAD_TEST_MAIN()
+
+/* ================================================================== TTFT split (ticket #21) */
+
+namespace {
+
+/* The `timings` of a 200 reply, as milliseconds: activation, queue, prefill. */
+struct Split { double activation, queue, prefill; };
+
+Split split_of(const HttpResponse& r) {
+    CHECK_EQ(r.status, 200);
+    const json t = json::parse(r.body).value("timings", json::object());
+    return { t.value("activation_ms", -1.0), t.value("queue_ms", -1.0), t.value("prompt_ms", -1.0) };
+}
+
+/* `radiance:<family>_count{model="<id>"}` and `_sum` from the router's scrape. */
+double sample_of(const std::string& text, const std::string& family, const std::string& id,
+                 const char* suffix) {
+    const std::string key = family + suffix + "{model=\"" + id + "\"} ";
+    const size_t at = text.find(key);
+    CHECK(at != std::string::npos);
+    return at == std::string::npos ? -1.0 : std::stod(text.substr(at + key.size()));
+}
+
+}  // namespace
+
+TEST(a_request_that_activates_its_model_reports_the_wait_as_activation_and_a_warm_one_zero) {
+    Fleet f;
+    f.delay_ms = 150;
+    const Split cold = split_of(f.post("b"));
+    CHECK(cold.activation >= 140.0);
+    CHECK(cold.queue >= 0.0 && cold.queue < 100.0);
+    const Split warm = split_of(f.post("b"));
+    CHECK_EQ(warm.activation, 0.0);
+
+    const std::string m = f.get("/metrics").body;
+    const std::string fam = "radiance:model_ttft_activation_seconds";
+    CHECK_EQ(sample_of(m, fam, "b", "_count"), 2.0);
+    CHECK(sample_of(m, fam, "b", "_sum") >= 0.14);
+    CHECK_EQ(sample_of(m, "radiance:model_ttft_queue_seconds", "b", "_count"), 2.0);
+    CHECK_EQ(sample_of(m, "radiance:model_ttft_prefill_seconds", "b", "_count"), 2.0);
+    /* "c" was never asked. */
+    f.post("a");
+    CHECK_EQ(sample_of(f.get("/metrics").body, fam, "c", "_count"), 0.0);
+}
+
+TEST(the_scheduler_queue_wait_is_reported_apart_from_the_activation) {
+    Fleet f;
+    f.a.sched.admit_delay_ms = 80;
+    const Split s = split_of(f.post("a"));
+    CHECK_EQ(s.activation, 0.0);
+    CHECK(s.queue >= 75.0);
+}

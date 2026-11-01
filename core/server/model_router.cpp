@@ -201,6 +201,11 @@ void ModelRouter::attach(const std::string& id, Server* s) {
         m.busy_at = now;
         ++m.activations;
         m.activation_s += std::chrono::duration<double>(now - m.began).count();
+        s->set_ttft_observer([&m](double act_s, double queue_s, double prefill_s) {
+            m.ttft_activation.observe(act_s);
+            m.ttft_queue.observe(queue_s);
+            m.ttft_prefill.observe(prefill_s);
+        });
     }
     if (registry_) registry_->set_state(id, ModelState::Active);
     /* Once: the table is read by the listener, and a model attached again after a deactivation
@@ -306,6 +311,7 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
     Cold* used = nullptr;   /* raised under the lock that found `s`; lowered when dispatch ends */
     std::string served;
     bool cold = false, unattached = false;
+    int64_t waited_ns = 0;
     {
         std::lock_guard<std::mutex> lk(m_);
         const auto it = servers_.find(id);
@@ -328,7 +334,9 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
     if (unattached) return answer_unattached(q);
     if (cold) {
         HttpResponse refusal;
+        const auto t0 = Clock::now();
         if (!(s = await_model(id, q, &refusal))) return refusal;
+        waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
         std::lock_guard<std::mutex> lk(m_);
         used = &cold_.at(id);
     }
@@ -351,7 +359,9 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
             c->busy_at = Clock::now();
         }
     } done{ *this, used };
-    HttpResponse r = s->router().dispatch(q);
+    HttpRequest routed = q;
+    routed.activation_wait_ns = waited_ns;
+    HttpResponse r = s->router().dispatch(std::move(routed));
     if (q.method == "GET" && q.path == "/metrics" && !r.streaming() && r.status == 200)
         r.body += metrics_text();
     return r;
@@ -744,6 +754,18 @@ std::string ModelRouter::metrics_text() const {
     o += "# HELP radiance:model_activation_failures_total Activations that failed and were rolled back\n"
          "# TYPE radiance:model_activation_failures_total counter\n";
     for (const auto& [id, c] : cold_) line("radiance:model_activation_failures_total", id, "", (double)c.failures_total);
+    for (const char* part : { "activation", "queue", "prefill" }) {
+        const std::string name = std::string("radiance:model_ttft_") + part + "_seconds";
+        o += "# HELP " + name + " Time to first token, " +
+             (part[0] == 'a' ? "the wait in the router until the model was active (0: it was)"
+              : part[0] == 'q' ? "the wait in the scheduler's queue until admission"
+                               : "prefill, from admission to the first token") +
+             "\n# TYPE " + name + " histogram\n";
+        for (const auto& [id, c] : cold_)
+            o += histogram_samples(name.c_str(), "{model=\"" + id + "\"}",
+                                   part[0] == 'a' ? c.ttft_activation
+                                   : part[0] == 'q' ? c.ttft_queue : c.ttft_prefill);
+    }
     o += "# HELP radiance:gpu_group_healthy 0 once a device error made the GPU group unhealthy\n"
          "# TYPE radiance:gpu_group_healthy gauge\n"
          "radiance:gpu_group_healthy " + std::string(unhealthy_ ? "0" : "1") + "\n";

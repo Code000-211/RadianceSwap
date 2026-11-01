@@ -2220,7 +2220,7 @@ full) and is read from the container or the page cache. Running generations are 
 this. The design is in `../GLOSSARY.md` and `adr/0001` to `0003`, and per feature in
 [`swap/elastic-slab.md`](swap/elastic-slab.md), [`swap/kv-lend.md`](swap/kv-lend.md),
 [`swap/static-streaming.md`](swap/static-streaming.md) and [`swap/host-budget.md`](swap/host-budget.md); the
-measurements behind the numbers below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md) (§1–§14).
+measurements behind the numbers below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md) (§1–§17).
 
 Text models only: image, audio and video endpoints, and image, audio or video parts in a text request, are
 refused with a 501 while a manifest is in use, and LoRA adapters are refused at startup (an adapter
@@ -2581,9 +2581,25 @@ models; you get the second one without waiting for the first.
 These figures are with the collective hand-off between the ranks' threads spinning for 300 µs before it sleeps;
 without that, two dense models made 31 tok/s each.
 Prefill beside a busy second model: dense 36 000–47 000 tok/s against 69 000–71 000 alone; MoE 4520–4730
-against 5120. TTFT is not split by queue, activation and prefill in any metric; derive it as the request's
-wall time = wait for the router + `activation_seconds` (the delta in `/radiance/models`) + the engine's `timings.ttft_ms`.
-For a warm dense activation that is about 2.16 s total with 25 ms of prefill; for a cold MoE about 70 s.
+against 5120. **Where the time to first token goes.** Every response's `timings` (§5.10) splits it per request:
+`activation_ms` (held in the router until the model was active, 0 if it was) + `queue_ms` (waiting in the
+model's scheduler for admission) + `prompt_ms` (prefill) + a fraction of a millisecond of parsing and tokenising
+= `ttft_ms`. `/metrics` carries the same three parts as histograms per model, `model_ttft_activation_seconds`,
+`model_ttft_queue_seconds` and `model_ttft_prefill_seconds` (label `model`; every request that got a first token counts
+in all three), so a dashboard can tell a slow first token from a model that was cold, a model that was busy and a long
+prompt. Dense 0.8B, 1700-token prompt, p50 / p95 in ms (`swap/gpu-acceptance.md` §17):
+
+| case | queue | activation | prefill | TTFT |
+|---|---|---|---|---|
+| model active | 0.1 / 0.2 | 0 | 23.7 / 25.0 | 24.0 / 25.5 |
+| cold (first request, not prepared) | 0.5 / 0.8 | 1968 / 2007 | 37.9 / 38.1 | 2008 / 2045 |
+| prepared (warm) | 0.4 / 0.8 | 2125 / 2227 | 28.8 / 29.5 | 2155 / 2256 |
+| active, 32 clients on 8 sequences | 1403 / 1461 | 0 | 27.1 / 103.6 | 1431 / 1490 |
+
+A request for a model that is not running waits for the activation (about 2 s for a dense 0.8B, a minute for the MoE),
+which is almost all of its TTFT; on a busy model the wait for admission is. Activating a second model
+under that load took as long as without it, and its own queue stayed under a millisecond. For a cold MoE the
+wait is about 70 s.
 
 **Experts from RAM (today).** An expert held in the pinned host pool is read across the link by the GEMM.
 Measured with `r4d_selftest --perfmoe 2048 5 512 10 <pooled %>`: a 2048-token gate_up GEMM takes 1.17 ms with every expert on the card
@@ -3387,6 +3403,7 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
   "predicted_n": 64, "predicted_ms": 711.0,
   "predicted_per_token_ms": 11.29, "predicted_per_second": 88.6,
   "draft_n": 78, "draft_n_accepted": 37,
+  "activation_ms": 0, "queue_ms": 1.2,
   "ttft_ms": 297.5, "total_ms": 1008.5
 }
 ```
@@ -3401,6 +3418,8 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
 | `predicted_ms` | from the first generated token to the last |
 | `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms` (the first token is the prefill's product). The same figure as `/metrics`' time per output token; with speculative decoding it counts every token a step accepts |
 | `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as in llama.cpp |
+| `activation_ms` | with `--manifest`: how long the router held the request until its model was active (§4.12); 0 when it was, and always 0 without a manifest. Part of `ttft_ms` |
+| `queue_ms` | from the request's hand-over to the scheduler to its admission: the wait for a free sequence or KV block. `null` when the engine did not report the admission. Part of `ttft_ms` |
 | `ttft_ms` | the server's time to first token: from having the whole request body to the first generated token, covering parsing, chat template rendering, tokenising, the wait for admission and the prefill. The time the body took to arrive is not in it, so a client on a slow link can separate the server's share from the network's. Not a llama.cpp field |
 | `total_ms` | from the same moment to the last generated token: `ttft_ms + predicted_ms`. Not a llama.cpp field |
 
@@ -4258,7 +4277,7 @@ there is none.
 | `num_requests_preempted` | | 
 | `preempt_forced_total` | preempted prefill waits that ended by reclaiming cache blocks and forcing a lowest-priority running victim (`--preempt-wait-ms`) |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
-| `model_*`, `gpu_group_healthy`, `host_*` | with `--manifest` only: per model state, activations, deactivations and weight loads (warm or cold), the group's health, and the host-RAM budget (§4.12). `/stats` and the rest of `/metrics` report the default model only |
+| `model_*`, `gpu_group_healthy`, `host_*` | with `--manifest` only: per model state, activations, deactivations and weight loads (warm or cold), the group's health, the host-RAM budget, and `model_ttft_{activation,queue,prefill}_seconds` histograms, the time to first token in its three parts (§4.12). `/stats` and the rest of `/metrics` report the default model only |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
 Two pitfalls:

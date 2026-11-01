@@ -71,6 +71,10 @@ private:
     std::atomic<double>   sum_{0.0};
 };
 
+/* The `_bucket`, `_sum` and `_count` lines of histogram `name` under `labels` (`{k="v"}`), without
+ * HELP and TYPE: the caller writes those once for the family, however many label sets follow. */
+std::string histogram_samples(const char* name, const std::string& labels, const Histogram& h);
+
 /* vLLM's bucket layouts, verbatim. Changing one breaks every histogram quantile a dashboard
  * computes across versions, so they are constants, not options. */
 std::vector<double> buckets_ttft();          /* vllm:time_to_first_token_seconds */

@@ -2855,6 +2855,8 @@ json timings_json(const TimingsOut& t) {
     o["predicted_ms"]           = t.predicted_ms;
     o["predicted_per_token_ms"] = per(t.decode_n, t.predicted_ms);
     o["predicted_per_second"]   = rate(t.decode_n, t.predicted_ms);
+    o["activation_ms"]          = t.activation_ms;
+    o["queue_ms"]               = t.queue_ms >= 0.0 ? json(t.queue_ms) : json(nullptr);
     o["ttft_ms"]                = t.ttft_ms >= 0.0 ? json(t.ttft_ms) : json(nullptr);
     o["total_ms"]               = t.total_ms >= 0.0 ? json(t.total_ms) : json(nullptr);
     if (t.draft_n > 0) {

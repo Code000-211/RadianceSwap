@@ -70,6 +70,7 @@
 #pragma once
 
 #include "http.h"
+#include "metrics.h"
 #include "model/weight_store.h"
 #include "place/group_planner.h"
 
@@ -211,6 +212,10 @@ private:
         double        load_s[2] = {0, 0};
         bool          has_load = false;
         WeightLoadReport last_load;
+        /* A request's TTFT in three parts (Server::set_ttft_observer): the wait in the router for
+         * the model to be active (0 when it was), the wait in the scheduler's queue, the prefill. */
+        Histogram ttft_activation{ buckets_ttft() }, ttft_queue{ buckets_ttft() },
+                  ttft_prefill{ buckets_ttft() };
     };
 
     HttpResponse route(const HttpRequest& q);

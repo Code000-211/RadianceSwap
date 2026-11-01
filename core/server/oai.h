@@ -144,6 +144,7 @@ struct OaiRequest {
     std::string last_user;
     std::string peer;             /* the handler sets it from the transport; "" in-process */
     int64_t     t_received_ns = -1;   /* HttpRequest::t_received_ns, for timings' ttft and total */
+    int64_t     activation_wait_ns = 0;   /* HttpRequest::activation_wait_ns, for timings' activation_ms */
     bool parse_tools = false;
     /* The reply parser this request's render produced. Per request, not per server: it binds the
      * model's format to the tools this call sent, so concurrent requests may need different
@@ -373,9 +374,13 @@ struct UsageOut {
  *   draft_n, draft_n_accepted
  *                 speculative tokens proposed for this request and accepted; present when any
  *                 were proposed, as in llama.cpp
- *   ttft_ms       from having the whole request body to the first token: parse, chat template,
- *                 tokenisation, admission wait and prefill. Body transfer time is excluded, so
- *                 a remote client sees the server's own share
+ *   activation_ms the part of ttft_ms the ModelRouter held the request until its model was
+ *                 active (0 for a model that was); with several models only
+ *   queue_ms      from the request's submission to the scheduler to its admission: the wait in
+ *                 the scheduler's queue; null when the engine did not report the admission
+ *   ttft_ms       from having the whole request body to the first token: activation_ms, parse,
+ *                 chat template, tokenisation, queue_ms and prompt_ms. Body transfer time is
+ *                 excluded, so a remote client sees the server's own share
  *   total_ms      from the same moment to the last token
  *
  * Rates are prompt_n / prompt_ms and (predicted_n - 1) / predicted_ms, since the first token
@@ -391,6 +396,8 @@ struct TimingsOut {
     double  predicted_ms = 0.0;
     int64_t draft_n = 0, draft_n_accepted = 0;
     double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
+    double  activation_ms = 0.0;
+    double  queue_ms = -1.0;     /* < 0: the engine did not report the admission */
 };
 
 /* `timings` is added at the top level when it is valid. */

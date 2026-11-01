@@ -40,6 +40,9 @@ struct HttpRequest {
     /* Steady-clock nanoseconds at which the whole body had arrived. The server's own time for
      * the request starts here, before parsing, so network time is excluded. -1 in-process. */
     int64_t     t_received_ns = -1;
+    /* Nanoseconds the ModelRouter held the request until its model was active (0: it was). Set by
+     * the router, read by the model's Server for the TTFT split. */
+    int64_t     activation_wait_ns = 0;
 
     /* True once the peer is gone; absent in-process. A dropped connection is a cancellation
      * (spec §14), so every path that waits polls this. */
