@@ -560,6 +560,20 @@ TEST(a_taker_is_granted_bytes_only_after_the_giver_released_them) {
     CHECK_EQ(mib(g.target("b")), 10);
 }
 
+/* A slab whose address arena ran out is reported in the rank's view (status and metrics), for that rank
+ * only, and it changes no target. */
+TEST(a_slab_that_used_up_its_address_arena_is_reported_for_its_rank_only) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    CHECK(!g.view("a")[0].arena_spent);
+    const int64_t target = g.target("a")[0].bytes;
+    g.update_arena_spent("a", 0);
+    g.update_arena_spent("nobody", 0);
+    g.update_arena_spent("a", 5);
+    CHECK(g.view("a")[0].arena_spent);
+    CHECK_EQ(g.target("a")[0].bytes, target);
+}
+
 TEST(two_takers_are_never_granted_the_same_free_bytes) {
     GroupPlanner g(0);
     (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));

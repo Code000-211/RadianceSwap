@@ -48,13 +48,41 @@ etwas zu entmappen.
   mit dem, was frei ist; das Wachstum des anderen schrumpft binnen Sekunden zurück, wenn das Target fällt.
 - Bis die Engine ihre erste Messung meldet, gilt das Angebot des Resolvers als belegt (`held = Angebot`),
   damit ein anderes Model in der Aktivierungsphase nicht in die Bytes wächst.
-- Die Arena ist endlich (8 TiB, bei 128-MiB-Stücken rund 65 000 Stückwechsel je Rank). Ist sie verbraucht,
-  hört das physische Entmappen und Mappen auf (Warnung „address arena is used up"); die Caps wirken dann
-  nur noch auf den bereits gemappten Teil.
+- Die Arena ist endlich (8 TiB, bei 128-MiB-Stücken rund 65 000 Stückwechsel je Rank); was bei Erschöpfung
+  gilt, steht im Abschnitt „Erschöpfte Arena (#45)" unten.
 - `RADIANCE_ELASTIC_SLAB=off` lässt in einer Gruppe den einfachen Pool (Kontrolle für Messungen).
 - `--host-pool-mib` bestimmt den Expert-Floor (`expert_floor`): ein Model kann nicht unter das schrumpfen,
   was sein Host-Pool nicht hält. Mit 20 000 MiB je Model (m_mm.json) liegt der Floor fast beim Angebot, es
   gibt dann nichts zu tauschen; die Messung nutzt 26 000 MiB (`m_el.json`).
+
+## Erschöpfte Arena (#45)
+
+Eine Adresse wird nie ein zweites Mal gemappt (Treiber-Aliasing, Abschnitt unten), also kann die Arena nicht
+recycelt werden. Das Verhalten ist deshalb eine Degradation auf **logisches Schrumpfen**:
+
+- **Entmappen nur, solange die Arena das Stück wieder liefern könnte** (`Mover::release_blocked`): ein Stück geht
+  an die Karte zurück, wenn `va_arena_left() − arena_owed_ ≥ chunk_span` ist. `arena_owed_` ist der Adressraum
+  der bereits zurückgegebenen, noch nicht wieder gemappten Stücke; so kann ein Regrow nie am Adressraum scheitern, den der
+  eigene Shrink gerade verbraucht hat (sonst blieb der Slab nach dem Shrink für immer kleiner als der Cap).
+- **Danach** (Arena kann kein weiteres Stück ersetzen, oder ein Mappen scheiterte an `va_arena`): Warnung einmal
+  („address arena is used up … keeps its pages mapped"), `Mover::slab_arena_spent()`. Ein Cap unterhalb der
+  gemappten Größe demotet weiter wie immer (Buchhaltung, D2H-Kopien), die Seiten bleiben gemappt
+  (`slab_held_bytes` fällt nicht, andere Models bekommen daraus keine Bytes); ein Cap darüber füllt die noch
+  gemappten Slots wieder. Wachstum über das Gemappte hinaus wird nicht versucht (`grow_backing` setzt das Ziel auf
+  das Gemappte, kein 1-s-Retry mit Warnung). Der Zustand bleibt bis zum Ende des Models.
+- **Sichtbar**: `/radiance/models` → `expert_slab[].arena_spent` (Bool je Rank) und Metrik
+  `radiance:model_expert_slab_arena_spent` (Gauge 0/1, je Rank); Mover → `GroupPlanner::update_arena_spent`.
+- Die Promotion gestreamter Statik (`promote_statics`) nimmt aus derselben Arena und meldet bei Erschöpfung dasselbe.
+
+**Ursache der stehengebliebenen Demote-Kopien.** Nicht die Arena selbst, sondern `Mover::resize`: es zählte
+die laufenden Moves zum Resident-Stand dazu (`Promote` +1, `Demote` −1) in jedem Zustand außer `Free`, also auch
+`Published` und `Quarantine`. Dort ist der Zustand der Unit aber schon umgebucht (`retire` setzt `slab_slot`/`tier`
+beim Veröffentlichen), die Unit wurde doppelt gezählt. Folge: nach einem Fill sah das nächste `resize`
+`excess > 0` und demotete Residents ohne Host-Kopie (echte D2H-Kopien), danach `excess < 0`, und der Fill promotete andere (68 000
+Demotionen in 10 s im Test, dauerhaft `busy`, `starved_pool`). Bei erschöpfter Arena blieb der Cap dauerhaft
+unerreichbar (Wunsch über dem Gemappten), und die Schleife lief nach jedem Cap-Wechsel weiter. Ob dasselbe bei einem
+erreichbaren Cap kurz auftrat, wurde nicht getrennt gemessen; der Fix gilt für beide. Fix: nur `Copying` zählt (eine Kopie
+unterwegs); alles danach steht im Zustand der Unit.
 
 ## Tests
 
@@ -64,6 +92,13 @@ bleibt unberührt. Die Host-Backend-VMem (mmap) ist die Fake-Device-Schicht; die
 Karte (`place_test_card`). `tests/mem_test.cpp` (`reserve_growing`), `tests/group_planner_test.cpp`
 (Elastic: Zuteilung über das Angebot, Grant erst nach Freigabe, keine doppelte Vergabe, Neuberechnung bei
 Leave, Rank-weise Entscheidung, Gleichschritt der Klassen).
+
+Erschöpfte Arena (#45), `place_test`: `an_elastic_slab_with_a_used_up_address_arena_shrinks_logically_and_stays_byte_exact`
+(Arena leer gewachsen; zufällige Caps: die Residents folgen dem Cap bis zur gemappten Größe, keine Seite geht zurück
+oder kommt hinzu, Bytes jeder Unit exakt, danach 100 Dispatches ohne Promotion/Demotion/`starved_pool`; ohne den
+Fix in `resize` sind es zehntausende Demotionen) und `an_elastic_slab_never_gives_back_pages_it_cannot_map_again` (Shrink/Regrow
+gegen eine kleine Arena: der Slab erreicht nach jedem Regrow wieder den Cap); `group_planner_test`:
+`a_slab_that_used_up_its_address_arena_is_reported_for_its_rank_only`.
 
 ## Nicht endliche Logits: Ursache und Fix
 

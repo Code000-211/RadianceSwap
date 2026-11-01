@@ -32,6 +32,7 @@ Freigabe-Zahlen unten.
 | – | Issue-Kriterien Sampling, MTP, Streaming, Abbruch, lange Prompts | bestanden |
 | 11 | Gestreamte Statik zurück in den VRAM (#19) | bestanden, siehe §11 |
 | 12 | KV-Leihe zwischen Models, die KV-Partition wächst (#17) | bestanden, nach vier Fixes (siehe §12) |
+| 14 | Erschöpfte VA-Arena, Single-Engine-Perf gegen den Stand vor #44 (#45) | bestanden, ein Fehler in `Mover::resize` behoben (siehe §14) |
 
 ## Gefundene Fehler und Fixes
 
@@ -548,3 +549,51 @@ Zeitlauf von Lauf 1 (Sample alle 2 s; A committed | B committed | B Wachstum gew
   ist als die Obergrenze. Eine Obergrenze, die der Carve ohnehin deckt (Standard `m_kv.json` zuvor), wächst nie.
 - Nicht gemessen: Idle KV von A an den Slab von B (`lend_from` über Engines, bleibt ungebaut), drei Models, dichte
   Models mit großem Cache-Bedarf.
+
+## 14 Erschöpfte VA-Arena und Single-Engine-Perf (#45)
+
+Design und Ursache: `elastic-slab.md`, Abschnitt „Erschöpfte Arena (#45)". Kurz: Bei erschöpfter Arena schrumpft der
+Slab nur noch logisch (Seiten bleiben gemappt, Warnung einmal, Gauge `radiance:model_expert_slab_arena_spent`); die
+stehengebliebenen Demote-Kopien kamen aus `Mover::resize`, das Moves im Zustand `Published`/`Quarantine` ein
+zweites Mal zählte (Fill promotete, das nächste `resize` demotete, endlos). Tests: Host (`ROCR_VISIBLE_DEVICES=99`) und
+Karte (`place_test` ohne die Variable) grün; ohne den Fix hat der Test zehntausende Demotionen.
+
+**Elastisch auf der Karte (Regression).** `m_el.json` (zwei MoE, 26 000 MiB Host-Pool), `elastic.py m1:45,idle:15,m2:60,idle:20`,
+je zwei Läufe auf dem Stand dieses Branches und auf `origin/main` (ohne den Fix, abwechselnd): Greedy-Tokens nach
+jeder Phase gleich der Referenz (4 von 4 Phasen, alle vier Läufe), keine Fehler, VRAM zwischen 25,5 und 30,6 GiB,
+am Ende 57 MiB je Karte. Die Prüfung „Summe der `committed_bytes` ≤ Pool“ meldet in allen Läufen vereinzelt
+„False“ (main: 1 und 2 von 20 Samples, Branch: 1 und 3 von 20, bis zu 864 MiB über dem Pool): das ist die Lesung
+einer nicht atomaren Meldung, kein neuer Befund, und gleich auf `main`.
+
+**Single-Engine ohne Manifest gegen den Stand vor #44.** Gebaut: `d66fc89` (Merge von PR #42, der Commit vor dem
+Merge von PR #44 auf `main`) gegen diesen Branch (`origin/main` + #45). `radiance --model … --tp 2`, Port 18080,
+je Lauf ein frischer Server; die Aufbauten abwechselnd (vor, nach, vor, nach), `bench.py` mit je 3 Wiederholungen
+(C1: 256 Token; C8: acht Requests; Prefill: ein Request, tok/s aus der Antwort). Zahlen: Mittel über die Läufe,
+in Klammern Minimum–Maximum.
+
+| Model, Optionen | Messgröße | vor #44 | dieser Branch | Δ |
+|---|---|---|---|---|
+| dicht Qwen3.5-0.8B, `--max-model-len 8192 --max-num-seqs 8` (2 Läufe × 3) | C1 tok/s | 328,9 (325,3–332,8) | 328,0 (324,3–333,2) | −0,3 % |
+| | C8 tok/s | 2047 (2040–2059) | 2042 (2022–2052) | −0,3 % |
+| | Prefill tok/s (~4300 Token) | 65 213 (60 008–67 021) | 64 974 (60 574–66 686) | −0,4 % |
+| MoE Qwen3.8-Flash-Next, `--max-model-len 4096 --max-num-seqs 8 --placement expert_tiered --host-pool-mib 26000 --kv-cache-dtype fp8 --tp-wire wht6 --num-speculative-tokens 3 --max-num-batched-tokens 1024 --ngram-placement disk` (2 Läufe × 3) | C1 tok/s | 172,3 (147,7–189,8) | 172,2 (148,1–188,9) | −0,1 % |
+| | C8 tok/s | 599 (474–806) | 625 (472–802) | +4,4 % (Rauschen) |
+| | Prefill tok/s (~3,3k Token) | 4443 (4210–4728) | 4297 (4028–4891) | −3,3 % (Rauschen) |
+| MoE, Prefill allein, 2 Läufe × 8 Wiederholungen | Median tok/s | 4326 (Lauf 1: 4462, Lauf 2: 4084) | 4388 (Lauf 1: 4417, Lauf 2: 4102) | +1,5 % (Läufe −1,0 % / +0,4 %) |
+
+Dicht: alle drei Größen innerhalb 0,5 %, das Ziel ±2 % ist erfüllt. MoE C1: 0,1 %, und die drei Wiederholungen
+steigen in beiden Aufbauten gleich (148 → 180 → 189 tok/s, die Heat wärmt sich). MoE C8 und Prefill streuen
+von Lauf zu Lauf stärker als zwischen den Aufbauten (C8 474–806 tok/s, Prefill 3880–5196 tok/s auch innerhalb eines
+Aufbaus, zweigipflig je nach Heat-Zustand); der erste Eindruck eines Prefill-Rückstands von 13 % in der ersten
+Wiederholung (4118/4028 gegen 4728/4715) verschwand bei 2 × 8 Wiederholungen (Mediane ±1,5 %). Eine Abweichung
+über ±2 % lässt sich bei MoE-C8 und -Prefill mit dieser Streuung weder ausschließen noch belegen; ein systematischer
+Unterschied war in keiner Messreihe zu sehen. Der Pfad ohne Manifest nutzt weder den elastischen Pool noch den
+geänderten `resize` (kein Cap), die Änderung dieses Tickets berührt ihn nicht.
+
+Nicht gemessen: drei oder mehr Models, die Arena wirklich erschöpft auf der Karte (zu viele Stückwechsel:
+65 000 je Rank; auf der Karte nur im `place_test` mit kleiner Arena).
+
+Beobachtung, nicht behoben (schon auf `main`): `place_test_card` (`ctest -R place_test_card`, echte Karte) endet im
+Test `a_promoted_static_unit_is_copied_to_fresh_arena_address_in_keep_order_within_the_cap` mit SIGSEGV, weil er den
+Inhalt von VRAM mit einem Host-Zeiger liest (`place_test.cpp`, `r.at(…)[i]`); mit `ROCR_VISIBLE_DEVICES=99` (Host-Backend) läuft
+er. Alle anderen Fälle laufen auf der Karte.

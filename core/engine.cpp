@@ -1591,6 +1591,7 @@ void Engine::group_tick(bool idle) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         const Rank& r = *ranks_[i];
         if (!r.mover.slab_elastic()) continue;
+        if (r.mover.slab_arena_spent()) group_->update_arena_spent(id, i);
         int64_t held = 0, offer = 0;
         for (int32_t k : group_classes(r.plan)) {
             held += r.mover.slab_held_bytes((size_t)k);

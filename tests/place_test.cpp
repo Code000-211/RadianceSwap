@@ -2804,6 +2804,94 @@ TEST(an_elastic_slab_grows_no_further_than_the_fresh_address_space_it_was_given)
     CHECK(r.m.backed_slots(cls) <= plan_slots + 3 * K);           /* ... into the pieces that were left */
 }
 
+/* The arena runs out (an address is never mapped twice, so it cannot be recycled): the slab degrades to a
+ * logical shrink. A lowered cap still demotes and a raised one promotes again into the pages that are still
+ * mapped, nothing is decommitted any more, the cap settles instead of churning, and every unit's bytes stay
+ * where its table entry says. (Counting a published move on top of its unit once made the fill promote and
+ * the next resize demote the same units, forever.) */
+TEST(an_elastic_slab_with_a_used_up_address_arena_shrinks_logically_and_stays_byte_exact) {
+    if (!VMem::supported()) return;
+    LoanRig r(64, 40);
+    r.shrinkable = true;
+    r.lend = false;
+    r.va_extra = 64 * MiB;          /* the plan's pieces take most of it */
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    CHECK_OK(stamp_units(r, false, nullptr));
+    CHECK(!r.m.slab_arena_spent());
+
+    /* Grow until the arena has nothing left for another piece. */
+    CHECK_OK(r.m.set_resident_cap(cls, before + 1000));
+    for (Deadline dl; !r.m.slab_arena_spent() && !dl.passed();) {
+        CHECK_OK(r.dispatch());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(r.m.slab_arena_spent());
+    CHECK_OK(settle(r, 16));
+    const int64_t backed = r.m.backed_slots(cls);
+    const int64_t committed = backed_bytes(r);
+    const int64_t rmax = (int64_t)resident_units(r).size();     /* what the mapped pages hold */
+    CHECK(rmax > before);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+
+    uint32_t rng = 12345;
+    for (int round = 0; round < 12; ++round) {
+        rng = rng * 1664525u + 1013904223u;
+        const int64_t cap = before - 12 + (int64_t)(rng >> 16) % 37;
+        CHECK_OK(r.m.set_resident_cap(cls, cap));
+        Deadline dl;
+        CHECK_OK(settle(r, 16));
+        CHECK(!dl.passed());
+        CHECK_EQ((int64_t)resident_units(r).size(), std::min(cap, rmax));
+        CHECK_EQ(r.m.backed_slots(cls), backed);                 /* logical: no page went back ... */
+        CHECK_EQ(backed_bytes(r), committed);                    /* ... and none was added */
+        CHECK_OK(stamp_units(r, true, &bad));
+    }
+    CHECK_EQ(bad, 0);
+
+    /* Settled: more dispatches move nothing (no promote/demote churn). */
+    const MoverStats s0 = r.m.stats();
+    for (int k = 0; k < 100; ++k) CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.stats().promotions, s0.promotions);
+    CHECK_EQ(r.m.stats().demotions, s0.demotions);
+    CHECK_EQ(r.m.stats().starved_pool, s0.starved_pool);
+    CHECK_OK(r.m.set_resident_cap(cls, -1));
+    CHECK_OK(settle(r, 16));
+    CHECK_EQ((int64_t)resident_units(r).size(), before);
+}
+
+/* Pages go back to the card only while the arena can map them again: a shrink and a regrow, over and over
+ * against a small arena, never leave the slab smaller than the cap asks for. */
+TEST(an_elastic_slab_never_gives_back_pages_it_cannot_map_again) {
+    if (!VMem::supported()) return;
+    LoanRig r(64, 40);
+    r.shrinkable = true;
+    r.lend = false;
+    r.va_extra = 64 * MiB;
+    CHECK_OK(r.build());
+    const size_t cls = expert_class(r);
+    const int64_t before = (int64_t)resident_units(r).size();
+    CHECK_OK(stamp_units(r, false, nullptr));
+    int bad = 0;
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        CHECK_OK(r.m.set_resident_cap(cls, before - 12));
+        CHECK_OK(settle(r, 16));
+        CHECK_EQ((int64_t)resident_units(r).size(), before - 12);
+        CHECK_OK(r.m.set_resident_cap(cls, -1));
+        Deadline dl;
+        for (; (int64_t)resident_units(r).size() < before && !dl.passed();) {
+            CHECK_OK(r.dispatch());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK_OK(settle(r, 16));
+        CHECK_EQ((int64_t)resident_units(r).size(), before);
+        CHECK_OK(stamp_units(r, true, &bad));
+    }
+    CHECK_EQ(bad, 0);
+}
+
 /* Without a group (a plain weights pool) the cap stays bookkeeping: nothing is backed or given
  * back, and the pool reports its whole budget as before. */
 TEST(a_plain_weights_pool_keeps_every_page_whatever_the_cap) {

@@ -469,6 +469,12 @@ void GroupPlanner::update_held(const std::string& id, size_t rank, int64_t held,
     recompute();
 }
 
+void GroupPlanner::update_arena_spent(const std::string& id, size_t rank) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (GroupMember& m : members_)
+        if (m.id == id && rank < m.facts.size()) m.facts[rank].arena_spent = true;
+}
+
 void GroupPlanner::update_kv(const std::string& id, size_t rank, const KvPartition& kv) {
     std::lock_guard<std::mutex> lk(mu_);
     for (GroupMember& m : members_)
@@ -498,7 +504,8 @@ std::vector<GroupPlanner::RankView> GroupPlanner::view(const std::string& id) co
         for (size_t r = 0; r < members_[i].facts.size() && r < targets_[i].size(); ++r)
             out.push_back({ targets_[i][r].bytes, members_[i].facts[r].held, members_[i].facts[r].offer,
                             members_[i].facts[r].elastic, members_[i].facts[r].statics,
-                            targets_[i][r].kv_grow, members_[i].facts[r].kv.grown });
+                            targets_[i][r].kv_grow, members_[i].facts[r].kv.grown,
+                            members_[i].facts[r].arena_spent });
     }
     return out;
 }

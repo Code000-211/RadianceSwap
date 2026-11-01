@@ -712,6 +712,9 @@ public:
         return std::max<int64_t>(cp.backed - cp.n_work - (cp.n_resident0 - cp.n_movable0), 0) *
                cp.stride;
     }
+    /* Whether the weights pool's address arena ran short: from then on a shrink is logical (the
+     * pages stay mapped) and the slab grows no further than what is mapped. */
+    bool    slab_arena_spent() const { return arena_spent_; }
     /* Whether a cap has moved the segment and not yet settled (balance() has work). */
     bool    resizing() const {
         for (const ClassPools& cp : pools_)
@@ -1069,9 +1072,14 @@ private:
     bool shrink_backing(ClassPools& cp);
     /* Maps slots [backed, upto) of an elastic class, piece by piece; the status of the first piece
      * that would not map (backed stops there). */
-    int  map_slots(ClassPools& cp, int64_t upto);
+    int  map_slots(ClassPools& cp, int64_t upto, bool* no_address = nullptr);
     /* The topmost piece with pages that no slot needed (below the target or held) lives in, or -1. */
     int64_t releasable_chunk(const ClassPools& cp) const;
+    /* Whether giving a piece back would leave the arena unable to map it again (see shrink_backing). */
+    bool release_blocked(const ClassPools& cp) const;
+    void note_arena_spent();
+    int64_t arena_owed_ = 0;       /* address space of the pieces given back and not yet re-mapped */
+    bool    arena_spent_ = false;  /* the arena ran short once: the slab only shrinks logically (sticky) */
     void count_flex();
 };
 
