@@ -25,9 +25,8 @@ siehe unten): KV-Spiegel (`kvstream`), Pinned-Puffer des Schedulers und Mapped-/
 - **Pflichtbuchung** (Pools/Staging einer Aktivierung): wird immer gebucht. Übersteigt sie das
   Budget, werden zuerst vorbereitete Models verdrängt, dann die **Store-Kopie aktiver Models**
   (das Model bleibt aktiv, ist nach Deaktivierung kalt), zuletzt die eigene Kopie des Aktivierenden.
-  Pools aktiver Models werden nie verdrängt: bleibt es trotzdem über dem Budget, zählt
-  `over_budget_claims` und der Log warnt. Die Aktivierung scheitert deshalb nicht am Budget, sondern
-  nur an den bestehenden Host-Checks.
+  Pools aktiver Models werden nie verdrängt: bleibt die Aktivierung trotzdem über dem Budget,
+  wird sie abgelehnt (siehe „Host-Pools vor der Allokation“, #46).
 - Ein Model, dessen Load läuft (`begin` … `commit`/`abort`), wird nie verdrängt (der Load hält Zeiger
   in seine Einträge).
 - **Ohne Budget** (0) entscheiden die bestehenden Checks (`lockable_room`: MemAvailable,
@@ -37,6 +36,44 @@ siehe unten): KV-Spiegel (`kvstream`), Pinned-Puffer des Schedulers und Mapped-/
   Speicher, den die Karte liest, zählt (wie bisher) nicht gegen RLIMIT_MEMLOCK.
 - Das Verdrängen gibt den Speicher sofort zurück: Store-Puffer sind anonyme `mmap`s (`munmap`), kein
   malloc-Arena, die ihn behalten könnte.
+
+## Host-Pools vor der Allokation (#46)
+
+Bei der GPU-Messung zu #18 (PR #43) endete MoE `a` (138 GiB Host-RAM) + streamendes MoE `b` mit Exit 137:
+`b` vergrößerte seinen Host-Pool (gestreamte Statik, Experts ohne Kartenplatz), und nur das Ledger
+wurde gebucht, nichts geprüft. Jetzt hat `Engine::plan` am Ende der Pool-Planung (nach Drafter- und
+Streaming-Wachstum, vor jeder Allokation) ein letztes Wort, `Engine::admit_host_pools`:
+
+1. **Host-Checks** (`host_room`, auch ohne `cache.host_budget_mib`): die gesamte Summe, die `plan` für diese
+   Aktivierung bucht (Host-Pool aller Ränge inkl. Wachstum, Embedding-/Tower-Pins, Host-Tier des
+   Prefix-Caches, Arenen, n-gram-RAM-Kopie), muss gegen MemAvailable, jede Memory-cgroup und
+   `--host-headroom-mib` passen. Passt sie nicht, werden zuerst Store-Kopien verdrängt (vorbereitete Models,
+   dann Kopien aktiver), und es wird neu geprüft.
+2. **Budget**: ist `cache.host_budget_mib` gesetzt und die Buchung bleibt auch nach dem Verdrängen jeder
+   verdrängbaren Kopie darüber, wird abgelehnt.
+
+Abgelehnt heißt: `plan` liefert `RAD_E_NOHOST` („not enough host memory“), die Engine wird mit allen Buchungen
+zerstört, die Meldung im Log nennt Grenze und Größe. Der Router behandelt das **nicht** als VRAM-Mangel
+(`RAD_E_NOMEM`): kein anderes Model wird dafür deaktiviert; die Anfrage bekommt 503
+(`model_activation_failed`, `/radiance/models`: `state: failed`, `error`), mit Backoff wie jede
+gescheiterte Aktivierung. Ein laufendes Model `a` behält seine Pools, seine Anfragen laufen weiter; höchstens
+seine Store-Kopie (nicht der Pool) wurde verdrängt, es ist dann nach der Deaktivierung kalt.
+
+Nur die Pools dieser Aktivierung laufen so strikt durch das Budget; Staging, Checkpoint-Store und die
+einzelnen Pins in `resolve_table_placement` buchen weiter wie oben (Warnung, kein Abbruch).
+
+Tests (Host): `lifecycle_test` (`a_host_pool_that_does_not_fit_refuses_the_activation_and_leaves_the_active_model`:
+simuliertes MemAvailable/cgroup über `--host-headroom-mib`, simuliertes Budget über `set_budget`; ein zweiter
+Engine neben dem aktiven scheitert mit `RAD_E_NOHOST`, die Pools des aktiven bleiben, passt es ins Budget, wird es
+aktiv; `a_failed_start_releases_every_partial_allocation_at_every_step`: ein Host-Pool größer als die Maschine),
+`model_deactivation_test` (`an_activation_whose_host_pools_do_not_fit_is_refused_and_the_active_model_stays`: 503,
+`a` bleibt aktiv, keine Druck-Deaktivierung). GPU-Nachweis (`a` MoE aktiv + `b` MoE streamend, kein Exit 137):
+`scripts/swap-acceptance/host_budget_stream.py`.
+
+GPU-Nachweis (2× R9700, 170 GiB RAM, siehe `gpu-acceptance.md` §13): `a` = MoE mit 73 GiB Pool + 67 GiB Store-Kopie,
+`b` = dasselbe MoE, streamt 56 %. Ohne Budget: `b` wird zugelassen (200), nachdem die Store-Kopie des aktiven `a`
+verdrängt wurde; Spitze 154,6 GiB belegt, MemAvailable nie unter 16 GiB. Mit Budget = Pools von `a` + 256 MiB:
+503 `not enough host memory`, `b` `failed`, `a` antwortet unverändert. Kein Exit 137.
 
 ## Page-Cache ist kein RAM-Backing
 
@@ -66,3 +103,6 @@ Deaktivierung kalt.
   wenn es festliegt (`--checkpoint-slots auto`).
 - Mehrere Engines, die gleichzeitig aktivieren, buchen nacheinander unter dem Store-Lock; die
   Aktivierungen selbst sind wie bisher serialisiert (`build_m`).
+- `admit_host_pools` rechnet mit dem, was `plan` bucht, nicht mit gemessener RSS; MemAvailable sieht, was
+  andere Models schon angefasst haben, nicht was sie noch anfassen werden (gepinnter Speicher ist sofort
+  belegt, der Rest eines laufenden Loads nicht).

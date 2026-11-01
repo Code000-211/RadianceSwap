@@ -38,7 +38,8 @@ enum {
     RAD_E_NOTFOUND      = -17,
     RAD_E_UNSUPPORTED   = -18,
     RAD_E_FULL          = -19,  /* a pool, arena or table is exhausted */
-    RAD_E_CANCELLED     = -20
+    RAD_E_CANCELLED     = -20,
+    RAD_E_NOHOST        = -21   /* host RAM, a memory cgroup or cache.host_budget_mib has no room */
 };
 
 /* ------------------------------------------------------------------ the helpers, inline
@@ -77,6 +78,7 @@ static inline const char* rad_strerror(int status) {
         case RAD_E_UNSUPPORTED: return "unsupported";
         case RAD_E_FULL:        return "pool or table exhausted";
         case RAD_E_CANCELLED:   return "cancelled";
+        case RAD_E_NOHOST:      return "not enough host memory (RAM, cgroup limit or host budget)";
         default:                return "unknown error";
     }
 }

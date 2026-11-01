@@ -32,6 +32,8 @@ Freigabe-Zahlen unten.
 | – | Issue-Kriterien Sampling, MTP, Streaming, Abbruch, lange Prompts | bestanden |
 | 11 | Gestreamte Statik zurück in den VRAM (#19) | bestanden, siehe §11 |
 | 12 | KV-Leihe zwischen Models, die KV-Partition wächst (#17) | bestanden, nach vier Fixes (siehe §12) |
+| 13 | Host-Pools vor der Allokation geprüft, MoE `a` + streamendes MoE `b` (#46) | bestanden, kein Exit 137 (siehe §13) |
+
 | 14 | Erschöpfte VA-Arena, Single-Engine-Perf gegen den Stand vor #44 (#45) | bestanden, ein Fehler in `Mover::resize` behoben (siehe §14) |
 
 ## Gefundene Fehler und Fixes
@@ -401,7 +403,7 @@ hat nach der Statik keinen Platz für Experts), `a` bleibt unverändert. Nicht g
 denen `a` Experts im Slab hält und `b` streamt. Der Versuch (`a` = MoE mit 20 GB Pool, `b` = MoE, 50 %)
 scheiterte am Host-RAM: `a` allein belegt 138 GiB, die Pool-Erhöhung von `b` (+20 282 MiB je Rank) kam
 dazu, der Kernel beendete den Server (Exit 137, ohne Meldung, `host budget` warnte nicht). Dieselbe
-Grenze wie „Host-RAM ist die Grenze großer Models (#13)“ oben; nicht behoben.
+Grenze wie „Host-RAM ist die Grenze großer Models (#13)“ oben; behoben in #46, siehe §13.
 
 ## 11 Gestreamte Statik zurück in den VRAM (#19)
 
@@ -549,6 +551,30 @@ Zeitlauf von Lauf 1 (Sample alle 2 s; A committed | B committed | B Wachstum gew
   ist als die Obergrenze. Eine Obergrenze, die der Carve ohnehin deckt (Standard `m_kv.json` zuvor), wächst nie.
 - Nicht gemessen: Idle KV von A an den Slab von B (`lend_from` über Engines, bleibt ungebaut), drei Models, dichte
   Models mit großem Cache-Bedarf.
+
+## 13 Host-Pools vor der Allokation (#46)
+
+`scripts/swap-acceptance/host_budget_stream.py MODEL.rad --a-headroom-mib 2836 --extra "--placement expert_tiered --host-pool-mib 26000 --kv-cache-dtype fp8 --tp-wire wht6 --ngram-placement disk"`
+(Port 18080, GPUs exklusiv, Merge-Stand mit `origin/main` inkl. #47 und #48). Beide Models sind das MoE
+(`qwen4exp`, 65,8 GiB Gewichte je Container-Kopie); `--host-pool-mib 26000` je Rang, damit `a` einen großen Host-Pool hält
+(das Szenario von PR #43: dort `a` 138 GiB, dann Exit 137). `a`: 262144 × 64, Headroom 2836 MiB (nach der Formel in
+`static-streaming.md`: `b` bleiben 1,96 GiB claimable für 166 MiB Cache + die Hälfte der Statik von 3,58 GiB), `b`: 4096 × 1,
+Headroom 96 MiB. `b` streamt tatsächlich (`static_streamed_fraction` 0,562). Host-RAM 170 GiB (MemAvailable im Leerlauf 161 GiB).
+
+| Phase | Budget | `a` aktiv | Anfrage an `b` | danach |
+|---|---|---|---|---|
+| `natural` | 0 (aus MemAvailable/cgroup) | Pool 73,3 GiB + Store 67,5 GiB = 140,8 GiB gebucht | **200**; Store-Kopie von `a` (67,5 GiB, aktives Model) verdrängt, Pools 139,4 GiB; `b` aktiv, 56,2 % gestreamt | `a` aktiv, gleiche Antwort wie vorher, Server lebt, VRAM danach 57 MiB je Karte |
+| `refuse` | `a`-Pools + 256 MiB (73,6 GiB) | Pool 73,3 GiB | **503** „activation of model b failed: not enough host memory (RAM, cgroup limit or host budget)“; Log: `host budget: this model's host pools (65.75 GiB) do not fit cache.host_budget_mib (73.60 GiB) after every prepared model and every store copy was dropped. Nothing running is touched` | `b` `failed`, `over_budget_claims` 3, `a` aktiv, gleiche Antwort, Server lebt |
+
+Host-RAM während des Laufs (`free -m` und RSS alle 4 s, Phase `natural`): Spitze 154,6 GiB „used“ (RSS 144,7 GiB), kleinstes
+MemAvailable **16,3 GiB** (≥ `--host-headroom-mib` 4 GiB), nie unter dem Headroom; nach der Deaktivierung zurück auf 10 GiB.
+Alle Prüfungen des Skripts in beiden Phasen bestanden, kein „Killed“ im Log. `ctest -L unit` auf dem Merge-Stand: nur
+die acht bekannten roten Tests (arch, gbnf shard0/2, tokenizer, images, videos, kbench, kbench_mutant).
+
+Fehler: keine neuen. Ohne den Fix hätte dieselbe Aktivierung Store-Kopie (67,5 GiB) + Pools beider Models (≈ 140 GiB)
+gebucht, also ≈ 208 GiB auf 170 GiB (der Kernel-Kill aus §10); hier verdrängt die Prüfung zuerst die Kopie und passt.
+Nicht gemessen: ein Lauf desselben Szenarios auf `main` zur Gegenprobe (die Kill-Gefahr für den Container ist es nicht
+wert), und `b` mit `--ngram-placement ram`.
 
 ## 14 Erschöpfte VA-Arena und Single-Engine-Perf (#45)
 

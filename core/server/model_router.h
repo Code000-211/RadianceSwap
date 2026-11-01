@@ -37,6 +37,10 @@
  * deactivated model, the Launcher drains and destroys its Engine, and the model is cold again.
  * Every model with a Launcher can be deactivated, the default model too.
  *
+ * A Launcher that returns RAD_E_NOHOST (host pools do not fit RAM, a cgroup or the host budget,
+ * ticket #46) is an ordinary activation failure: 503, backoff, and no other model is deactivated,
+ * since freeing VRAM would not give back host memory.
+ *
  * Deactivation under VRAM pressure (ticket #16): a Launcher that returns RAD_E_NOMEM (thrown
  * exceptions excepted) before attaching reports that the cards had no room for the model: the
  * Engine's budget did not fit, or main.cpp saw beforehand that the tightest card has less free than

@@ -115,6 +115,9 @@ struct Fleet {
      * load that reads 4096 source bytes), later ones find it (warm, nothing read), and the router
      * is told, as main.cpp does. */
     PreparedWeightStore* const store;
+    /* Model "b" finds no host memory for its pools: its launcher returns what Engine::plan does
+     * (ticket #46) before it has pinned a byte. */
+    std::atomic<bool> b_lacks_host_memory{ false };
 
     explicit Fleet(int64_t idle_ms, bool manual_sched = false, Gate* slow_teardown = nullptr,
                    PreparedWeightStore* weights = nullptr)
@@ -139,6 +142,7 @@ struct Fleet {
         for (const char* id : { "a", "b", "c" })
             mr->add_cold(id, [this](const std::string& model) {
                 ++launches;
+                if (model == "b" && b_lacks_host_memory) return (int)RAD_E_NOHOST;
                 FakeEngine e(model, model == "a" ? "alpha" : model == "b" ? "beta" : "gamma",
                              destroyed);
                 e.sched.manual = manual;   /* before the Server can be reached */
@@ -377,6 +381,26 @@ TEST(the_host_budget_makes_the_least_recently_used_prepared_model_cold) {
     CHECK(f.state("b") == ModelState::Cold);
     CHECK(f.state("c") == ModelState::Prepared);
     CHECK(store.stats().used() <= 8192);
+}
+
+/* Ticket #46: an activation whose host pools do not fit (RAD_E_NOHOST from Engine::plan) is refused
+ * with a 503 that says so. It is not the VRAM shortage the router resolves by deactivating another
+ * model: the active model keeps running and keeps answering, and nothing is deactivated for it. */
+TEST(an_activation_whose_host_pools_do_not_fit_is_refused_and_the_active_model_stays) {
+    Fleet f(0);
+    REQUIRE(eventually([&] { return f.state("a") == ModelState::Active; }));
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    f.b_lacks_host_memory = true;
+    const HttpResponse r = f.post("b");
+    CHECK_EQ(r.status, 503);
+    CHECK(r.body.find("not enough host memory") != std::string::npos);
+    CHECK(f.state("a") == ModelState::Active);
+    CHECK(f.state("b") == ModelState::Failed);
+    CHECK_EQ(f.status("a")["pressure_deactivations"].get<int>(), 0);
+    CHECK_EQ(f.status("a")["deactivations"].get<int>(), 0);
+    CHECK_EQ(f.status("b")["activation_failures"].get<int>(), 1);
+    CHECK_EQ(reply_of(f.post("a")), std::string("alpha"));
+    CHECK_EQ(f.launches.load(), 2);   /* a once, b once: nothing activated again */
 }
 
 TEST(a_model_that_keeps_getting_requests_stays_active) {
