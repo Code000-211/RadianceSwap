@@ -642,6 +642,17 @@ struct PromoteRig {
         return RAD_OK;
     }
     const char* at(rad_weight w) { return (const char*)m.residency()->lookup(w)->ptr; }
+    /* Bytes of the weight's 2 MiB that are not `v`, read through a device copy: a promoted unit
+     * sits in the card's memory, which the host cannot dereference. -1 if the copy fails. */
+    int64_t bytes_not(rad_weight w, uint8_t v) {
+        RadStream s = nullptr;
+        if (rad_stream_create(&s, 0) < 0) return -1;
+        std::vector<uint8_t> got((size_t)(2 * MiB));
+        rad_stream_sync(m.transfer_stream());
+        const bool ok = rad_memcpy_async(got.data(), at(w), 2 * MiB, s) >= 0 && rad_stream_sync(s) >= 0;
+        rad_stream_destroy(s);
+        return ok ? (int64_t)std::count_if(got.begin(), got.end(), [v](uint8_t b) { return b != v; }) : -1;
+    }
     /* promote_statics until `streamed` weight bytes are left (a copy lands on a later call), or
      * four calls when nothing is to land. */
     int promote(int64_t cap, int64_t streamed = -1) {
@@ -687,7 +698,7 @@ TEST(a_promoted_static_unit_is_copied_to_fresh_arena_address_in_keep_order_withi
     const char* lo = (const char*)r.pools.weights().base() + r.pools.weights().bytes();
     const char* hi = (const char*)r.pools.weights().base() + r.pools.weights().va_bytes();
     CHECK(r.at(r.streamed[0]) >= lo && r.at(r.streamed[0]) < hi);     /* the arena, not the budget */
-    for (int64_t i = 0; i < 2 * MiB; i += 4096) CHECK_EQ((int)r.at(r.streamed[0])[i], 0x41);
+    CHECK_EQ(r.bytes_not(r.streamed[0], 0x41), (int64_t)0);
     /* The stager no longer copies it: only the unit still in the pool is staged. */
     CHECK_EQ(r.m.stage_need({ r.unit[0] }), (int64_t)0);
     CHECK_EQ(r.m.stage_need({ r.unit[1] }), align_up(2 * MiB, RAD_ALIGN_UNIT));
@@ -697,7 +708,7 @@ TEST(a_promoted_static_unit_is_copied_to_fresh_arena_address_in_keep_order_withi
     CHECK_OK(r.promote(2 * one, 0));
     CHECK(r.at(r.streamed[1]) != home1);
     CHECK(r.at(r.streamed[1]) >= first + one);              /* fresh, beyond the first's span */
-    for (int64_t i = 0; i < 2 * MiB; i += 4096) CHECK_EQ((int)r.at(r.streamed[1])[i], 0x42);
+    CHECK_EQ(r.bytes_not(r.streamed[1], 0x42), (int64_t)0);
     CHECK_EQ(r.m.static_promoted_cost(), 2 * one);
     CHECK_EQ(r.m.static_remaining_cost(), (int64_t)0);
     CHECK_EQ(r.m.static_streamed_bytes(), (int64_t)0);
