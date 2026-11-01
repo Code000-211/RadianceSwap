@@ -5,7 +5,7 @@ both at once, A and B the percent weights of m1 and m2: 10*A/100 and 10*B/100 cl
 VRAM per card (rocm-smi) is sampled every 3 s and printed with the server log's 'group:' lines, and greedy tokens of
 both models are checked after every phase. Every load request asks for logprobs (a non-finite logit is an HTTP 500
 and a 'no finite logit' log line, both counted). /radiance/models is sampled every 100 ms in a thread of its own: the
-server answers all models from one planner snapshot, so every sample must have sum committed <= pool per rank (#51);
+server answers all models from one planner snapshot, so every sample must have sum committed <= pool (+ POOL_SLACK_MIB of MiB rounding) per rank (#51);
 the phase line counts samples and violations. e.g. elastic.py /tmp/t35/mm.log m1:60,idle:20,w80/20:60,w20/80:60"""
 import hashlib, json, random, re, subprocess, sys, threading, time, urllib.request
 log, phases = sys.argv[1], sys.argv[2].split(",")
@@ -32,6 +32,7 @@ def slab():
 def sums(sl):
     """per rank: (sum committed, pool) MiB over the models, from one /radiance/models answer"""
     return [(sum(v[r][0] for v in sl.values()), sum(v[r][2] for v in sl.values())) for r in range(len(next(iter(sl.values()))))]
+POOL_SLACK_MIB = 2   # each of the four numbers of a rank is cut to whole MiB, so a sum may read up to 2 MiB over the exact pool
 trace = []   # (s, {model: [(committed, target, offer) MiB per rank]}) every 5 s
 checks = {"n": 0, "bad": 0, "worst": 0, "first_bad": None}
 def check_sampler():
@@ -42,7 +43,7 @@ def check_sampler():
             checks["n"] += 1
             if checks["n"] % 50 == 1: trace.append((round(time.time() - t0, 1), sl))
             over = max(c - p for c, p in sums(sl))
-            if over > 0:
+            if over > POOL_SLACK_MIB:
                 checks["bad"] += 1; checks["worst"] = max(checks["worst"], over)
                 checks["first_bad"] = checks["first_bad"] or (round(time.time() - t0, 1), sl)
         stop.wait(0.1)

@@ -1,6 +1,5 @@
 #include "group_planner.h"
 
-#include "../rad_internal.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -261,6 +260,20 @@ std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
          * cannot grow, and an expert is only a cache line. Each step takes from what the one before it
          * left, so no byte is planned twice. */
         const int64_t statics = r < static_pending.size() ? static_pending[r] : 0;
+        /* A grant kept from `prev` was planned against an older pool: a newcomer that started with less
+         * than it offered shrinks the pool when it reports. What the pool no longer covers is taken back
+         * from the grants not yet backed; the bytes a member holds are never counted twice (#51). */
+        int64_t unbacked = 0;
+        for (size_t i = 0; i < n && i < want.size(); ++i)
+            if (grows[i]) unbacked += reserved[i] - std::max<int64_t>(members[i].facts[r].held, 0);
+        const int64_t cut = std::min(unbacked, std::max<int64_t>(taken + statics - pool[r], 0));
+        for (size_t i = 0; i < n && i < want.size() && cut > 0; ++i)
+            if (grows[i]) {
+                const int64_t held = std::max<int64_t>(members[i].facts[r].held, 0);
+                const int64_t d = (int64_t)((__int128)cut * (reserved[i] - held) / unbacked);
+                reserved[i] -= d;
+                taken -= d;
+            }
         int64_t free_bytes = std::max<int64_t>(pool[r] - taken - statics, 0);
         /* The experts were already cut by the claim (group_allocate). */
         const int64_t kv_free = free_bytes;
@@ -342,6 +355,15 @@ std::vector<int32_t> group_classes(const Plan& plan) {
     return { k.begin(), k.end() };
 }
 
+void group_limit_growth(std::vector<ClassCap>& classes, int64_t granted) {
+    int64_t growth = 0;
+    for (const ClassCap& c : classes)
+        if (c.cap > c.held) growth += (c.cap - c.held) * c.unit_bytes;
+    if (growth <= granted) return;
+    for (ClassCap& c : classes)
+        if (c.cap > c.held) c.cap = c.held + (int64_t)((__int128)(c.cap - c.held) * std::max<int64_t>(granted, 0) / growth);
+}
+
 int64_t group_resident_cap(const RankBudget& b, int32_t slab_class) {
     if (b.class_units.empty()) return b.bytes > 0 ? -1 : 0;
     const auto it = b.class_units.find(slab_class);
@@ -411,20 +433,6 @@ void GroupPlanner::recompute(const std::string& reporter, size_t rank) {
     given_.clear();
     for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)
         given_[members_[i].id] = targets_[i];
-    /* TEMP diagnostic (#51) */
-    for (size_t r = 0; r < pool.size(); ++r) {
-        int64_t sh = 0, st = 0;
-        for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)
-            if (r < members_[i].facts.size() && members_[i].facts[r].elastic) { sh += members_[i].facts[r].held; st += targets_[i][r].bytes; }
-        if (sh > pool[r] || st > pool[r]) {
-            std::string d;
-            for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)
-                d += " " + members_[i].id + "{held " + std::to_string(members_[i].facts[r].held >> 20) + " target " + std::to_string(targets_[i][r].bytes >> 20) +
-                     " prev " + std::to_string((i < prev.size() && r < prev[i].size() ? prev[i][r].bytes : 0) >> 20) + " offer " + std::to_string(members_[i].facts[r].offer >> 20) +
-                     " kvgrown " + std::to_string(members_[i].facts[r].kv.grown >> 20) + "}";
-            RAD_WARN("OVERBOOK rank %zu: sum held %lld sum target %lld > pool %lld MiB; free %lld;%s", r, (long long)(sh >> 20), (long long)(st >> 20), (long long)(pool[r] >> 20), (long long)(free[r] >> 20), d.c_str());
-        }
-    }
 }
 
 GroupBudget GroupPlanner::join(const std::string& id, GroupFacts facts) {

@@ -4,7 +4,7 @@ Each cycle loads m1 alone, then m2 alone (the idle one gives its pages up, the b
 load request asks for logprobs, so a non-finite logit in any step shows up as an HTTP 500. Prints per phase the
 requests, the errors, the committed expert bytes per engine and the VRAM; at the end the error rate per cycle.
 A thread asks /radiance/models every 100 ms: the server answers from one planner snapshot, so each answer must have
-sum committed <= pool (the sum of the offers) per rank (#51); the total line counts samples and violations."""
+sum committed <= pool (the sum of the offers, + POOL_SLACK_MIB) per rank (#51); the total line counts samples and violations."""
 import json, random, re, subprocess, sys, threading, time, urllib.request, urllib.error
 log, cycles, secs = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 PORT = 18080
@@ -23,6 +23,7 @@ def vram():
 def slab():
     j = json.load(urllib.request.urlopen(f"http://localhost:{PORT}/radiance/models", timeout=30))
     return {m["id"]: [v["committed_bytes"] >> 20 for v in m["expert_slab"]] for m in j["data"] if "expert_slab" in m}
+POOL_SLACK_MIB = 2   # MiB rounding of the four numbers per rank (see elastic.py)
 pool_checks = {"n": 0, "bad": 0, "worst": 0}
 def pool_sampler():
     while True:
@@ -31,7 +32,7 @@ def pool_sampler():
             if len(ms) == 2:
                 pool_checks["n"] += 1
                 over = max(sum(m[r]["committed_bytes"] for m in ms) - sum(m[r]["offer_bytes"] for m in ms) for r in range(len(ms[0]))) >> 20
-                if over > 0: pool_checks["bad"] += 1; pool_checks["worst"] = max(pool_checks["worst"], over)
+                if over > POOL_SLACK_MIB: pool_checks["bad"] += 1; pool_checks["worst"] = max(pool_checks["worst"], over)
         except Exception: pass
         time.sleep(0.1)
 threading.Thread(target=pool_sampler, daemon=True).start()

@@ -705,13 +705,15 @@ public:
     int64_t slab_offer_bytes(size_t klass) const {
         return klass < pools_.size() ? pools_[klass].n_movable0 * pools_[klass].stride : 0;
     }
-    int64_t slab_held_bytes(size_t klass) const {
+    int64_t slab_held_bytes(size_t klass) const { return slab_held_units(klass) * slab_unit_bytes(klass); }
+    /* The same in movable units, and one unit's slot bytes (what a cap in units costs in bytes). */
+    int64_t slab_held_units(size_t klass) const {
         if (klass >= pools_.size()) return 0;
         const ClassPools& cp = pools_[klass];
         if (cp.n_movable0 == 0) return 0;
-        return std::max<int64_t>(cp.backed - cp.n_work - (cp.n_resident0 - cp.n_movable0), 0) *
-               cp.stride;
+        return std::max<int64_t>(cp.backed - cp.n_work - (cp.n_resident0 - cp.n_movable0), 0);
     }
+    int64_t slab_unit_bytes(size_t klass) const { return klass < pools_.size() ? pools_[klass].stride : 0; }
     /* Whether the weights pool's address arena ran short: from then on a shrink is logical (the
      * pages stay mapped) and the slab grows no further than what is mapped. */
     bool    slab_arena_spent() const { return arena_spent_; }

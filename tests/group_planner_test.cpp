@@ -985,3 +985,67 @@ TEST(static_grants_are_decided_per_rank_at_world_size_2) {
     CHECK_EQ(t[0].statics_cap, 4 * MiB);
     CHECK_EQ(t[1].statics_cap, 10 * MiB);
 }
+
+/* #51: a newcomer that starts with less than it offered reports a smaller offer, and the pool shrinks with
+ * it. The grant planned for it against the larger pool must not outlive the pool: the running model still
+ * holds its bytes, so the newcomer is granted only what the pool has left beside them. */
+TEST(a_newcomer_that_starts_with_less_than_it_offered_is_not_granted_past_the_smaller_pool) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("b", 0, 10 * MiB, 10 * MiB);       /* started with 10 of its 20: the pool is 20 + 10 */
+    CHECK(mib(g.target("a")) + mib(g.target("b")) <= 30);
+    CHECK(20 + mib(g.target("b")) <= 30);            /* a holds 20 until it reports less */
+}
+
+/* #51: the planner grants bytes for the whole slab; a class cap that rises beside a class that is slow to
+ * give pages back may map no more than the grant. */
+TEST(class_caps_grow_together_by_no_more_than_the_granted_bytes) {
+    const auto caps = [](int64_t granted) {
+        std::vector<ClassCap> c = { { 100, 60, 2 * MiB }, { 50, 80, 3 * MiB }, { -1, 10, MiB } };
+        group_limit_growth(c, granted);
+        return std::vector<int64_t>{ c[0].cap, c[1].cap, c[2].cap };
+    };
+    CHECK(caps(80 * MiB) == (std::vector<int64_t>{ 100, 50, -1 }));    /* the grant covers it */
+    CHECK(caps(40 * MiB) == (std::vector<int64_t>{ 80, 50, -1 }));     /* half of it */
+    CHECK(caps(0) == (std::vector<int64_t>{ 60, 50, -1 }));            /* none: the class holds what it has, the fall stays */
+    CHECK(caps(-5 * MiB) == (std::vector<int64_t>{ 60, 50, -1 }));
+}
+
+/* #51: movers that follow the target they read at their last report, with heat that flips at random:
+ * what the members hold never exceeds the pool. */
+TEST(movers_that_follow_their_targets_never_hold_more_than_the_pool) {
+    for (int members = 2; members <= 3; ++members)
+        for (uint32_t seed = 1; seed <= 200; ++seed) {
+            GroupPlanner g(0);
+            std::vector<std::string> id;
+            std::vector<int64_t> held(members, 20), cap(members, 20);   /* MiB; a joined member holds its offer */
+            for (int i = 0; i < members; ++i) {
+                id.push_back(std::string(1, (char)('a' + i)));
+                (void)g.join(id[i], elastic_rank(20, { bin(30, 2, 0.0f) }));
+                g.update_held(id[i], 0, 20 * MiB);
+            }
+            uint32_t rng = seed * 2654435761u;
+            const auto next = [&](uint32_t n) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % n; };
+            for (int step = 0; step < 400; ++step) {
+                const int i = (int)next((uint32_t)members);
+                if (next(5) == 0)
+                    g.update(id[i], std::vector<std::vector<HeatBin>>{ { bin(30, 2, (float)(next(3) * next(5))) } });
+                /* The pages the mover mapped or released since its last report, up to the target it read then. */
+                const int64_t move = (int64_t)(1 + next(4)) * 2;
+                held[i] = held[i] < cap[i] ? std::min(cap[i], held[i] + move) : std::max(cap[i], held[i] - move);
+                g.update_held(id[i], 0, held[i] * MiB);
+                cap[i] = mib(g.target(id[i]));
+                int64_t sum = 0;
+                for (int64_t h : held) sum += h;
+                if (sum > 20 * members) {
+                    std::fprintf(stderr, "members %d seed %u step %d: sum held %lld > pool %d:", members, seed, step, (long long)sum, 20 * members);
+                    for (int k = 0; k < members; ++k) std::fprintf(stderr, " %s{held %lld target %lld}", id[k].c_str(), (long long)held[k], (long long)mib(g.target(id[k])));
+                    std::fprintf(stderr, "\n");
+                }
+                CHECK(sum <= 20 * members);
+                if (sum > 20 * members) return;
+            }
+        }
+}

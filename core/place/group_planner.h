@@ -223,6 +223,17 @@ std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat, f
 /* The slab classes of a plan whose units the group planner counts (group_heat_bins). */
 std::vector<int32_t> group_classes(const Plan& plan);
 
+/* One slab class of an elastic slab as the engine hands the planner's target to the mover. */
+struct ClassCap {
+    int64_t cap;          /* resident units the target allows; < 0: no limit */
+    int64_t held;         /* movable units with pages behind them now */
+    int64_t unit_bytes;   /* one unit's slot bytes */
+};
+/* The planner grants bytes for the whole slab, the mover grows a class at a time: a class cap that rises
+ * while the other class is slow to give its pages back would map more than was granted (#51). The caps
+ * above what the classes hold may add up to no more than `granted` bytes; they are cut in proportion. */
+void group_limit_growth(std::vector<ClassCap>& classes, int64_t granted);
+
 /* How many resident units of slab class `slab_class` the target `b` lets an engine keep, for
  * Mover::set_resident_cap; -1 for no limit. A sole engine's target names no classes and equals
  * its offer; a target that names some grants the others nothing. */
