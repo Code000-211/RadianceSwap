@@ -199,6 +199,12 @@ public:
     /* What run() hands the transport; a ModelRouter listens with the default model's. */
     TransportOptions transport_options() const;
 
+    /* Called as each request that got a first token is recorded, with its activation wait, its
+     * wait in the scheduler's queue and its prefill, in seconds (TimingsOut). Set before the
+     * Server takes requests; the ModelRouter sets it to feed `radiance:model_ttft_*`. */
+    using TtftObserver = std::function<void(double activation_s, double queue_s, double prefill_s)>;
+    void set_ttft_observer(TtftObserver f) { ttft_observer_ = std::move(f); }
+
     /* Renders the deployment's template defaults once at startup, since a default the template
      * refuses would 400 every request relying on it. A one-message chat is parsed as a request
      * would be: with no defaults, then with --chat-template-kwargs, then also --reasoning-effort.
@@ -248,8 +254,10 @@ private:
     struct StreamState;
 
     static UsageOut usage_of(const OaiRequest& r, const std::vector<Generation>& gens);
-    static TimingsOut timings_of(const Sink* const* sinks, size_t n, int64_t received_ns);
-    static TimingsOut timings_of(const std::vector<Generation>& gens, int64_t received_ns);
+    static TimingsOut timings_of(const Sink* const* sinks, size_t n, int64_t received_ns,
+                                 int64_t activation_ns = 0);
+    static TimingsOut timings_of(const std::vector<Generation>& gens, int64_t received_ns,
+                                 int64_t activation_ns = 0);
 
     void register_routes();
 
@@ -396,6 +404,7 @@ private:
     void  record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall,
                  bool quiet = false);
 
+    TtftObserver   ttft_observer_;
     Deps           deps_;
     ServerOptions  opt_;
     std::shared_ptr<ModelFrontend> frontend_;

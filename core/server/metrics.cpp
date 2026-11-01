@@ -250,6 +250,9 @@ struct Writer {
      * Histogram::observe makes consistent. */
     void hist(const char* name, const char* doc, const std::string& labels, const Histogram& h) {
         help(name, doc, "histogram");
+        hist_samples(name, labels, h);
+    }
+    void hist_samples(const char* name, const std::string& labels, const Histogram& h) {
         for (size_t i = 0; i < h.bounds().size(); ++i) {
             out += name; out += "_bucket";
             out += labels.substr(0, labels.size() - 1);   /* drop the closing brace */
@@ -268,6 +271,12 @@ struct Writer {
 };
 
 }  /* namespace */
+
+std::string histogram_samples(const char* name, const std::string& labels, const Histogram& h) {
+    Writer w;
+    w.hist_samples(name, labels, h);
+    return std::move(w.out);
+}
 
 std::string Metrics::render() const {
     Writer w;

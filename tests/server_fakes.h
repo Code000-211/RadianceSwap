@@ -800,6 +800,8 @@ struct FakeScheduler : IScheduler {
     /* Manual mode: see the file comment. A cancel finishes the request at once, as an engine
      * frees a cancelled request's blocks before the next step. */
     bool manual = false;
+    /* Threaded mode: how long a request waits before it is admitted, as in a scheduler's queue. */
+    int admit_delay_ms = 0;
     /* Refuse every submission the way SchedulerBridge refuses one: id 0 and a failed sink, with
      * this status and reason (RAD_E_FULL is the scheduler's "the prompt is longer than the KV
      * cache can ever hold"). */
@@ -890,9 +892,11 @@ struct FakeScheduler : IScheduler {
         const int fst = fail_status;
         const char* fwhy = fail_why;
         const int32_t nd = drafts;
+        const int admit_ms = admit_delay_ms;
         std::vector<float> vec = embedding;
         if (embed_mark_length && !vec.empty()) vec[0] = (float)r.prompt.size();
-        workers.emplace_back([sink, cap, text, h, fst, fwhy, nd, np, embed, vec] {
+        workers.emplace_back([sink, cap, text, h, fst, fwhy, nd, np, embed, vec, admit_ms] {
+            if (admit_ms) std::this_thread::sleep_for(std::chrono::milliseconds(admit_ms));
             sink_admitted(sink);
             sink_prompt_stats(sink, 8, 4);
             if (embed) {
