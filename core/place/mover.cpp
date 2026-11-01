@@ -801,6 +801,7 @@ int Mover::promote_statics(int64_t cap) {
         if (off < 0) {
             RAD_WARN("mover: the weights pool's address arena is used up; no more static weights "
                      "are promoted");
+            note_arena_spent();
             promote_ok_ = false;
             break;
         }
@@ -1679,7 +1680,7 @@ void Mover::pick_chunk(int64_t want_bytes, int64_t stride, int64_t* slots, int64
     *slots = std::max<int64_t>((best_n * g - (int64_t)RAD_ALIGN_UNIT) / stride, 1);
 }
 
-int Mover::map_slots(ClassPools& cp, int64_t upto) {
+int Mover::map_slots(ClassPools& cp, int64_t upto, bool* no_address) {
     Pool& wp = budget_->weights();
     upto = std::min(upto, cp.n_fixed);
     while (cp.backed < upto) {
@@ -1688,9 +1689,12 @@ int Mover::map_slots(ClassPools& cp, int64_t upto) {
         if (ch.off < 0) {
             ch.off = wp.va_arena(cp.chunk_span);
             if (ch.off < 0) {
+                note_arena_spent();
+                if (no_address) *no_address = true;
                 device_set_error("the weights pool's address arena is used up");
                 return RAD_E_NOMEM;
             }
+            arena_owed_ = std::max<int64_t>(arena_owed_ - cp.chunk_span, 0);
         }
         const int64_t m = std::min(upto - c * cp.chunk_slots, cp.chunk_slots);
         const int rc = wp.commit(ch.off, m * cp.stride + (int64_t)RAD_ALIGN_UNIT);
@@ -1720,8 +1724,14 @@ bool Mover::grow_backing(ClassPools& cp) {
             }
         }
         const int64_t before = cp.backed;
-        const int rc = map_slots(cp, to);
-        if (rc < 0) {
+        bool no_address = false;
+        const int rc = map_slots(cp, to, &no_address);
+        if (rc < 0 && no_address) {
+            /* No fresh address space to map into, and an address is never mapped twice: the slab
+             * cannot grow past what it has pages behind (it can still shrink and regrow within them). */
+            cp.want_target = std::max(cp.backed, have);
+            cp.pool.set_target(cp.n_pool0 + std::max<int64_t>(cp.n_base - cp.want_target, 0));
+        } else if (rc < 0) {
             cp.grow_after_ns = rad_mono_ns() + 1000000000ull;
             RAD_WARN("mover: the card would not back %lld more slab slots of %s; the cap stays at "
                      "%lld slots for a second (%s)", (long long)(to - before),
@@ -1748,6 +1758,7 @@ int64_t Mover::releasable_chunk(const ClassPools& cp) const {
 bool Mover::shrink_backing(ClassPools& cp) {
     const int64_t c = releasable_chunk(cp);
     if (c < 0) return false;
+    if (release_blocked(cp)) { note_arena_spent(); return false; }
     ClassPools::Chunk& ch = cp.chunks[(size_t)c];
     if (budget_->weights().decommit(ch.off, cp.chunk_span) < 0) {
         RAD_WARN("mover: giving back slab slots %lld.. failed: %s", (long long)(c * cp.chunk_slots),
@@ -1756,7 +1767,23 @@ bool Mover::shrink_backing(ClassPools& cp) {
     }
     ch = {};
     cp.backed = c * cp.chunk_slots;
+    arena_owed_ += cp.chunk_span;
     return true;
+}
+
+/* Pages go back to the card only while the arena can hand the slab a fresh piece for them again
+ * (an address is never mapped twice) beyond the pieces already given back and owed. Past that the
+ * shrink is logical: the cap still demotes, the pages stay mapped for the next regrow. */
+bool Mover::release_blocked(const ClassPools& cp) const {
+    return budget_->weights().va_arena_left() - arena_owed_ < cp.chunk_span;
+}
+
+void Mover::note_arena_spent() {
+    if (arena_spent_) return;
+    arena_spent_ = true;
+    RAD_WARN("mover: the weights pool's address arena is used up (%s left); the expert slab keeps its pages "
+             "mapped from here on: a cap still demotes, but no bytes go back to the card and the slab "
+             "cannot grow past what is mapped", humanb(budget_->weights().va_arena_left()).c_str());
 }
 
 /* One step of the resident cap, from the units' own state rather than the slot counts, so a swap
@@ -1785,7 +1812,9 @@ bool Mover::resize(size_t c, HeatEngine* heat) {
         drop_cand_.push_back({ heat ? heat->heat(u) : 0.0f, u });
     }
     for (const Move& m : moves_) {
-        if (m.state == Move::State::Free || m.unit < 0 || m.slab_slot < 0) continue;
+        /* A copy in flight only: once published, the unit's own state says where it is, and counting
+         * the move again made the cap oscillate (the fill promoted, the next resize demoted). */
+        if (m.state != Move::State::Copying || m.unit < 0 || m.slab_slot < 0) continue;
         if (unit_[(size_t)m.unit].klass != (int32_t)c || cp.is_flex(m.slab_slot)) continue;
         if (m.kind == Move::Kind::Demote) --resident;
         if (m.kind == Move::Kind::Promote) ++resident;
@@ -1816,7 +1845,8 @@ bool Mover::resize(size_t c, HeatEngine* heat) {
         const int64_t room = std::min(-excess, spare);
         if (room > 0 && fill(c, room, heat, 0) >= 0) moved = true;
     } else if (stranded.empty() && cp.slab.target(0) == cp.n_base && cp.want_target == cp.n_base &&
-               (cp.chunk_slots == 0 || releasable_chunk(cp) < 0) && cp.backed >= cp.n_base) {
+               (cp.chunk_slots == 0 || releasable_chunk(cp) < 0 || release_blocked(cp)) &&
+               cp.backed >= cp.n_base) {
         cp.resized = false;     /* regrown and settled: the class is as the plan placed it */
     }
     if (cp.chunk_slots > 0 && shrink_backing(cp)) moved = true;

@@ -146,6 +146,7 @@ struct RankFacts {
      * its ceiling, as before. */
     bool    elastic = false;
     int64_t held = 0;    /* expert bytes its slab has pages behind now (Mover::slab_held_bytes) */
+    bool    arena_spent = false;   /* the slab's address arena ran out: it shrinks logically only (Mover::slab_arena_spent) */
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
     KvPartition kv;
@@ -250,6 +251,8 @@ public:
      * and until then the member's whole offer is reserved as held. Ignored for an unknown id or
      * rank. */
     void update_held(const std::string& id, size_t rank, int64_t held, int64_t offer = -1);
+    /* The rank's slab ran out of address space (status and metrics only). Ignored for an unknown id or rank. */
+    void update_arena_spent(const std::string& id, size_t rank);
     /* A rank's KV partition; targets are recomputed. Ignored for an unknown id or rank. */
     void update_kv(const std::string& id, size_t rank, const KvPartition& kv);
     /* A rank's static weights (StaticFacts); targets are recomputed. Ignored for an unknown id or
@@ -269,6 +272,7 @@ public:
         bool elastic = false;
         StaticFacts statics;   /* as last reported; all zero before the first report */
         int64_t kv_target = 0, kv_grown = 0;   /* the KV partition's claim beyond its carve, and what it has backed */
+        bool arena_spent = false;              /* RankFacts::arena_spent */
     };
     std::vector<RankView> view(const std::string& id) const;
 

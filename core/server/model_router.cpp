@@ -649,7 +649,8 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
             nlohmann::json ranks = nlohmann::json::array();
             for (const auto& v : group_->view(id))
                 ranks.push_back({ { "target_bytes", v.target }, { "committed_bytes", v.committed },
-                                  { "offer_bytes", v.offer }, { "elastic", v.elastic } });
+                                  { "offer_bytes", v.offer }, { "elastic", v.elastic },
+                                  { "arena_spent", v.arena_spent } });
             if (!ranks.empty()) m["expert_slab"] = std::move(ranks);
             nlohmann::json kv = nlohmann::json::array();
             for (const auto& v : group_->view(id))
@@ -761,6 +762,8 @@ std::string ModelRouter::metrics_text() const {
              "# TYPE radiance:model_expert_slab_committed_bytes gauge\n"
              "# HELP radiance:model_expert_slab_target_bytes What the group planner entitles the model's expert slab to, per rank\n"
              "# TYPE radiance:model_expert_slab_target_bytes gauge\n"
+             "# HELP radiance:model_expert_slab_arena_spent 1 once the slab's address arena ran out: it only shrinks logically (pages stay mapped), per rank\n"
+             "# TYPE radiance:model_expert_slab_arena_spent gauge\n"
              "# HELP radiance:model_kv_grown_bytes Bytes of the model's KV cache beyond its carve with pages behind them, per rank\n"
              "# TYPE radiance:model_kv_grown_bytes gauge\n"
              "# HELP radiance:model_kv_grow_target_bytes What the group planner grants the model's KV cache beyond its carve, per rank\n"
@@ -771,6 +774,7 @@ std::string ModelRouter::metrics_text() const {
                 const std::string rk = ",rank=\"" + std::to_string(r) + "\"";
                 line("radiance:model_expert_slab_committed_bytes", id, rk, (double)views[r].committed);
                 line("radiance:model_expert_slab_target_bytes", id, rk, (double)views[r].target);
+                line("radiance:model_expert_slab_arena_spent", id, rk, views[r].arena_spent ? 1.0 : 0.0);
                 line("radiance:model_kv_grown_bytes", id, rk, (double)views[r].kv_grown);
                 line("radiance:model_kv_grow_target_bytes", id, rk, (double)views[r].kv_target);
             }
