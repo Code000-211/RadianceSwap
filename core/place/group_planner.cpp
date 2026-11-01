@@ -542,6 +542,18 @@ std::vector<GroupPlanner::RankView> GroupPlanner::view(const std::string& id) co
     return out;
 }
 
+std::map<std::string, std::vector<GroupPlanner::RankView>> GroupPlanner::view_all() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::map<std::string, std::vector<RankView>> out;
+    for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)
+        for (size_t r = 0; r < members_[i].facts.size() && r < targets_[i].size(); ++r)
+            out[members_[i].id].push_back({ targets_[i][r].bytes, members_[i].facts[r].held, members_[i].facts[r].offer,
+                                            members_[i].facts[r].elastic, members_[i].facts[r].statics,
+                                            targets_[i][r].kv_grow, members_[i].facts[r].kv.grown,
+                                            members_[i].facts[r].arena_spent });
+    return out;
+}
+
 GroupBudget GroupPlanner::target(const std::string& id) const {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)

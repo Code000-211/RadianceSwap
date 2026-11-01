@@ -280,6 +280,9 @@ public:
         bool arena_spent = false;              /* RankFacts::arena_spent */
     };
     std::vector<RankView> view(const std::string& id) const;
+    /* Every member's view from one lock: a status answer that sums the models (the pool check, #51)
+     * must not read one model before and the next after a report moved bytes between them. */
+    std::map<std::string, std::vector<RankView>> view_all() const;
 
 private:
     /* `reporter`/`rank`: the member whose report triggered this, whose cut grants take effect now. */

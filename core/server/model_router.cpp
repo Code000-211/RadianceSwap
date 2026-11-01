@@ -628,6 +628,7 @@ std::string ModelRouter::status_json() const {
 
 std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
     nlohmann::json models = nlohmann::json::array();
+    const auto slabs = group_ ? group_->view_all() : decltype(group_->view_all()){};   /* one snapshot for all models (#51) */
     for (const auto& [id, c] : cold_) {
         const char* state = state_locked(id, c);
         nlohmann::json m = { { "id", id }, { "state", state },
@@ -646,14 +647,17 @@ std::string ModelRouter::status_json_locked(const HostMemoryStats& host) const {
         if (c.vram_released_mib >= 0) m["vram_released_mib"] = c.vram_released_mib;
         m["prepared_bytes"] = c.prepared_bytes;
         if (group_) {
+            const auto sv = slabs.find(id);
+            const std::vector<GroupPlanner::RankView> none;
+            const auto& views = sv != slabs.end() ? sv->second : none;
             nlohmann::json ranks = nlohmann::json::array();
-            for (const auto& v : group_->view(id))
+            for (const auto& v : views)
                 ranks.push_back({ { "target_bytes", v.target }, { "committed_bytes", v.committed },
                                   { "offer_bytes", v.offer }, { "elastic", v.elastic },
                                   { "arena_spent", v.arena_spent } });
             if (!ranks.empty()) m["expert_slab"] = std::move(ranks);
             nlohmann::json kv = nlohmann::json::array();
-            for (const auto& v : group_->view(id))
+            for (const auto& v : views)
                 kv.push_back({ { "grown_bytes", v.kv_grown }, { "target_bytes", v.kv_target } });
             if (!kv.empty()) m["kv_growth"] = std::move(kv);
         }
@@ -768,8 +772,11 @@ std::string ModelRouter::metrics_text() const {
              "# TYPE radiance:model_kv_grown_bytes gauge\n"
              "# HELP radiance:model_kv_grow_target_bytes What the group planner grants the model's KV cache beyond its carve, per rank\n"
              "# TYPE radiance:model_kv_grow_target_bytes gauge\n";
+        const auto slabs = group_->view_all();
         for (const auto& [id, c] : cold_) {
-            const auto views = group_->view(id);
+            const auto sv = slabs.find(id);
+            const std::vector<GroupPlanner::RankView> none;
+            const auto& views = sv != slabs.end() ? sv->second : none;
             for (size_t r = 0; r < views.size(); ++r) {
                 const std::string rk = ",rank=\"" + std::to_string(r) + "\"";
                 line("radiance:model_expert_slab_committed_bytes", id, rk, (double)views[r].committed);

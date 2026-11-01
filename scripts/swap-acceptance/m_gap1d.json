@@ -1,0 +1,38 @@
+{
+ "gpu_group": {
+  "devices": [
+   0,
+   1
+  ],
+  "tp": 2
+ },
+ "cache": {
+  "idle_timeout_ms": 30000,
+  "warmup_budget_mib": 0
+ },
+ "models": [
+  {
+   "id": "moe",
+   "path": "/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad",
+   "default": true,
+   "engine": [
+    "--max-model-len",
+    "8192",
+    "--max-num-seqs",
+    "8",
+    "--placement",
+    "expert_tiered",
+    "--host-pool-mib",
+    "20000",
+    "--kv-cache-dtype",
+    "fp8",
+    "--tp-wire",
+    "wht6",
+    "--num-speculative-tokens",
+    "3",
+    "--max-num-batched-tokens",
+    "2048"
+   ]
+  }
+ ]
+}
