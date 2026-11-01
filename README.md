@@ -17,16 +17,16 @@ upstream Radiance; everything below only applies in manifest mode.
 
 ```mermaid
 flowchart LR
-    C1[Client A<br/>model: big] --> R
-    C2[Client B<br/>model: small] --> R
-    C3[Client C<br/>no model] --> R
-    R[ModelRouter<br/>one listener, one port] -->|routes by `model`| F1
+    C1["Client A<br/>model: big"] --> R
+    C2["Client B<br/>model: small"] --> R
+    C3["Client C<br/>no model"] --> R
+    R["ModelRouter<br/>one listener, one port"] -->|"routes by model"| F1
     R --> F2
-    subgraph GPU group: 2 cards, TP=2
-        F1[Model runtime: big<br/>own scheduler, streams, KV]
-        F2[Model runtime: small<br/>own scheduler, streams, KV]
+    subgraph G ["GPU group (2 cards, TP=2)"]
+        F1["Model runtime: big<br/>own scheduler, streams, KV"]
+        F2["Model runtime: small<br/>own scheduler, streams, KV"]
     end
-    F1 <-.->|collectives in one<br/>group-wide order| F2
+    F1 <-.->|"collectives in one group-wide order"| F2
 ```
 
 - The router reads the request's `model` field **before** tokenizing, so each request uses its own
@@ -62,14 +62,14 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    subgraph Card [One card]
+    subgraph Card ["One card"]
         direction LR
-        S1[Model A<br/>static weights] --- E1[Model A<br/>expert slab]
-        E1 <-->|elastic: pages move<br/>to the busier model| E2[Model B<br/>expert slab]
-        E2 --- S2[Model B<br/>static weights]
-        K1[A: KV cache] <-.->|KV lending| K2[B: KV cache]
+        S1["Model A<br/>static weights"] --- E1["Model A<br/>expert slab"]
+        E1 <-->|"elastic: pages move to the busier model"| E2["Model B<br/>expert slab"]
+        E2 --- S2["Model B<br/>static weights"]
+        K1["A: KV cache"] <-.->|"KV lending"| K2["B: KV cache"]
     end
-    H[(Host RAM:<br/>pinned pools + prepared models)] <-->|streaming when VRAM is short| Card
+    H[("Host RAM<br/>pinned pools + prepared models")] <-->|"streaming when VRAM is short"| Card
 ```
 
 Free VRAM is handed out in this order: **static weights → KV cache → experts**.
