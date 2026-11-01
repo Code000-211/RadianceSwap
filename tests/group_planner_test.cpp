@@ -618,6 +618,58 @@ TEST(a_grant_not_yet_used_stays_reserved_while_it_is_wanted) {
     CHECK_EQ(mib(g.target("b")), 30);
 }
 
+/* #51: the taker's mover maps pages up to the target it last read, so a grant it has not used yet
+ * cannot be given to another model the moment the planner changes its mind; it stays until the taker
+ * reports what it holds. */
+TEST(a_grant_that_is_cut_stays_reserved_until_the_taker_reports) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    g.update_held("b", 0, 20 * MiB);
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update_held("a", 0, 10 * MiB);       /* a released 10: b is granted 30, holds 20 */
+    CHECK_EQ(mib(g.target("b")), 30);
+    /* The heat turns: a is hot, b cold. b may be mapping up to 30 right now. */
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    CHECK_EQ(mib(g.target("b")), 30);      /* the cut waits for b's report */
+    CHECK(mib(g.target("a")) <= 10);       /* and nothing of it goes to a */
+    g.update_held("b", 0, 24 * MiB);       /* b reports (and its mover now follows the cut target) */
+    CHECK_EQ(mib(g.target("b")), 10);
+    CHECK_EQ(mib(g.target("a")), 16);      /* 24 held: only the 6 MiB b has already given back */
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    /* A report that changes nothing releases a cut grant too. */
+    GroupPlanner h(0);
+    (void)h.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)h.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    h.update_held("a", 0, 20 * MiB);
+    h.update_held("b", 0, 20 * MiB);
+    h.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update_held("a", 0, 10 * MiB);
+    h.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    CHECK_EQ(mib(h.target("b")), 30);
+    h.update_held("b", 0, 20 * MiB);
+    CHECK_EQ(mib(h.target("b")), 10);
+    CHECK_EQ(mib(h.target("a")), 20);      /* 40 - b's 20 held: a gets the 10 it released, b still holds 20 */
+}
+
+/* #51: a newcomer is assumed to hold its whole offer until its first report; with less, the join's own
+ * recompute granted the bytes between what it starts with and its offer to the model already running. */
+TEST(a_joining_model_holds_its_whole_offer_until_it_reports) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 9.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    const GroupBudget b0 = g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    CHECK_EQ(mib(b0), 10);                 /* b starts with the cold share ... */
+    CHECK_EQ(mib(g.target("a")), 20);      /* ... but a is granted nothing until b reports what it holds */
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+}
+
 TEST(an_elastic_model_that_leaves_gives_the_pool_back_to_the_others_offers) {
     GroupPlanner g(0);
     (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
@@ -626,7 +678,10 @@ TEST(an_elastic_model_that_leaves_gives_the_pool_back_to_the_others_offers) {
     g.update_held("b", 0, 10 * MiB);
     CHECK_EQ(mib(g.target("a")), 30);
     g.leave("b");
-    /* A sole engine is back to its offer: what b's share held is b's again when it returns. */
+    /* A sole engine is back to its offer: what b's share held is b's again when it returns. The grant
+     * a has not used yet is a cut one, kept until a reports. */
+    CHECK_EQ(mib(g.target("a")), 30);
+    g.update_held("a", 0, 20 * MiB);
     CHECK_EQ(mib(g.target("a")), 20);
     CHECK(g.target("a")[0].class_units.empty());
 }
@@ -717,8 +772,11 @@ TEST(backed_kv_bytes_are_not_free_for_the_experts_and_a_returned_chunk_is) {
     CHECK_EQ(mib(g.target("a")), 24);
     g.update_kv("b", 0, kv_of(8, 8, 8, 0));
     CHECK_EQ(mib(g.target("a")), 30);
-    /* B's need returns while it holds the chunks: nothing is asked of A again. */
+    /* B's need returns while it holds the chunks: nothing is asked of A again. A's 30 was a grant it
+     * had not used, so it is kept until A reports (cut grant). */
     g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    CHECK_EQ(mib(g.target("a")), 30);
+    g.update_held("a", 0, 24 * MiB);
     CHECK_EQ(mib(g.target("a")), 24);
 }
 

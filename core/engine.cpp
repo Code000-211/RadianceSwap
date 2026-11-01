@@ -1597,11 +1597,12 @@ void Engine::group_tick(bool idle) {
             held += r.mover.slab_held_bytes((size_t)k);
             offer += r.mover.slab_offer_bytes((size_t)k);
         }
-        if (held == group_held_[i]) continue;
-        if (group_held_[i] >= 0)
+        if (held != group_held_[i] && group_held_[i] >= 0)
             RAD_INFO("group: '%s' rank %d: expert slab holds %s (%+lld MiB)", id.c_str(), r.index,
                      humanb(held).c_str(), (long long)((held - group_held_[i]) >> 20));
         group_held_[i] = held;
+        /* Every tick, changed or not: the report also tells the planner that no page is being
+         * mapped under an older target (GroupPlanner: a cut grant is kept until it arrives). */
         group_->update_held(id, i, held, offer);
     }
 
@@ -1640,10 +1641,12 @@ void Engine::group_tick(bool idle) {
         if (!r.heat.enabled()) continue;
         for (int32_t k : group_classes(r.plan)) {
             const int64_t cap = group_resident_cap(want[i], k);
-            /* Between two limits, a change under 1% of the cap (at least 4 units) is noise of the
-             * heat buckets: moving it would cost link copies for nothing. */
+            /* Between two limits, a rise under 1% of the cap (at least 4 units) is noise of the
+             * heat buckets: moving it would cost link copies for nothing. A fall is always taken: the
+             * mover would go on mapping pages up to the old cap, bytes the planner has already
+             * given another model (#51). */
             int64_t& last = group_cap_.try_emplace({ i, k }, -2).first->second;
-            if (cap >= 0 && last >= 0 && std::llabs(cap - last) < std::max<int64_t>(4, last / 100))
+            if (cap >= 0 && last >= 0 && cap >= last && cap - last < std::max<int64_t>(4, last / 100))
                 continue;
             if (cap == last) continue;
             RAD_INFO("group: '%s' rank %d class %d: target %lld resident units (was %lld; -1 is "

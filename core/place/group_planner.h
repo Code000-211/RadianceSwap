@@ -146,6 +146,11 @@ struct RankFacts {
      * its ceiling, as before. */
     bool    elastic = false;
     int64_t held = 0;    /* expert bytes its slab has pages behind now (Mover::slab_held_bytes) */
+    /* The planner cut a grant the member had not used yet (its target fell below the previous one while
+     * `held` was still under it) and the member has not reported since: it may be mapping pages up to
+     * the old target, so group_gate keeps the old target until the next update_held (#51). Set by the
+     * planner, cleared by update_held. */
+    bool    grant_cut = false;
     bool    arena_spent = false;   /* the slab's address arena ran out: it shrinks logically only (Mover::slab_arena_spent) */
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
@@ -277,7 +282,8 @@ public:
     std::vector<RankView> view(const std::string& id) const;
 
 private:
-    void recompute();
+    /* `reporter`/`rank`: the member whose report triggered this, whose cut grants take effect now. */
+    void recompute(const std::string& reporter = {}, size_t rank = 0);
 
     mutable std::mutex mu_;
     int    pending_;
