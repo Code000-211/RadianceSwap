@@ -52,7 +52,8 @@ ausschließt. Deshalb lehnt `Engine::plan` dort ein Streaming statischer Gewicht
 `--host-pool-mib` wird vor dem Split um `statics_streamed + experts + größte statische Unit + 8 MiB`
 abzüglich der Größe des Pools erhöht, wenn das nötig ist (Log: „--host-pool-mib grows by N“). Ein
 MoE mit wenig VRAM-Anteil braucht damit alle Experts im Pool (die Karte hat für keinen Platz);
-das Host-Budget (#13) zählt die Vergrößerung als Pool.
+das Host-Budget (#13) zählt die Vergrößerung als Pool. Vor der Allokation prüft `Engine::admit_host_pools` den ganzen Pool gegen MemAvailable, cgroups und Budget (verdrängt Store-Kopien, sonst `RAD_E_NOHOST`, 503; #46, `host-budget.md`).
+GPU-Nachweis: `scripts/swap-acceptance/host_budget_stream.py`.
 
 ## Tests (Host, `ROCR_VISIBLE_DEVICES=99`)
 
