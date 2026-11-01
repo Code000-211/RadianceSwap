@@ -240,8 +240,15 @@ std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
             }
             if (!f || !f->elastic) { reserved[i] = t; taken += t; continue; }
             const int64_t held = std::max<int64_t>(f->held, 0);
-            if (t <= held) { reserved[i] = held; taken += held; continue; }
             const int64_t before = i < prev.size() && r < prev[i].size() ? prev[i][r].bytes : 0;
+            /* A cut grant is kept until the member reports: its mover may still be mapping up to it. */
+            if (f->grant_cut && before > held && before > t) {
+                want[i][r].bytes = before;
+                want[i][r].class_units = prev[i][r].class_units;
+                reserved[i] = before; taken += before;
+                continue;
+            }
+            if (t <= held) { reserved[i] = held; taken += held; continue; }
             reserved[i] = std::max(held, std::min(before, t));
             extra[i] = t - reserved[i];
             grows[i] = 1;
@@ -253,6 +260,20 @@ std::vector<GroupBudget> group_gate(const std::vector<int64_t>& pool,
          * cannot grow, and an expert is only a cache line. Each step takes from what the one before it
          * left, so no byte is planned twice. */
         const int64_t statics = r < static_pending.size() ? static_pending[r] : 0;
+        /* A grant kept from `prev` was planned against an older pool: a newcomer that started with less
+         * than it offered shrinks the pool when it reports. What the pool no longer covers is taken back
+         * from the grants not yet backed; the bytes a member holds are never counted twice (#51). */
+        int64_t unbacked = 0;
+        for (size_t i = 0; i < n && i < want.size(); ++i)
+            if (grows[i]) unbacked += reserved[i] - std::max<int64_t>(members[i].facts[r].held, 0);
+        const int64_t cut = std::min(unbacked, std::max<int64_t>(taken + statics - pool[r], 0));
+        for (size_t i = 0; i < n && i < want.size() && cut > 0; ++i)
+            if (grows[i]) {
+                const int64_t held = std::max<int64_t>(members[i].facts[r].held, 0);
+                const int64_t d = (int64_t)((__int128)cut * (reserved[i] - held) / unbacked);
+                reserved[i] -= d;
+                taken -= d;
+            }
         int64_t free_bytes = std::max<int64_t>(pool[r] - taken - statics, 0);
         /* The experts were already cut by the claim (group_allocate). */
         const int64_t kv_free = free_bytes;
@@ -334,6 +355,15 @@ std::vector<int32_t> group_classes(const Plan& plan) {
     return { k.begin(), k.end() };
 }
 
+void group_limit_growth(std::vector<ClassCap>& classes, int64_t granted) {
+    int64_t growth = 0;
+    for (const ClassCap& c : classes)
+        if (c.cap > c.held) growth += (c.cap - c.held) * c.unit_bytes;
+    if (growth <= granted) return;
+    for (ClassCap& c : classes)
+        if (c.cap > c.held) c.cap = c.held + (int64_t)((__int128)(c.cap - c.held) * std::max<int64_t>(granted, 0) / growth);
+}
+
 int64_t group_resident_cap(const RankBudget& b, int32_t slab_class) {
     if (b.class_units.empty()) return b.bytes > 0 ? -1 : 0;
     const auto it = b.class_units.find(slab_class);
@@ -364,7 +394,7 @@ std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat, f
     return out;
 }
 
-void GroupPlanner::recompute() {
+void GroupPlanner::recompute(const std::string& reporter, size_t rank) {
     /* With an elastic member the pool is what the members were offered: the bytes a model's share
      * left unclaimed are free for any member to grow into. */
     std::vector<int64_t> pool = pool_;
@@ -388,8 +418,15 @@ void GroupPlanner::recompute() {
     std::vector<int64_t> free = free_;
     free.resize(pool.size(), 0);
     const std::vector<int64_t> static_pending = group_statics(free, members_, prev, &statics);
-    targets_ = group_gate(pool, members_, group_allocate(pool, members_, pending_, min_share_), prev,
-                          static_pending);
+    std::vector<GroupBudget> want = group_allocate(pool, members_, pending_, min_share_);
+    for (size_t i = 0; i < members_.size() && i < want.size(); ++i)
+        for (size_t r = 0; r < members_[i].facts.size() && r < want[i].size() && r < prev[i].size(); ++r) {
+            RankFacts& f = members_[i].facts[r];
+            if (members_[i].id == reporter && r == rank) continue;
+            if (f.elastic && prev[i][r].bytes > std::max<int64_t>(f.held, 0) && want[i][r].bytes < prev[i][r].bytes)
+                f.grant_cut = true;
+        }
+    targets_ = group_gate(pool, members_, std::move(want), prev, static_pending);
     for (size_t i = 0; i < targets_.size(); ++i)
         for (size_t r = 0; r < targets_[i].size() && r < statics[i].size(); ++r)
             targets_[i][r].statics_cap = statics[i][r].statics_cap;
@@ -414,8 +451,11 @@ GroupBudget GroupPlanner::join(const std::string& id, GroupFacts facts) {
             if (r < g.size()) pool_[r] += g[r].bytes;
     }
     given_.erase(id);
-    /* It holds nothing until its pools are made: what it starts with is its first report. */
-    for (RankFacts& f : facts) f.held = 0;
+    /* Until its first report (update_held) the member is assumed to hold its whole offer, the fixed
+     * slots the resolver counts included. With less, the recompute below would grant a member that is
+     * already running the bytes between what the newcomer starts with and its offer, which it maps at
+     * once and the newcomer's report then claims: planned twice (#51). */
+    for (RankFacts& f : facts) f.held = f.offer;
     members_.push_back({ id, std::move(facts) });
     if (pending_ > 0) --pending_;
     recompute();
@@ -426,7 +466,6 @@ GroupBudget GroupPlanner::join(const std::string& id, GroupFacts facts) {
         const int64_t offer = members_.back().facts[r].offer;
         got[r].bytes = std::min(want[r].bytes, offer);
         if (want[r].bytes <= offer) got[r].class_units = want[r].class_units;
-        members_.back().facts[r].held = got[r].bytes;
     }
     granted_.push_back(got);
     return got;
@@ -464,9 +503,10 @@ void GroupPlanner::update_held(const std::string& id, size_t rank, int64_t held,
     for (GroupMember& m : members_)
         if (m.id == id && rank < m.facts.size()) {
             m.facts[rank].held = held;
+            m.facts[rank].grant_cut = false;
             if (offer >= 0) m.facts[rank].offer = offer;
         }
-    recompute();
+    recompute(id, rank);
 }
 
 void GroupPlanner::update_arena_spent(const std::string& id, size_t rank) {
@@ -507,6 +547,18 @@ std::vector<GroupPlanner::RankView> GroupPlanner::view(const std::string& id) co
                             targets_[i][r].kv_grow, members_[i].facts[r].kv.grown,
                             members_[i].facts[r].arena_spent });
     }
+    return out;
+}
+
+std::map<std::string, std::vector<GroupPlanner::RankView>> GroupPlanner::view_all() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::map<std::string, std::vector<RankView>> out;
+    for (size_t i = 0; i < members_.size() && i < targets_.size(); ++i)
+        for (size_t r = 0; r < members_[i].facts.size() && r < targets_[i].size(); ++r)
+            out[members_[i].id].push_back({ targets_[i][r].bytes, members_[i].facts[r].held, members_[i].facts[r].offer,
+                                            members_[i].facts[r].elastic, members_[i].facts[r].statics,
+                                            targets_[i][r].kv_grow, members_[i].facts[r].kv.grown,
+                                            members_[i].facts[r].arena_spent });
     return out;
 }
 

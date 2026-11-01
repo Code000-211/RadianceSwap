@@ -2680,9 +2680,11 @@ repetitions, runs alternating (`swap/gpu-acceptance.md` §9, §14):
 The dense figures are within the ±2 % aim. The MoE C8 and prefill figures scatter more between runs (C8 474–806 tok/s,
 prefill 3880–5196 tok/s inside one build; bimodal with the heat state) than between builds, so a difference above
 ±2 % there can neither be excluded nor shown; none was seen in any series. A first-repetition prefill deficit of 13 %
-on the MoE vanished in the repeated series; whether it is real is *measured in gpu-acceptance.md §15 once available*.
-How the GroupPlanner redistributes experts between two models under load, beyond the slab figures above, is
-*measured in gpu-acceptance.md §16 once available*.
+on the MoE vanished in the repeated series. The related C1 gap of a MoE in a two-model manifest against `--model`
+(13 % in an earlier series) is not reproducible with explicit per-model headroom (−0.3 %, n = 30 per variant); without it
+the halved VRAM share costs 9.2 % (gpu-acceptance.md §15). How the GroupPlanner redistributes experts between two
+models under constant load with changing weights (80/20, 20/80, 50/50: targets follow, committed follows the giver, no
+non-finite logit, 0 of 7736 samples with the sum of committed bytes over the pool) is in gpu-acceptance.md §16.
 
 The prototype measurement that decided the design, kept for the per-operation figures
 (`swap/measure-static-streaming.md`, prototype outside the engine):
@@ -2776,9 +2778,15 @@ steps after an activation that were already on the card (also `early_hit=…%` i
   on a card with an exhausted arena.
 - **Single-engine cost.** No difference above the noise was found for `--model` against the build before the elastic
   slab (dense within 0.5 %; MoE C8 and prefill scatter ±5 % and more between runs). The prefill deficit of 13 % seen once
-  on the MoE: *measured in gpu-acceptance.md §15 once available*.
+  on the MoE did not return in repeated series. A MoE in a two-model manifest runs as fast as alone when it has its own
+  `--gpu-headroom-mib` (−0.3 % C1, n = 30 per variant) and 9.2 % slower without it: the manifest halves its VRAM share
+  (`(free − headroom) / n`) even for a model that is never activated, and fewer experts stay resident (95.4 % against
+  99.5 %; gpu-acceptance.md §15). Set `--gpu-headroom-mib` per model.
 - **GroupPlanner under load.** How the planner redistributes experts between models under a mixed load over a longer time
-  than the acceptance's phases of 45–90 s: *measured in gpu-acceptance.md §16 once available*.
+  than the acceptance's phases of 45–90 s: measured with constant load on both models and weights 80/20, 20/80, 50/50
+  over 60–90 s phases (gpu-acceptance.md §16): targets follow the weights, committed follows the giver's release, no
+  non-finite logit, and 0 of 7736 samples with the sum of committed bytes over the pool (3561 of 4793 before the
+  fixes of #51). Hours of constant load are not measured.
 - **A MoE activation takes a minute** (60 s warm, 70 s cold, with the n-gram table in RAM), because the mapped table
   is copied at every activation and the store pushes the page cache out; `--ngram-placement disk` avoids it
   (6.3–7.6 s of weights, 36–38 s when it streams beside a model holding the cards).

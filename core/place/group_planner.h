@@ -146,6 +146,11 @@ struct RankFacts {
      * its ceiling, as before. */
     bool    elastic = false;
     int64_t held = 0;    /* expert bytes its slab has pages behind now (Mover::slab_held_bytes) */
+    /* The planner cut a grant the member had not used yet (its target fell below the previous one while
+     * `held` was still under it) and the member has not reported since: it may be mapping pages up to
+     * the old target, so group_gate keeps the old target until the next update_held (#51). Set by the
+     * planner, cleared by update_held. */
+    bool    grant_cut = false;
     bool    arena_spent = false;   /* the slab's address arena ran out: it shrinks logically only (Mover::slab_arena_spent) */
     int64_t floor = 0;   /* VramFacts::expert_floor: below it the planner refuses experts */
     std::vector<HeatBin> bins;   /* its expert plane; the ceiling is their slot bytes */
@@ -218,6 +223,17 @@ std::vector<HeatBin> group_heat_bins(const Plan& plan, const HeatEngine& heat, f
 /* The slab classes of a plan whose units the group planner counts (group_heat_bins). */
 std::vector<int32_t> group_classes(const Plan& plan);
 
+/* One slab class of an elastic slab as the engine hands the planner's target to the mover. */
+struct ClassCap {
+    int64_t cap;          /* resident units the target allows; < 0: no limit */
+    int64_t held;         /* movable units with pages behind them now */
+    int64_t unit_bytes;   /* one unit's slot bytes */
+};
+/* The planner grants bytes for the whole slab, the mover grows a class at a time: a class cap that rises
+ * while the other class is slow to give its pages back would map more than was granted (#51). The caps
+ * above what the classes hold may add up to no more than `granted` bytes; they are cut in proportion. */
+void group_limit_growth(std::vector<ClassCap>& classes, int64_t granted);
+
 /* How many resident units of slab class `slab_class` the target `b` lets an engine keep, for
  * Mover::set_resident_cap; -1 for no limit. A sole engine's target names no classes and equals
  * its offer; a target that names some grants the others nothing. */
@@ -275,9 +291,13 @@ public:
         bool arena_spent = false;              /* RankFacts::arena_spent */
     };
     std::vector<RankView> view(const std::string& id) const;
+    /* Every member's view from one lock: a status answer that sums the models (the pool check, #51)
+     * must not read one model before and the next after a report moved bytes between them. */
+    std::map<std::string, std::vector<RankView>> view_all() const;
 
 private:
-    void recompute();
+    /* `reporter`/`rank`: the member whose report triggered this, whose cut grants take effect now. */
+    void recompute(const std::string& reporter = {}, size_t rank = 0);
 
     mutable std::mutex mu_;
     int    pending_;

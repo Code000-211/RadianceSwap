@@ -618,6 +618,58 @@ TEST(a_grant_not_yet_used_stays_reserved_while_it_is_wanted) {
     CHECK_EQ(mib(g.target("b")), 30);
 }
 
+/* #51: the taker's mover maps pages up to the target it last read, so a grant it has not used yet
+ * cannot be given to another model the moment the planner changes its mind; it stays until the taker
+ * reports what it holds. */
+TEST(a_grant_that_is_cut_stays_reserved_until_the_taker_reports) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    g.update_held("b", 0, 20 * MiB);
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update_held("a", 0, 10 * MiB);       /* a released 10: b is granted 30, holds 20 */
+    CHECK_EQ(mib(g.target("b")), 30);
+    /* The heat turns: a is hot, b cold. b may be mapping up to 30 right now. */
+    g.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    g.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    CHECK_EQ(mib(g.target("b")), 30);      /* the cut waits for b's report */
+    CHECK(mib(g.target("a")) <= 10);       /* and nothing of it goes to a */
+    g.update_held("b", 0, 24 * MiB);       /* b reports (and its mover now follows the cut target) */
+    CHECK_EQ(mib(g.target("b")), 10);
+    CHECK_EQ(mib(g.target("a")), 16);      /* 24 held: only the 6 MiB b has already given back */
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+    /* A report that changes nothing releases a cut grant too. */
+    GroupPlanner h(0);
+    (void)h.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    (void)h.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    h.update_held("a", 0, 20 * MiB);
+    h.update_held("b", 0, 20 * MiB);
+    h.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update_held("a", 0, 10 * MiB);
+    h.update("a", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 9.0f) } });
+    h.update("b", std::vector<std::vector<HeatBin>>{ { bin(30, 2, 0.0f) } });
+    CHECK_EQ(mib(h.target("b")), 30);
+    h.update_held("b", 0, 20 * MiB);
+    CHECK_EQ(mib(h.target("b")), 10);
+    CHECK_EQ(mib(h.target("a")), 20);      /* 40 - b's 20 held: a gets the 10 it released, b still holds 20 */
+}
+
+/* #51: a newcomer is assumed to hold its whole offer until its first report; with less, the join's own
+ * recompute granted the bytes between what it starts with and its offer to the model already running. */
+TEST(a_joining_model_holds_its_whole_offer_until_it_reports) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 9.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    const GroupBudget b0 = g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    CHECK_EQ(mib(b0), 10);                 /* b starts with the cold share ... */
+    CHECK_EQ(mib(g.target("a")), 20);      /* ... but a is granted nothing until b reports what it holds */
+    g.update_held("b", 0, 10 * MiB);
+    CHECK_EQ(mib(g.target("a")), 30);
+}
+
 TEST(an_elastic_model_that_leaves_gives_the_pool_back_to_the_others_offers) {
     GroupPlanner g(0);
     (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
@@ -626,7 +678,10 @@ TEST(an_elastic_model_that_leaves_gives_the_pool_back_to_the_others_offers) {
     g.update_held("b", 0, 10 * MiB);
     CHECK_EQ(mib(g.target("a")), 30);
     g.leave("b");
-    /* A sole engine is back to its offer: what b's share held is b's again when it returns. */
+    /* A sole engine is back to its offer: what b's share held is b's again when it returns. The grant
+     * a has not used yet is a cut one, kept until a reports. */
+    CHECK_EQ(mib(g.target("a")), 30);
+    g.update_held("a", 0, 20 * MiB);
     CHECK_EQ(mib(g.target("a")), 20);
     CHECK(g.target("a")[0].class_units.empty());
 }
@@ -717,8 +772,11 @@ TEST(backed_kv_bytes_are_not_free_for_the_experts_and_a_returned_chunk_is) {
     CHECK_EQ(mib(g.target("a")), 24);
     g.update_kv("b", 0, kv_of(8, 8, 8, 0));
     CHECK_EQ(mib(g.target("a")), 30);
-    /* B's need returns while it holds the chunks: nothing is asked of A again. */
+    /* B's need returns while it holds the chunks: nothing is asked of A again. A's 30 was a grant it
+     * had not used, so it is kept until A reports (cut grant). */
     g.update_kv("b", 0, kv_of(8, 8, 14, 0));
+    CHECK_EQ(mib(g.target("a")), 30);
+    g.update_held("a", 0, 24 * MiB);
     CHECK_EQ(mib(g.target("a")), 24);
 }
 
@@ -926,4 +984,68 @@ TEST(static_grants_are_decided_per_rank_at_world_size_2) {
     const GroupBudget t = g.target("b");
     CHECK_EQ(t[0].statics_cap, 4 * MiB);
     CHECK_EQ(t[1].statics_cap, 10 * MiB);
+}
+
+/* #51: a newcomer that starts with less than it offered reports a smaller offer, and the pool shrinks with
+ * it. The grant planned for it against the larger pool must not outlive the pool: the running model still
+ * holds its bytes, so the newcomer is granted only what the pool has left beside them. */
+TEST(a_newcomer_that_starts_with_less_than_it_offered_is_not_granted_past_the_smaller_pool) {
+    GroupPlanner g(0);
+    (void)g.join("a", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("a", 0, 20 * MiB);
+    (void)g.join("b", elastic_rank(20, { bin(30, 2, 0.0f) }));
+    g.update_held("b", 0, 10 * MiB, 10 * MiB);       /* started with 10 of its 20: the pool is 20 + 10 */
+    CHECK(mib(g.target("a")) + mib(g.target("b")) <= 30);
+    CHECK(20 + mib(g.target("b")) <= 30);            /* a holds 20 until it reports less */
+}
+
+/* #51: the planner grants bytes for the whole slab; a class cap that rises beside a class that is slow to
+ * give pages back may map no more than the grant. */
+TEST(class_caps_grow_together_by_no_more_than_the_granted_bytes) {
+    const auto caps = [](int64_t granted) {
+        std::vector<ClassCap> c = { { 100, 60, 2 * MiB }, { 50, 80, 3 * MiB }, { -1, 10, MiB } };
+        group_limit_growth(c, granted);
+        return std::vector<int64_t>{ c[0].cap, c[1].cap, c[2].cap };
+    };
+    CHECK(caps(80 * MiB) == (std::vector<int64_t>{ 100, 50, -1 }));    /* the grant covers it */
+    CHECK(caps(40 * MiB) == (std::vector<int64_t>{ 80, 50, -1 }));     /* half of it */
+    CHECK(caps(0) == (std::vector<int64_t>{ 60, 50, -1 }));            /* none: the class holds what it has, the fall stays */
+    CHECK(caps(-5 * MiB) == (std::vector<int64_t>{ 60, 50, -1 }));
+}
+
+/* #51: movers that follow the target they read at their last report, with heat that flips at random:
+ * what the members hold never exceeds the pool. */
+TEST(movers_that_follow_their_targets_never_hold_more_than_the_pool) {
+    for (int members = 2; members <= 3; ++members)
+        for (uint32_t seed = 1; seed <= 200; ++seed) {
+            GroupPlanner g(0);
+            std::vector<std::string> id;
+            std::vector<int64_t> held(members, 20), cap(members, 20);   /* MiB; a joined member holds its offer */
+            for (int i = 0; i < members; ++i) {
+                id.push_back(std::string(1, (char)('a' + i)));
+                (void)g.join(id[i], elastic_rank(20, { bin(30, 2, 0.0f) }));
+                g.update_held(id[i], 0, 20 * MiB);
+            }
+            uint32_t rng = seed * 2654435761u;
+            const auto next = [&](uint32_t n) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % n; };
+            for (int step = 0; step < 400; ++step) {
+                const int i = (int)next((uint32_t)members);
+                if (next(5) == 0)
+                    g.update(id[i], std::vector<std::vector<HeatBin>>{ { bin(30, 2, (float)(next(3) * next(5))) } });
+                /* The pages the mover mapped or released since its last report, up to the target it read then. */
+                const int64_t move = (int64_t)(1 + next(4)) * 2;
+                held[i] = held[i] < cap[i] ? std::min(cap[i], held[i] + move) : std::max(cap[i], held[i] - move);
+                g.update_held(id[i], 0, held[i] * MiB);
+                cap[i] = mib(g.target(id[i]));
+                int64_t sum = 0;
+                for (int64_t h : held) sum += h;
+                if (sum > 20 * members) {
+                    std::fprintf(stderr, "members %d seed %u step %d: sum held %lld > pool %d:", members, seed, step, (long long)sum, 20 * members);
+                    for (int k = 0; k < members; ++k) std::fprintf(stderr, " %s{held %lld target %lld}", id[k].c_str(), (long long)held[k], (long long)mib(g.target(id[k])));
+                    std::fprintf(stderr, "\n");
+                }
+                CHECK(sum <= 20 * members);
+                if (sum > 20 * members) return;
+            }
+        }
 }
