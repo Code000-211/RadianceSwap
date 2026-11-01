@@ -35,6 +35,8 @@ Freigabe-Zahlen unten.
 | 13 | Host-Pools vor der Allokation geprüft, MoE `a` + streamendes MoE `b` (#46) | bestanden, kein Exit 137 (siehe §13) |
 
 | 14 | Erschöpfte VA-Arena, Single-Engine-Perf gegen den Stand vor #44 (#45) | bestanden, ein Fehler in `Mover::resize` behoben (siehe §14) |
+| 15 | MoE im Manifest mit zwei Models gegen `--model`, die „13-%-Lücke“ (C1) | im früheren Aufbau (`--deterministic`, Headroom 5000) nicht mehr zu reproduzieren (−0,3 %); die einzige reproduzierbare Lücke (−9,2 %) ist der halbierte VRAM-Anteil ohne eigenes `--gpu-headroom-mib`, nicht behoben, Folge-Issue empfohlen (siehe §15) |
+| 16 | GroupPlanner unter Dauerlast mit wechselnder Gewichtung, Summe `committed_bytes` ≤ Pool (#51) | bestanden, nach vier Fixes: 7736 Samples, 0 Überschreitungen (vorher 3561 von 4793, bis 3,4 GiB über dem Pool); siehe §16 |
 
 ## Gefundene Fehler und Fixes
 
@@ -623,3 +625,126 @@ Beobachtung, nicht behoben (schon auf `main`): `place_test_card` (`ctest -R plac
 Test `a_promoted_static_unit_is_copied_to_fresh_arena_address_in_keep_order_within_the_cap` mit SIGSEGV, weil er den
 Inhalt von VRAM mit einem Host-Zeiger liest (`place_test.cpp`, `r.at(…)[i]`); mit `ROCR_VISIBLE_DEVICES=99` (Host-Backend) läuft
 er. Alle anderen Fälle laufen auf der Karte.
+
+## 15 Die 13-%-Lücke: MoE im Manifest mit zwei Models (C1)
+
+`scripts/swap-acceptance/gap13.py OUTDIR 5 6 VARIANTEN`: je Runde ein frischer Server je Variante (die Reihenfolge der
+Varianten rotiert von Runde zu Runde), Aufwärmen mit 4 (statisch) bzw. 10 (dynamisch) C1-Requests, dann 6 C1-Requests
+(`Write a long story about a robot.`, 256 Tokens, Greedy, `ignore_eos`), 5 Runden, also 30 Messwerte je Variante.
+Das MoE ist das von `m_dm.json`, TP=2, Port 18080, GPUs exklusiv; in den Manifest-Varianten steht daneben das
+dichte `d` (0,8B), das nie aktiviert wird (kalt).
+
+**Statischer Aufbau** (wie §8: `--deterministic`, `--gpu-headroom-mib 5000` im Model; die Heat ist aus):
+
+| Variante | C1 tok/s Mittel (Median, Min–Max) | gegen `--model` |
+|---|---|---|
+| `--model` | 90,8 (91,0; 89,7–91,6) | – |
+| Manifest, nur das MoE (`m_gap1.json`) | 90,9 (91,0; 90,1–91,4) | +0,1 % |
+| Manifest, MoE + kaltes `d` (`m_dm.json`) | 90,5 (90,4; 89,9–91,3) | −0,3 % |
+| dasselbe mit `RADIANCE_ELASTIC_SLAB=off` (einfacher Pool) | 90,8 (91,0; 89,8–91,3) | 0,0 % |
+| MoE + `d`, `d` einmal aktiviert und wieder deaktiviert (MoE blieb aktiv) | 90,3 (89,8; 89,3–91,4) | −0,5 % |
+
+Die Residenz ist in allen Varianten gleich (`/stats`: 18 185 Einheiten im VRAM, 6893 gepinnt). **Die Lücke von 13 %
+aus §8 (74,8 → 65,2 tok/s) ist auf dem heutigen Stand nicht mehr zu sehen**; die Werte liegen ohnehin höher (91 statt
+72–75 tok/s für `--model` mit Headroom 5000), das alte Bild entstand also in einem anderen Zustand des Hosts oder des
+Builds. Was es war, ist nicht geklärt. Weder der elastische Pool (Variante ohne ihn), noch die Tape-Umgehung durch
+eine zweite registrierte Engine (`d` kalt bzw. nach der Deaktivierung), noch der GroupPlanner-Tick (die Heat ist hier
+aus, der Tick meldet nur die Slab-Größe) kosten messbar etwas.
+
+**Dynamischer Aufbau** (ohne `--deterministic` und ohne `--gpu-headroom-mib` im Model, `--host-pool-mib 20000`;
+Heat an): hier gibt es die Lücke, und sie ist der VRAM-Anteil.
+
+| Variante | C1 tok/s Mittel (Median, Min–Max) | gegen `--model` | Experts im VRAM (`routed_res`) | Einheiten VRAM / gepinnt | Slab je Rank |
+|---|---|---|---|---|---|
+| `--model` | 186,8 (186,7; 184,7–189,1) | – | 99,51 % | 22 188 / 2890 | – |
+| Manifest, nur das MoE | 186,8 (186,5; 184,7–189,7) | 0,0 % | 99,51 % | 22 188 / 2890 | 26 319 MiB |
+| Manifest, MoE + kaltes `d` | 169,6 (169,7; 168,5–170,5) | **−9,2 %** | 95,41 % | 8778 / 16 300 | 10 375 / 10 422 MiB |
+
+Ursache belegt: das Manifest rechnet den Anteil jedes Models als `(frei − Headroom) / n` (`manifest_share_mib`,
+`core/main.cpp`), auch für Models, die nie aktiv werden. Im Log: `manifest: model 'moe' takes about 16235 MiB … 
+(--gpu-headroom-mib 16331)` gegen den Standard-Headroom 96 MiB bei einem Model. Das halbierte Expert-Budget lässt
+nur 8778 statt 22 188 Einheiten im VRAM (Rest gepinnt), `routed_res` fällt von 99,5 auf 95,4 %, und C1 fällt um 9,2 %
+(bei 13 % liegt die Lücke nicht; sie hängt vom Anteil der nicht residenten Experts ab). Im statischen Aufbau greift der
+Anteil nie, weil `--gpu-headroom-mib` im Model steht und den Anteil ersetzt.
+
+**Nicht behoben.** „Keinen Anteil für nicht aktive Models reservieren“ ist nicht klein: die Aktivierung des zweiten
+Models braucht die Bytes gleich bei der Aktivierung (Statik, KV, Arena, Staging), und nur die Experts kann der Planer
+später zurückholen; ein erstes Model mit der ganzen Karte würde die zweite Aktivierung in den Druckpfad
+(`RAD_E_NOMEM`, Deaktivierung des ersten) schicken. **Empfohlenes Folge-Issue:** „Manifest: Anteil des ersten
+Models wächst auf die ganze Karte, solange die anderen kalt sind, und schrumpft über den GroupPlanner, wenn eines
+aktiv wird“ (Expert-Slab elastisch, Statik/KV/Arena des ersten Models auf den Anteil begrenzt). Bis dahin: ein
+eigenes `--gpu-headroom-mib` je Model (wie in `m_dm.json`) oder `cache.max_active_models: 1` (nach dem Code ist der
+Anteil dann die ganze Karte; nicht gemessen, die zweite Aktivierung deaktiviert das erste Model).
+
+## 16 GroupPlanner unter Dauerlast mit wechselnder Gewichtung und die Summe der Commits (#51)
+
+Zwei MoE-Einträge (`m_el.json`, TP=2, `idle_timeout_ms` 0), `elastic.py LOG m1:40,idle:15,w80/20:90,w20/80:90,w50/50:60,w80/20:60,w20/80:60,m2:40`.
+`wA/B` belastet beide Models zugleich mit Dauerlast: 8 Client-Threads für `m1` und 2 für `m2` bei `w80/20`, umgekehrt bei
+`w20/80`, 5 und 5 bei `w50/50`. Jeder Request fragt `logprobs` (ein nicht endliches Logit wäre ein HTTP 500 und die
+Logzeile `no finite logit`); nach jeder Phase die Greedy-Tokens beider Models gegen die Referenz (`5e8678d0682f`);
+`/radiance/models` wird alle 100 ms gelesen und gegen den Pool geprüft. Der Pool ist je Rank die Summe der Angebote
+(Rank 0: 10 314 + 5 124 = 15 438 MiB; `m2` tritt mit 5,08 GiB bei, weil die Karte nach `m1` nicht mehr frei hatte,
+darum ist der Pool kleiner als in §9). Spalten: `committed / target` in MiB, Rank 0, am Ende der Phase.
+
+| Phase | m1 | m2 | Σ committed ≤ 15 438 | Samples / Überschreitungen | Tokens / Fehler | Greedy = Referenz | `no finite logit` |
+|---|---|---|---|---|---|---|---|
+| `m1:40` | 9 303 / 9 304 | 6 135 / 4 451 | 15 438 | 701 / 0 | 512 / 0 | ja | 0 |
+| `idle:15` (Heat kühlt) | 6 854 / 4 451 | 8 583 / 8 584 | 15 437 | 371 / 0 | 0 / 0 | ja | 0 |
+| `w80/20:90` | 9 309 / 9 309 | 6 130 / 4 451 | 15 439 (+1) | 1 294 / 0 | 384 / 0 | ja | 0 |
+| `w20/80:90` | 6 854 / 4 451 | 8 583 / 8 584 | 15 437 | 1 279 / 0 | 384 / 0 | ja | 0 |
+| `w50/50:60` | 7 446 / 5 822 | 7 993 / 7 993 | 15 439 (+1) | 1 051 / 0 | 384 / 0 | ja | 0 |
+| `w80/20:60` | 10 239 / 10 240 | 5 199 / 4 451 | 15 438 | 979 / 0 | 256 / 0 | ja | 0 |
+| `w20/80:60` | 6 854 / 4 451 | 8 583 / 8 584 | 15 437 | 955 / 0 | 256 / 0 | ja | 0 |
+| `m2:40` | 6 854 / 4 451 | 8 583 / 8 584 | 15 437 | 702 / 0 | 513 / 0 | ja | 0 |
+| **gesamt** | | | | **7 736 / 0** | **2 689 / 0** | 8 von 8 | **0** |
+
+- Die Targets ändern sich mit der Gewichtung: bei `w80/20` bekommt `m1` rund 9,3–10,2 GiB und `m2` fällt auf sein Minimum
+  (Target 4 451), bei `w20/80` kehrt es sich um (`m2` 8 583, `m1` 4 451), bei `w50/50` liegen beide bei 5,8 / 8,0 GiB.
+  Das Target des Gebers fällt sofort, das des Nehmenden folgt der Freigabe; `committed` folgt dem Target in Schritten
+  von 128–510 MiB je Meldung (100 ms), ein voller Wechsel von 3 GiB dauert 10–20 s. Danach bleiben die Werte stehen
+  (`m2` unter 20 % Last gibt nicht alles ab: 6 130 gegen 4 451 Target ist der Rest, den der Geber nicht freigeben kann,
+  weil sein Heat-Rest belegt ist).
+- VRAM je Karte bleibt zwischen 26,9 und 27,3 GiB (Basis mit zwei Models 27 290 MiB); am Ende des Laufs, nach dem
+  Beenden des Servers, 57 MiB je Karte (Grundlinie).
+- Keine nicht endlichen Logits, kein Hänger, kein HTTP-Fehler in 8 Phasen mit `logprobs` bei jedem Request. Das in §9
+  beschriebene „Bekannte Risiko“ (`row 0 has no finite logit`) trat in diesem Lauf nicht auf; `lpstress.py` wurde nicht
+  wiederholt, das Risiko ist damit nicht ausgeschlossen. Die Phasen sind 60–90 s lang; eine Dauerlast über Stunden ist
+  nicht gemessen.
+
+### #51: Summe der `committed_bytes` über dem Pool: echte Überbuchung, behoben
+
+Gleicher Lauf (`m1:40,idle:15,w80/20:60,w20/80:60,m2:40,m1:40`, Samples alle 100 ms), erst auf `origin/main`, dann
+jeweils mit einem weiteren Fix; „Überschreitung“ heißt Σ `committed` > Σ Angebote (ohne Toleranz):
+
+| Stand | Samples | Überschreitungen | größte Überschreitung | VRAM Karte 0 Spitze |
+|---|---|---|---|---|
+| `origin/main` | 4793 | 3561 (74 %) | 3 399 MiB | 30 396 MiB (+3,1 GiB über der Basis) |
+| `main` + ein Lesen aller Models aus einem Planer-Schnappschuss | 4802 | 3471 (72 %) | 3 398 MiB | – |
+| Branch: Beitritt hält sein ganzes Angebot, gekürzte Grants bleiben bis zur Meldung (WIP-Stand) | 4791 | 3603 | 3 329 MiB | 28 208 MiB |
+| + kein Grant über den verkleinerten Pool | 4718 | 3561 | 3 407 MiB | 28 156 MiB |
+| + Wachstum der Klassen höchstens um den gewährten Betrag | 4836 | 572 | 1 MiB | 27 292 MiB (Basis) |
+| endgültiger Stand, Toleranz 2 MiB (Rundung), 8 Phasen (oben) | 7 736 | 0 | 0 | 27 292 MiB (Basis) |
+
+- **Kein Messartefakt.** Das Lesen aus einem Schnappschuss (`GroupPlanner::view_all`; vorher las der Server jedes Model
+  mit einer eigenen Sperre) ändert die Zahl der Überschreitungen nicht (74 % → 72 %), und der VRAM der Karte stieg
+  tatsächlich um 3,1 GiB über die Basis: `m1` hatte Seiten gemappt, die `m2` noch nicht zurückgegeben hatte. Die Karte
+  hatte den Platz noch frei, darum fiel nichts aus; bei vollem VRAM wäre der Commit gescheitert.
+- **Ursachen** (jede mit Test): (1) Ein beitretendes Model galt bis zu seiner ersten Meldung als leer, der Planer gab
+  die Bytes zwischen seinem Start und seinem Angebot dem laufenden Model, die das Neue dann zugleich beanspruchte
+  (`a_joining_model_holds_its_whole_offer_until_it_reports`). (2) Ein Grant, der gekürzt wurde, bevor der Nehmende ihn
+  benutzt hatte, ging sofort an ein anderes Model, während der Mover des Nehmenden weiter bis zum alten Target mappte
+  (`a_grant_that_is_cut_stays_reserved_until_the_taker_reports`; dazu nimmt der Engine-Tick jetzt jedes Absenken des
+  Caps sofort, nicht erst ab 1 %). (3) Ein Beitretender, der mit weniger startet als er anbot, verkleinert mit seiner
+  ersten Meldung den Pool; sein Grant aus dem größeren Pool blieb als „noch nicht benutzt“ reserviert
+  (`a_newcomer_that_starts_with_less_than_it_offered_is_not_granted_past_the_smaller_pool`; Fix in `group_gate`: was der
+  Pool nicht mehr deckt, kommt von den nicht gedeckten Grants zurück). (4) Der Planer gewährt Bytes für den ganzen
+  Slab, der Mover wächst je Slab-Klasse (zwei Klassen mit 0,97 und 1,45 MiB je Slot): in den Logs wuchs `m1` um 128 MiB
+  je Meldung von 6 988 auf 10 220 MiB, während sein Target gleich `held` war und `m2` nicht freigab. Dass die
+  Zusammensetzung der Klassen der Auslöser ist, folgt aus der Wirkung des Fixes (aus 3561 wurden 572 Überschreitungen
+  von höchstens 1 MiB), nicht aus einer Einzelmessung des Mover-Zustands. Fix: `group_limit_growth` begrenzt die Caps
+  über dem, was die Klassen halten, zusammen auf die gewährten Bytes (`class_caps_grow_together_by_no_more_than_the_granted_bytes`).
+  Dazu ein Simulationstest (`movers_that_follow_their_targets_never_hold_more_than_the_pool`: 2 und 3 Models, 200 Startwerte,
+  400 Schritte, zufällige Heat); er fand auf `origin/main` die Überbuchung (`a` hält 30, `b` 12, Pool 40).
+- **Der Rest ist Rundung.** Die vier Zahlen je Rank werden einzeln auf ganze MiB gekürzt, die Summe kann bis 2 MiB über
+  dem Pool lesen (größter Wert 1 MiB, die Zeilen „+1“ oben). Die Prüfung in `elastic.py` und `lpstress.py` hat darum
+  `POOL_SLACK_MIB = 2` und zählt Samples, Überschreitungen und die größte Überschreitung je Phase und gesamt.
