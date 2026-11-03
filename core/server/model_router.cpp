@@ -27,33 +27,10 @@ HttpResponse refuse(const HttpRequest& q, const ApiError& e, int retry_after_s =
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
 
-/* The generation endpoints that are not text: they belong to one model's Server alone. */
-bool media_endpoint(const std::string& path) {
-    for (const char* p : { "/v1/images/", "/images/", "/v1/audio/", "/audio/", "/v1/videos",
-                           "/v1/realtime" })
-        if (starts_with(path, p)) return true;
-    return false;
-}
-
-/* A content part that carries a picture, a clip or a video, in any of the API shapes (OpenAI's
- * chat and Responses parts, Anthropic's blocks). */
-bool has_media_part(const nlohmann::json& j) {
-    if (j.is_object()) {
-        const auto t = j.find("type");
-        if (t != j.end() && t->is_string()) {
-            const std::string& v = t->get_ref<const std::string&>();
-            if (v == "image_url" || v == "input_image" || v == "image" || v == "video_url" ||
-                v == "input_video" || v == "video" || v == "input_audio" || v == "audio_url" ||
-                v == "audio")
-                return true;
-        }
-        for (const auto& kv : j.items())
-            if (has_media_part(kv.value())) return true;
-    } else if (j.is_array()) {
-        for (const auto& e : j)
-            if (has_media_part(e)) return true;
-    }
-    return false;
+/* The video jobs: one model's Server keeps them, and a GET or DELETE of a job names no model, so
+ * the router could not tell which Server to ask. */
+bool video_endpoint(const std::string& path) {
+    return path == "/v1/videos" || starts_with(path, "/v1/videos/");
 }
 
 }  /* namespace */
@@ -212,6 +189,7 @@ void ModelRouter::attach(const std::string& id, Server* s) {
      * finds it there. */
     if (!routes_added_) {
         routes_added_ = true;
+        socket_paths_ = s->router().socket_routes();
         for (const std::string& sig : s->router().routes()) {
             const size_t sp = sig.find(' ');
             router_.add(sig.substr(0, sp), sig.substr(sp + 1),
@@ -282,23 +260,36 @@ void ModelRouter::stop() {
 
 HttpResponse ModelRouter::route(const HttpRequest& q) {
     if (unhealthy()) return answer_unhealthy(q);
-    if (media_endpoint(q.path)) {
+    if (video_endpoint(q.path)) {
         ApiError e = err_not_implemented(
-            q.path + " is not served while several models are active: the image, audio and video "
-                     "endpoints are available only with a single model");
+            q.path + " is not served with a manifest: a video job is kept by one model, so the "
+                     "videos endpoints are available only with a single model (--model)");
         return refuse(q, e);
     }
+    bool socket;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        socket = std::find(socket_paths_.begin(), socket_paths_.end(), q.path) != socket_paths_.end();
+    }
+    if (socket) {
+        ApiError e = err_not_implemented(
+            q.path + " is a WebSocket session, which is not served with a manifest; it is "
+                     "available only with a single model (--model)");
+        return refuse(q, e);
+    }
+    /* The model first, from a JSON body or a multipart field (an image edit's usual form); every
+     * endpoint, the image, audio and media-input ones included, is then the named model's to
+     * answer, as with a single model. */
     std::string id = default_id_;
     bool named = false;
-    if (!q.body.empty()) {
+    if (!q.form.empty()) {
+        if (const FormPart* m = q.part("model"); m && !m->data.empty()) {
+            id = m->data;
+            named = true;
+        }
+    } else if (!q.body.empty()) {
         const nlohmann::json j = nlohmann::json::parse(q.body, nullptr, false);
         if (j.is_object()) {
-            if (has_media_part(j)) {
-                ApiError e = err_not_implemented(
-                    "image, audio and video input is not served while several models are "
-                    "active; it is available only with a single model");
-                return refuse(q, e);
-            }
             const auto m = j.find("model");
             if (m != j.end() && m->is_string() && !m->get_ref<const std::string&>().empty()) {
                 id = m->get<std::string>();

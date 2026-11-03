@@ -2222,9 +2222,13 @@ this. The design is in `../GLOSSARY.md` and `adr/0001` to `0003`, and per featur
 [`swap/static-streaming.md`](swap/static-streaming.md) and [`swap/host-budget.md`](swap/host-budget.md); the
 measurements behind the numbers below are in [`swap/gpu-acceptance.md`](swap/gpu-acceptance.md) (§1–§17).
 
-Text models only: image, audio and video endpoints, and image, audio or video parts in a text request, are
-refused with a 501 while a manifest is in use, and LoRA adapters are refused at startup (an adapter
-belongs to one base model).
+Image, audio and media-input requests go to the model they name, like text requests: an image model
+and a text model can share one manifest, `POST /v1/images/generations` and `/v1/images/edits` (JSON,
+or multipart with a `model` field) activate and serve the image model, and a model asked for
+something it cannot do answers with its own error. Refused with a 501 while a manifest is in use:
+`/v1/videos` (a video job is kept by one model, and fetching it names none) and the WebSocket
+sessions `/v1/realtime` and `/v1/audio/speech/stream`. LoRA adapters are refused at startup (an
+adapter belongs to one base model).
 
 #### The manifest
 

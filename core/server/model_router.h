@@ -4,8 +4,12 @@
  * (frontend, scheduler bridge, limits, admission), built by that model's Engine. A request's
  * `model` is read here, before any Server tokenises or renders a template, and the request is
  * handed to that model's Server through its own Router. A request naming no model goes to the
- * default one, an unknown id is a 404, and the image, audio and video endpoints (and media parts
- * in a text request) are refused: the manifest mode serves text models only.
+ * default one and an unknown id is a 404. The model is read from a JSON body's `model` or a
+ * multipart `model` field, so the image and audio endpoints, and media parts in a text request,
+ * reach the named model's Server, which answers them as it would alone (or refuses them, if that
+ * model makes no images or takes no pictures). Refused with a 501: /v1/videos, whose jobs live in
+ * one Server while a job's GET or DELETE names no model, and the WebSocket sessions (/v1/realtime,
+ * /v1/audio/speech/stream), which the listener does not carry to a model.
  *
  * Activation (ticket #9): a configured model that is not attached is cold. The first request that
  * names it starts its Launcher on a thread of its own (the model's activation thread, owned here),
@@ -82,6 +86,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace rad {
 
@@ -259,6 +264,9 @@ private:
     std::map<std::string, Server*> servers_;
     std::map<std::string, Cold>    cold_;
     bool stopped_ = false, stop_done_ = false, serving_ = false, routes_added_ = false;
+    /* A Server's WebSocket paths: the listener does not carry a session to a model, so route()
+     * refuses them rather than hand the upgrade to a Server's plain GET answer. */
+    std::vector<std::string> socket_paths_;
     bool unhealthy_ = false;
     int64_t deactivated_total_ = 0;   /* deactivations that completed: VRAM was freed */
     std::string unhealthy_reason_;
