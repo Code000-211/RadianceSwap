@@ -8,6 +8,8 @@
 
 #include "server/model_router.h"
 
+#include "mm/media.h"
+
 #include "cpp-httplib/httplib.h"
 
 namespace {
@@ -56,6 +58,29 @@ struct FakeModel {
     size_t submitted() {
         std::lock_guard<std::mutex> lk(sched.mu);
         return sched.prompts.size();
+    }
+};
+
+/* An image model: a generator and no text (FakeImageGen finishes every request on submit). */
+struct FakeImageModel {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    FakeImageGen img;
+    std::unique_ptr<Server> srv;
+
+    explicit FakeImageModel(const std::string& id) {
+        Deps d;
+        d.sched = &sched;
+        d.tok = &tok;
+        d.chat = &tmpl;
+        d.images = &img;
+        ServerOptions o;
+        o.model_id = id;
+        o.image_model = true;
+        o.host = "127.0.0.1";
+        o.port = 0;
+        srv = std::make_unique<Server>(d, o);
     }
 };
 
@@ -173,28 +198,129 @@ TEST(a_request_without_a_model_goes_to_the_default) {
     CHECK_EQ(b_default.a.submitted(), (size_t)0);
 }
 
-TEST(media_input_and_the_media_endpoints_are_refused) {
-    Pair p;
-    const std::string image = R"({"model":"a","messages":[{"role":"user","content":[
+/* A text model "t" (the default) and an image model "img" behind one router. */
+struct Mixed {
+    FakeModel t{ "t", "[T]", 200, "text", false };
+    FakeImageModel img{ "img" };
+    ModelRouter mr;
+    Mixed() : mr("t", 2) {
+        mr.attach("t", t.srv.get());
+        mr.attach("img", img.srv.get());
+    }
+    HttpResponse post(const std::string& body, const std::string& path) {
+        return mr.router().call("POST", path, body);
+    }
+    HttpResponse form(const std::string& path, std::vector<FormPart> parts) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = path;
+        q.form = std::move(parts);
+        return mr.router().dispatch(q);
+    }
+};
+
+TEST(an_image_request_reaches_the_image_model_it_names) {
+    Mixed m;
+    const HttpResponse r = m.post(R"({"model":"img","prompt":"a red cube","size":"256x256"})",
+                                  "/v1/images/generations");
+    CHECK_EQ(r.status, 200);
+    REQUIRE_EQ(m.img.img.got.size(), (size_t)1);
+    CHECK_EQ(json::parse(r.body)["data"].size(), (size_t)1);
+    /* Without /v1 too. */
+    CHECK_EQ(m.post(R"({"model":"img","prompt":"x"})", "/images/generations").status, 200);
+    CHECK_EQ(m.img.img.got.size(), (size_t)2);
+    /* ...and the text model still serves chat beside it. */
+    CHECK_EQ(reply_of(m.post(chat("t"), "/v1/chat/completions")), std::string("text"));
+}
+
+TEST(a_multipart_image_request_is_routed_by_its_model_field) {
+    Mixed m;
+    const HttpResponse r = m.form("/v1/images/generations",
+                                  { FormPart{ "model", "", "", "img" }, FormPart{ "prompt", "", "", "a cat" } });
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(m.img.img.got.size(), (size_t)1);
+    /* An unknown id in a form is the router's 404 as well. */
+    const HttpResponse u = m.form("/v1/images/edits",
+                                  { FormPart{ "model", "", "", "nope" }, FormPart{ "prompt", "", "", "x" } });
+    CHECK_EQ(u.status, 404);
+    CHECK_EQ(code_of(u), std::string("model_not_found"));
+}
+
+TEST(a_multipart_edit_reaches_the_image_model) {
+    if (!mm::decoder_available()) return;
+    Mixed m;
+    std::vector<uint8_t> px(16 * 16 * 4, 200), file;
+    std::string why;
+    REQUIRE(mm::encode_image(px.data(), 16, 16, 4, "png", 0, &file, &why) == 0);
+    const HttpResponse r = m.form("/v1/images/edits",
+                                  { FormPart{ "model", "", "", "img" }, FormPart{ "prompt", "", "", "make it blue" },
+                                    FormPart{ "image", "a.png", "image/png", std::string(file.begin(), file.end()) } });
+    CHECK_EQ(r.status, 200);
+    REQUIRE_EQ(m.img.img.got.size(), (size_t)1);
+    CHECK_EQ(m.img.img.got.back()->refs.size(), (size_t)1);
+}
+
+TEST(an_image_request_naming_no_model_goes_to_the_default) {
+    Mixed m;   /* default: the text model, which answers that it makes no images */
+    const HttpResponse r = m.post(R"({"prompt":"x"})", "/v1/images/generations");
+    CHECK_EQ(r.status, 501);
+    CHECK(r.body.find("requires an image generation model") != std::string::npos);
+    const HttpResponse f = m.form("/v1/images/generations", { FormPart{ "prompt", "", "", "x" } });
+    CHECK_EQ(f.status, 501);
+    CHECK_EQ(m.img.img.got.size(), (size_t)0);
+    /* An image model as the default serves it. */
+    FakeModel t("t", "[T]", 200, "text", false);
+    FakeImageModel img("img");
+    ModelRouter mr("img", 2);
+    mr.attach("t", t.srv.get());
+    mr.attach("img", img.srv.get());
+    CHECK_EQ(mr.router().call("POST", "/v1/images/generations", R"({"prompt":"x"})").status, 200);
+    CHECK_EQ(img.img.got.size(), (size_t)1);
+}
+
+TEST(an_image_request_for_an_unknown_model_is_a_404) {
+    Mixed m;
+    const HttpResponse r = m.post(R"({"model":"definitely-not-a-model","prompt":"x"})",
+                                  "/v1/images/generations");
+    CHECK_EQ(r.status, 404);
+    CHECK_EQ(code_of(r), std::string("model_not_found"));
+    CHECK_EQ(m.img.img.got.size(), (size_t)0);
+}
+
+TEST(each_model_answers_media_it_cannot_serve_with_its_own_error) {
+    Mixed m;
+    /* The text model asked for a picture. */
+    const HttpResponse gen = m.post(R"({"model":"t","prompt":"x"})", "/v1/images/generations");
+    CHECK_EQ(gen.status, 501);
+    CHECK(gen.body.find("several models") == std::string::npos);
+    CHECK(gen.body.find("requires an image generation model") != std::string::npos);
+    /* A picture in a chat request reaches the named model: here a text model with no vision
+     * encoder, which says so itself... */
+    const std::string image = R"({"model":"t","messages":[{"role":"user","content":[
         {"type":"text","text":"what is this"},
         {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]})";
-    const std::string audio = R"({"model":"b","messages":[{"role":"user","content":[
-        {"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]})";
-    const std::string video = R"({"model":"b","messages":[{"role":"user","content":[
-        {"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}}]}]})";
-    for (const std::string& body : { image, audio, video }) {
-        const HttpResponse r = p.post(body);
-        CHECK_EQ(r.status, 501);
-        CHECK(r.body.find("several models") != std::string::npos);
-    }
-    for (const char* path : { "/v1/images/generations", "/v1/images/edits", "/v1/audio/speech",
-                              "/v1/audio/transcriptions", "/v1/videos", "/audio/speech" })
-        CHECK_EQ(p.post(R"({"model":"a","prompt":"x"})", path).status, 501);
-    CHECK_EQ(p.mr.router().call("GET", "/v1/realtime").status, 501);
-    CHECK_EQ(p.mr.router().call("GET", "/v1/videos").status, 501);
-    CHECK_EQ(p.a.submitted() + p.b.submitted(), (size_t)0);
-    /* A plain text request is served as before. */
-    CHECK_EQ(p.post(chat("a")).status, 200);
+    const HttpResponse c = m.post(image, "/v1/chat/completions");
+    CHECK_EQ(c.status, 501);
+    CHECK(c.body.find("vision encoder") != std::string::npos);
+    /* ...and the image model, which generates no text. */
+    const HttpResponse ci = m.post(R"({"model":"img","messages":[{"role":"user","content":"hi"}]})",
+                                   "/v1/chat/completions");
+    CHECK_EQ(ci.status, 501);
+    CHECK(ci.body.find("image model") != std::string::npos);
+    CHECK_EQ(m.t.submitted(), (size_t)0);
+    /* Audio reaches the model too, not a router-wide refusal. */
+    CHECK(m.post(R"({"model":"t","input":"x"})", "/v1/audio/speech").body.find("several models") ==
+          std::string::npos);
+}
+
+TEST(the_videos_endpoints_are_refused_with_a_manifest) {
+    Mixed m;
+    for (const char* path : { "/v1/videos", "/v1/videos/video_1", "/v1/videos/video_1/content" })
+        CHECK_EQ(m.mr.router().call("GET", path).status, 501);
+    const HttpResponse r = m.post(R"({"model":"img","prompt":"x"})", "/v1/videos");
+    CHECK_EQ(r.status, 501);
+    CHECK(r.body.find("single model") != std::string::npos);
+    CHECK_EQ(m.img.img.got.size(), (size_t)0);
 }
 
 TEST(a_text_request_naming_no_media_is_not_mistaken_for_one) {

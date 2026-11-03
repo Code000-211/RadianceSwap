@@ -4,8 +4,11 @@
  * (frontend, scheduler bridge, limits, admission), built by that model's Engine. A request's
  * `model` is read here, before any Server tokenises or renders a template, and the request is
  * handed to that model's Server through its own Router. A request naming no model goes to the
- * default one, an unknown id is a 404, and the image, audio and video endpoints (and media parts
- * in a text request) are refused: the manifest mode serves text models only.
+ * default one and an unknown id is a 404. The model is read from a JSON body's `model` or a
+ * multipart `model` field, so the image and audio endpoints, and media parts in a text request,
+ * reach the named model's Server, which answers them as it would alone (or refuses them, if that
+ * model makes no images or takes no pictures). Only /v1/videos is refused: its jobs live in one
+ * Server and a job's GET or DELETE names no model.
  *
  * Activation (ticket #9): a configured model that is not attached is cold. The first request that
  * names it starts its Launcher on a thread of its own (the model's activation thread, owned here),
