@@ -189,6 +189,7 @@ void ModelRouter::attach(const std::string& id, Server* s) {
      * finds it there. */
     if (!routes_added_) {
         routes_added_ = true;
+        socket_paths_ = s->router().socket_routes();
         for (const std::string& sig : s->router().routes()) {
             const size_t sp = sig.find(' ');
             router_.add(sig.substr(0, sp), sig.substr(sp + 1),
@@ -263,6 +264,17 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
         ApiError e = err_not_implemented(
             q.path + " is not served with a manifest: a video job is kept by one model, so the "
                      "videos endpoints are available only with a single model (--model)");
+        return refuse(q, e);
+    }
+    bool socket;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        socket = std::find(socket_paths_.begin(), socket_paths_.end(), q.path) != socket_paths_.end();
+    }
+    if (socket) {
+        ApiError e = err_not_implemented(
+            q.path + " is a WebSocket session, which is not served with a manifest; it is "
+                     "available only with a single model (--model)");
         return refuse(q, e);
     }
     /* The model first, from a JSON body or a multipart field (an image edit's usual form); every

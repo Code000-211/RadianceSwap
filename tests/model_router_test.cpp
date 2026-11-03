@@ -308,9 +308,45 @@ TEST(each_model_answers_media_it_cannot_serve_with_its_own_error) {
     CHECK_EQ(ci.status, 501);
     CHECK(ci.body.find("image model") != std::string::npos);
     CHECK_EQ(m.t.submitted(), (size_t)0);
-    /* Audio reaches the model too, not a router-wide refusal. */
-    CHECK(m.post(R"({"model":"t","input":"x"})", "/v1/audio/speech").body.find("several models") ==
-          std::string::npos);
+    /* Audio reaches the named model too, which answers by what it is. */
+    const HttpResponse at = m.post(R"({"model":"t","input":"x"})", "/v1/audio/speech");
+    CHECK_EQ(at.status, 501);
+    CHECK(at.body.find("this one generates text") != std::string::npos);
+    const HttpResponse ai = m.post(R"({"model":"img","input":"x"})", "/v1/audio/speech");
+    CHECK_EQ(ai.status, 501);
+    CHECK(ai.body.find("this one makes images") != std::string::npos);
+}
+
+TEST(a_cold_image_model_is_activated_by_its_first_image_request) {
+    FakeModel t("t", "[T]", 200, "text", false);
+    ModelRouter mr("t", 1);
+    std::atomic<int> launches{ 0 };
+    mr.add_cold("img", [&](const std::string& id) {
+        ++launches;
+        FakeImageModel img(id);
+        return mr.serve_model(id, img.srv.get());
+    });
+    mr.attach("t", t.srv.get());
+    const HttpResponse r = mr.router().call("POST", "/v1/images/generations",
+                                            R"({"model":"img","prompt":"a red cube"})");
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body)["data"].size(), (size_t)1);
+    CHECK_EQ(launches.load(), 1);
+    mr.stop();
+    mr.join();
+}
+
+TEST(the_websocket_sessions_are_refused_with_a_manifest) {
+    Mixed m;
+    for (const char* path : { "/v1/realtime", "/v1/audio/speech/stream" }) {
+        HttpRequest q;
+        q.method = "GET";
+        q.path = path;
+        q.headers["Upgrade"] = "websocket";
+        const HttpResponse r = m.mr.router().dispatch(q);
+        CHECK_EQ(r.status, 501);
+        CHECK(r.body.find("WebSocket") != std::string::npos);
+    }
 }
 
 TEST(the_videos_endpoints_are_refused_with_a_manifest) {
