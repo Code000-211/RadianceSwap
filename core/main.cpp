@@ -68,6 +68,14 @@ static int serve_manifest(rad::ModelRegistry& registry) {
         }
         return least;
     };
+    /* The free VRAM once what an Engine just released shows in the driver's figure (#62): read
+     * after a model's Engine is destroyed, before the router counts its VRAM as given back. */
+    auto settled_free_mib = [&](int tp) {
+        return rad::manifest_settled_free_mib(
+            [&] { return free_mib(tp); },
+            [](int64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); },
+            20, 300, 5000);
+    };
 
     /* One model is built at a time: the budget resolver claims what the card has free, and a
      * model's step staging comes out of the room it kept (start_execution), before the next
@@ -88,10 +96,12 @@ static int serve_manifest(rad::ModelRegistry& registry) {
                                                         registry.cache.max_active_models);
                 /* Fewer active models than configured: the VRAM may be taken by the others, which
                  * the router resolves by deactivating one (RAD_E_NOMEM). Otherwise the last model
-                 * takes what is left, as before. */
+                 * takes what is left, as before. With no other model holding VRAM there is nothing
+                 * to deactivate: the model starts with what is free, and its own budget decides. */
                 const int64_t max_active = registry.cache.max_active_models;
                 if (max_active > 0 && max_active < (int64_t)n &&
-                    !rad::manifest_has_room(free, share_mib, cfg.gpu_headroom_mib)) {
+                    !rad::manifest_has_room(free, share_mib, cfg.gpu_headroom_mib) &&
+                    rad::manifest_others_hold_vram(registry, models[i].id)) {
                     RAD_INFO("manifest: model '%s' needs about %lld MiB of VRAM and the group's "
                              "tightest card has %lld MiB free (headroom %lld MiB)",
                              models[i].id.c_str(), (long long)share_mib, (long long)free,
@@ -186,7 +196,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
             const int s = build(i, startup, &e, &dump_rc);
             if (s < 0) {
                 /* build() has destroyed the Engine, and with it every partial allocation. */
-                const int64_t free_after = free_mib(models[i].config.tp);
+                const int64_t free_after = settled_free_mib(models[i].config.tp);
                 if (free_before >= 0 && free_after >= 0)
                     RAD_INFO("model '%s': the failed activation is rolled back; the group's tightest "
                              "card has %lld MiB free (%lld MiB before it began)", id.c_str(),
@@ -206,7 +216,7 @@ static int serve_manifest(rad::ModelRegistry& registry) {
             const bool deactivated = router_ptr->deactivating(id);
             e.reset();
             if (deactivated) {
-                const int64_t after = free_mib(models[i].config.tp);
+                const int64_t after = settled_free_mib(models[i].config.tp);
                 if (before >= 0 && after >= 0) {
                     router_ptr->note_vram_released(id, after - before);
                     RAD_INFO("model '%s' deactivated: %lld MiB of VRAM freed on the group's "

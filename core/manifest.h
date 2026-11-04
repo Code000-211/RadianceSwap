@@ -30,6 +30,7 @@
 
 #include "rad_core.h"
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,6 +102,22 @@ int64_t manifest_share_mib(int64_t free_mib, int64_t base_mib, size_t n_models, 
  * A sixteenth of the share is allowed to be missing: what an Engine takes beyond its budget
  * (runtime libraries, staging) is not exact. */
 bool manifest_has_room(int64_t free_mib, int64_t share_mib, int64_t base_mib);
+
+/* Whether a model other than `id` may hold VRAM: one active, activating or being deactivated. When
+ * none does, a model short of its share is started anyway with what the card has: the share was
+ * read once, at the first start, and VRAM another process took since cannot be freed by
+ * deactivating anything here (#62). */
+bool manifest_others_hold_vram(const ModelRegistry& registry, const std::string& id);
+
+/* The free VRAM once what the process just freed shows in the driver's figure. amdgpu releases a
+ * freed buffer's VRAM some tens of milliseconds after the free (it clears the buffer first), so the
+ * figure read right after an Engine is destroyed still counts most of what it held: in #62 8 GiB
+ * free where 14 GiB were. `read` (MiB, -1: unknown) is polled every `poll_ms` until it has not
+ * risen by more than 16 MiB, the driver's own drift, for `quiet_ms`, and for at most `max_ms`;
+ * `sleep_ms` waits. The last reading is returned, -1 at once if `read` gives -1. */
+int64_t manifest_settled_free_mib(const std::function<int64_t()>& read,
+                                  const std::function<void(int64_t)>& sleep_ms,
+                                  int64_t poll_ms, int64_t quiet_ms, int64_t max_ms);
 
 /* Fills `out` from the manifest, each model's Config layered on `base` (the parsed command line).
  * RAD_E_INVAL, after logging what is wrong, for a malformed or inconsistent manifest. */

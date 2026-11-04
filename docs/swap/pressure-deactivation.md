@@ -11,7 +11,11 @@ Ein Launcher, der vor dem Attach mit `RAD_E_NOMEM` zurückkehrt (eine geworfene 
 nicht), meldet "kein Platz im VRAM". Zwei Quellen:
 
 - vorab: `build()` in `core/main.cpp` sieht, dass `free (engste Karte) − Headroom < Anteil` ist
-  (`manifest_has_room`, ein Sechzehntel des Anteils darf fehlen);
+  (`manifest_has_room`, ein Sechzehntel des Anteils darf fehlen) und ein anderes Model VRAM hält
+  (aktiv, aktivierend oder deaktivierend, `manifest_others_hold_vram`). Hält keines VRAM, gäbe es
+  nichts zu deaktivieren: das Model startet mit dem, was frei ist, und sein eigenes Budget
+  entscheidet. Der Anteil wurde einmal beim ersten Start gemessen; was ein fremder Prozess seitdem
+  belegt, würde das Model sonst dauerhaft aussperren (#62);
 - nachträglich: das Budget der Engine passt nicht (`vram_budget_resolve`) oder eine Allokation scheitert.
 
 Jeder andere Fehler läuft wie bisher (Rollback, Backoff, bei `RAD_E_DEVICE` unhealthy). Auch der
@@ -37,6 +41,14 @@ gewählt (zuletzt in Benutzung gesehen). Ein Model mit laufenden Requests wird n
    (`wait_ms`) mit 503 `model_activation_timeout` endet.
 
 Höchstens so viele erneute Aktivierungen pro Anfrage, wie Models konfiguriert sind: keine Endlosschleife.
+
+Der Launcher kehrt nach einer Deaktivierung (und nach einer zurückgerollten Aktivierung) erst
+zurück, wenn der freie VRAM der Karte sich gesetzt hat (`manifest_settled_free_mib`): amdgpu gibt
+den VRAM eines freigegebenen Buffers einige zehn Millisekunden nach dem Free zurück (es löscht den
+Buffer vorher). Direkt nach `~Engine` gelesen, zählt die Zahl noch fast alles, was das Model hielt;
+auf einer RX 9060 XT standen 8 GiB frei, wo 14 GiB waren, und die erneute Aktivierung in Schritt 2
+scheiterte daran (#62). Gelesen wird alle 20 ms, bis die Zahl 300 ms lang um nicht mehr als 16 MiB
+gestiegen ist, höchstens 5 s.
 
 ## VRAM-Anteile
 

@@ -229,6 +229,37 @@ bool manifest_has_room(int64_t free_mib, int64_t share_mib, int64_t base_mib) {
     return free_mib - base_mib >= share_mib - share_mib / 16;
 }
 
+bool manifest_others_hold_vram(const ModelRegistry& registry, const std::string& id) {
+    for (const ModelRecord& r : registry.models()) {
+        if (r.id == id) continue;
+        const ModelState s = registry.state_of(r.id);
+        if (s == ModelState::Active || s == ModelState::Activating || s == ModelState::Deactivating)
+            return true;
+    }
+    return false;
+}
+
+int64_t manifest_settled_free_mib(const std::function<int64_t()>& read,
+                                  const std::function<void(int64_t)>& sleep_ms,
+                                  int64_t poll_ms, int64_t quiet_ms, int64_t max_ms) {
+    constexpr int64_t kDrift = 16;
+    int64_t last = read();
+    int64_t base = last;     /* the reading the quiet stretch started at */
+    int64_t quiet = 0;
+    for (int64_t waited = 0; last >= 0 && quiet < quiet_ms && waited < max_ms; waited += poll_ms) {
+        sleep_ms(poll_ms);
+        last = read();
+        if (last < 0) break;
+        if (last > base + kDrift) {
+            base = last;
+            quiet = 0;
+        } else {
+            quiet += poll_ms;
+        }
+    }
+    return last;
+}
+
 int manifest_parse(const std::string& text, const Config& base, ModelRegistry* out) {
     out->reset();
     const json j = json::parse(text, nullptr, false);
