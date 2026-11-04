@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <new>
+#include <set>
 #include <vector>
 
 namespace rad {
@@ -318,8 +319,11 @@ HttpResponse ModelRouter::route(const HttpRequest& q) {
             if (q.method == "GET" && !named) unattached = true;
             else cold = true;
         } else {
-            for (const auto& kv : servers_) served += (served.empty() ? "" : ", ") + kv.first;
-            for (const auto& kv : cold_) served += (served.empty() ? "" : ", ") + kv.first;
+            /* A configured model is in cold_ whether or not it is attached: each id once. */
+            std::set<std::string> ids;
+            for (const auto& kv : servers_) ids.insert(kv.first);
+            for (const auto& kv : cold_) ids.insert(kv.first);
+            for (const std::string& m : ids) served += (served.empty() ? "" : ", ") + m;
         }
     }
     if (unattached) return answer_unattached(q);

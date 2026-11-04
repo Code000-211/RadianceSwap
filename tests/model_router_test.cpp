@@ -185,6 +185,19 @@ TEST(an_unknown_model_is_a_404_that_names_the_served_ones) {
     CHECK_EQ(json::parse(am.body)["type"].get<std::string>(), std::string("error"));
 }
 
+TEST(the_404_names_each_model_once_when_it_is_both_configured_and_attached) {
+    /* A manifest's models are all configured (add_cold), and the active ones attached too. */
+    FakeModel a("a", "[A]", 200, "alpha", false);
+    ModelRouter mr("a", 1);
+    mr.add_cold("a", [](const std::string&) { return (int)RAD_OK; });
+    mr.add_cold("b", [](const std::string&) { return (int)RAD_OK; });
+    mr.attach("a", a.srv.get());
+    const HttpResponse r = mr.router().call("POST", "/v1/chat/completions", chat("c"));
+    CHECK_EQ(r.status, 404);
+    const std::string msg = json::parse(r.body)["error"]["message"].get<std::string>();
+    CHECK(msg.find("(served: a, b)") != std::string::npos);
+}
+
 TEST(a_request_without_a_model_goes_to_the_default) {
     Pair a_default("a");
     CHECK_EQ(reply_of(a_default.post(chat(""))), std::string("alpha"));
