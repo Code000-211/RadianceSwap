@@ -314,8 +314,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     /* The cache pool must exist even when the split left it nothing, as the weights pool must: a
      * model with no cache whose statics stream (an image model on a card another model shares,
      * #62) has its claimable space all in statics and ring, and a zero here would be refused as an
-     * unresolved split. One MiB, out of the headroom. */
-    if (cfg.vram_kv_mib <= 0) cfg.vram_kv_mib = 1;
+     * unresolved split. One MiB, out of the headroom. Only for a model that has no cache: one that
+     * needs a cache and was left none must still fail to start, not serve from a pool of one MiB
+     * that refuses every prompt. */
+    if (cfg.vram_kv_mib <= 0 && kv_one == 0 && b.kv_ceiling == 0 && b.kv_fixed == 0)
+        cfg.vram_kv_mib = 1;
 
     /* The report: every term in the order spent. `unclaimed` includes what to_mib truncated,
      * which stays beside the headroom. */

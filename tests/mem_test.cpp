@@ -426,6 +426,21 @@ TEST(a_model_with_no_cache_whose_statics_stream_still_gets_a_cache_pool) {
     CHECK_EQ(c.vram_kv_mib, (int64_t)1);
 }
 
+/* The floor is for a model with no cache only. One that needs a cache and is left none, its
+ * statics filling a card it may not stream from, keeps a zero, which the pools refuse: a pool of
+ * one MiB would start the model and refuse every prompt. */
+TEST(a_model_that_needs_a_cache_and_is_left_none_gets_no_cache_pool) {
+    const int64_t GiB = 1LL << 30;
+    VramFacts f = big_moe_facts();
+    f.statics = 40 * GiB;
+    f.experts = 0;
+    Config c = derive_config();
+    c.placement = "all_vram";
+    VramBudget b;
+    const int rc = vram_budget_resolve(c, { f }, &b);
+    CHECK(rc != RAD_OK || c.vram_kv_mib == 0);
+}
+
 /* RAM-Streaming of statics (ticket #18): when the static weights do not fit beside a workable
  * cache (one full-length sequence, at most a GiB), the card holds the statics that fit after that
  * cache and the prefill ring, and the rest is the host pool's. A model that fits is untouched,
