@@ -1743,6 +1743,81 @@ int ref_qsa_work_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("qsa_work", operand, out);
 }
 
+/* LSA's indexer (ref_lsa.cpp). The descriptions draw what the ops accept: positions inside the
+ * tables, a cluster batch whose every sequence closes its first block (a constant position of
+ * block - 1), and descriptor pages a sequence each. */
+int ref_lsa_index_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t heads = gi(p, n_p, "heads", 0), kv = gi(p, n_p, "kv_heads", 0);
+    const int64_t hd = gi(p, n_p, "head_dim", 0), rot = gi(p, n_p, "rot", 0);
+    if (M <= 0 || n <= 0 || heads <= 0 || kv <= 0 || hd <= rot || heads % kv) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, heads * hd });                                    /* q */
+    o.t(D, { M, kv * hd });                                       /* k */
+    o.t(D, { n, kv * (hd - rot) });                               /* wq */
+    o.t(D, { n, kv * (hd - rot) });                               /* wk */
+    o.t((uint32_t)RAD_F32, { M, n });                             /* iq */
+    o.t(D, { M, n });                                             /* ik */
+    return o.finish("lsa_index", operand, out);
+}
+
+int ref_lsa_key_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), bs = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || n <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t S = qsa_seqs(p, n_p, M), blocks = 64 / bs + 1, pages = S * blocks;
+    Opd o;
+    o.t(D, { M, n });                                             /* ik */
+    o.t_idx({ M }, 64, -1, 0);                                    /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t_idx({ S, blocks }, pages, -1, 0);                         /* bt */
+    o.t(D, { pages, 1, bs, n });                                  /* kv */
+    return o.finish("lsa_key_store", operand, out);
+}
+
+int ref_lsa_cluster_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t block = gi(p, n_p, "block", 0), buckets = gi(p, n_p, "buckets", 0);
+    const int64_t cap = gi(p, n_p, "cap", 0);
+    if (M <= 0 || n <= 0 || ratio <= 0 || block <= 0 || block % ratio || buckets <= 0 ||
+        cap <= 0 || cap % ratio)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t S = qsa_seqs(p, n_p, M), P = block / ratio;
+    const int64_t per = buckets * (n + cap / ratio), dpages = S;
+    Opd o;
+    o.t_idx({ M }, 0, block - 1, 0);                              /* pos -- every row closes block 0 */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t(D, { S * P, 1, ratio, n });                               /* key */
+    o.t_idx({ S, P }, S * P, -1, 0);                              /* bt_key */
+    o.t_idx({ S, 1 }, dpages, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);/* bt_desc -- a page each */
+    o.t(D, { dpages, 1, per });                                   /* desc */
+    return o.finish("lsa_cluster", operand, out);
+}
+
+int ref_lsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t buckets = gi(p, n_p, "buckets", 0), cap = gi(p, n_p, "cap", 0);
+    const int64_t width = gi(p, n_p, "width", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t cblocks = gi(p, n_p, "cblocks", 0);
+    if (M <= 0 || n <= 0 || ratio <= 0 || buckets <= 0 || cap <= 0 || cap % ratio || width <= 0 ||
+        blocks <= 0 || cblocks <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t S = qsa_seqs(p, n_p, M), per = buckets * (n + cap / ratio), dpages = S * cblocks;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, n });                             /* iq */
+    o.t(act_dt(p, n_p), { dpages, 1, per });                      /* desc */
+    o.t_idx({ S, cblocks }, dpages, -1, 0);                       /* bt_desc */
+    o.t_idx({ S, blocks }, S * blocks, -1, 0);                    /* bt */
+    o.t_idx({ M }, blocks * ratio, -1, 0);                        /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t((uint32_t)RAD_I32, { M, width + 1 });                     /* sel */
+    o.t((uint32_t)RAD_I32, { M });                                /* nsel */
+    o.t((uint32_t)RAD_I32, { M });                                /* seqused */
+    return o.finish("lsa_select", operand, out);
+}
+
 /* The residency map and the two byte planes. `sel` is block ids, -1 past `nsel`. A described map
  * can only be all-resident (no draw expresses -1), so a tool's cold call exercises the epoch, the
  * rewrite and the bookkeeping, never a miss, eviction or copy; those cases are built by hand in

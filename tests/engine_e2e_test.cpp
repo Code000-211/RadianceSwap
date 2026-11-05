@@ -1767,6 +1767,108 @@ namespace {
 const std::vector<std::string> kPlain = { "--num-speculative-tokens", "0", "--no-prefix-cache" };
 const std::vector<std::string> kSpec = { "--num-speculative-tokens", "4", "--no-prefix-cache" };
 
+/* ================================================================== LSA, qwen35 (docs/LSA.md)
+ * The tiny Qwen3.5 with an LSA map merged by rad-convert --add, as tools/lsa/export_map.py's line
+ * does it, served on libref. Its two full layers (1 and 3) read 16 of each head's 32 lanes past
+ * the rotation, 4 KV heads: a [16, 64] map. */
+namespace {
+struct LsaBuilt { bool ok = false; std::string plain, lsa_wide, lsa_tight; tiny::TempDir dir{"e2e_lsa"}; };
+
+/* `plain` has no map; `lsa_wide` selects every page of the prompts below (its exactness bound is
+ * 4612 tokens) while still clustering 32-token blocks; `lsa_tight` reads 16 long-range keys, a
+ * 32-key window and the sink, so it is sparse from 52 tokens of reach. */
+LsaBuilt& lsa_built() {
+    static LsaBuilt b;
+    static bool once = false;
+    if (once) return b;
+    once = true;
+    const std::string ckpt = b.dir / "ckpt";
+    std::filesystem::create_directories(ckpt);
+    if (!tiny::write_qwen35(ckpt, {})) { fprintf(stderr, "    no tiny qwen35 at %s\n", ckpt.c_str()); return b; }
+    tiny::Rng r(7);
+    std::vector<tiny::Tensor> maps;
+    for (int layer : { 1, 3 })
+        for (const char* which : { "q", "k" })
+            maps.push_back(tiny::noise("model.language_model.layers." + std::to_string(layer) +
+                                           ".self_attn.lsa." + which + "_map.weight",
+                                       { 16, 64 }, r, 0.5f));
+    const std::string add = b.dir / "lsa.safetensors";
+    if (!tiny::write_safetensors(add, maps)) { fprintf(stderr, "    no map at %s\n", add.c_str()); return b; }
+    std::string log;
+    auto convert = [&](const std::string& out, std::vector<std::string> sets) {
+        std::vector<std::string> a = { RAD_E2E_CONVERT, ckpt, "-o", out };
+        if (!sets.empty()) { a.push_back("--add"); a.push_back(add); }
+        for (const std::string& kv : sets) { a.push_back("--set"); a.push_back(kv); }
+        const int st = tiny::run(a, engine_env(), &log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(log).c_str());
+        return st == 0;
+    };
+    const std::vector<std::string> common = { "lsa.enable=1", "lsa.index_dim=16", "lsa.pool_size=4",
+                                              "lsa.cluster_block=32", "lsa.bucket_size=8",
+                                              "lsa.bucket_cap=16", "lsa.sink_size=4" };
+    std::vector<std::string> wide = common, tight = common;
+    tight.insert(tight.end(), { "lsa.window_size=32", "lsa.top_p=2", "lsa.top_k=16" });
+    b.plain = b.dir / "plain.rad";
+    b.lsa_wide = b.dir / "lsa_wide.rad";
+    b.lsa_tight = b.dir / "lsa_tight.rad";
+    b.ok = convert(b.plain, {}) && convert(b.lsa_wide, wide) && convert(b.lsa_tight, tight);
+    return b;
+}
+
+std::vector<int32_t> lsa_greedy(const std::string& model, const std::vector<std::string>& args,
+                                const std::vector<int32_t>& prompt, int n, std::string* log = nullptr) {
+    Server s;
+    if (!s.start(model, args)) return {};
+    int status = 0;
+    const json reply = post(s.port, "/completion", completion(prompt, n), &status);
+    s.stop();
+    if (log) *log = s.log;
+    if (status != 200) fprintf(stderr, "    status %d:\n%s\n", status, tail(s.log).c_str());
+    return tokens_of(reply);
+}
+}  /* namespace */
+
+/* Below its exactness bound LSA selects every page, so decoding through its table - clustering the
+ * 32-token blocks the prompt closes on the way - gives the plain model's greedy tokens exactly. */
+TEST(lsa_below_its_bound_generates_what_dense_attention_generates) {
+    LsaBuilt& b = lsa_built();
+    REQUIRE(b.ok);
+    const std::vector<int32_t> prompt = prompt_ids(31, 40);
+    std::string log;
+    const auto plain = lsa_greedy(b.plain, kPlain, prompt, 24);
+    const auto lsa = lsa_greedy(b.lsa_wide, kPlain, prompt, 24, &log);
+    /* the startup plan names the indexer's groups at their page sizes */
+    CHECK(log.find("kv_lsa_desc    full") != std::string::npos);
+    CHECK_EQ(plain.size(), (size_t)24);
+    if (plain != lsa) fprintf(stderr, "    plain %s\n    lsa   %s\n", show(plain).c_str(), show(lsa).c_str());
+    CHECK(plain == lsa);
+}
+
+/* Above it the read is sparse, and the selection is a function of the tokens alone: a prompt
+ * prefilled in chunks - each closing cluster blocks that later chunks select from -
+ * generates exactly what it generates prefilled whole. A chunk is 64 tokens, the smallest the
+ * delta net's geometry takes, and closes two 32-token cluster blocks. */
+TEST(lsa_sparse_generation_does_not_depend_on_the_prefill_chunk) {
+    LsaBuilt& b = lsa_built();
+    REQUIRE(b.ok);
+    const std::vector<int32_t> prompt = prompt_ids(32, 120);
+    REQUIRE(prompt.size() > 100);
+    std::vector<std::string> whole = kPlain, chunked = kPlain;
+    whole.insert(whole.end(), { "--max-num-batched-tokens", "512" });
+    /* the smallest chunk the delta net's geometry takes (64): two cluster blocks a chunk */
+    chunked.insert(chunked.end(), { "--max-num-batched-tokens", "64" });
+    const auto a = lsa_greedy(b.lsa_tight, whole, prompt, 24);
+    const auto c = lsa_greedy(b.lsa_tight, chunked, prompt, 24);
+    CHECK_EQ(a.size(), (size_t)24);
+    if (a != c) fprintf(stderr, "    whole   %s\n    chunked %s\n", show(a).c_str(), show(c).c_str());
+    CHECK(a == c);
+    /* and the read really is sparse: 16 long-range keys of some 300 change what the model says */
+    const auto dense = lsa_greedy(b.plain, whole, prompt, 24);
+    CHECK_EQ(dense.size(), (size_t)24);
+    CHECK(dense != a);
+}
+
+
 int64_t timing(const json& reply, const char* field) {
     return reply.value(json::json_pointer(std::string("/timings/") + field), (int64_t)-1);
 }

@@ -495,6 +495,31 @@ static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
+/* LSA's indexer, D-LSA (Flat): index keys and queries off the attention's own q and k, their paged
+ * store, the Ward clustering of each closed cluster block into a descriptor page, and the per-query
+ * page table (docs/LSA.md). `block_size` sizes the KV group each store op claims: `ratio` for the
+ * index keys, `block` for the descriptors. `work` bounds the blocks a batch can close. */
+static const RadParamSpec pLsaIndex[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("kv_heads"),
+                                          P_INT("head_dim"), P_INT("rot"), P_STR("dtype") };
+static const RadOperandSpec oLsaIndex[] = { OPD("q"), OPD("k"), WGT("wq"), WGT("wk"), OUT("iq"),
+                                            OUT("ik") };
+static const RadParamSpec pLsaKeyStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"),
+                                             P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oLsaKeyStore[] = { OPD("ik"), OPD("pos"), OPD("cu"), OPD("bt"),
+                                               INOUT("kv") };
+static const RadParamSpec pLsaCluster[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("block"),
+                                            P_INT("buckets"), P_INT("cap"), P_INT("seqs"),
+                                            P_CAP("work"), P_INTO("block_size"), P_STR("dtype") };
+static const RadOperandSpec oLsaCluster[] = { OPD("pos"), OPD("cu"), OPD("key"), OPD("bt_key"),
+                                              OPD("bt_desc"), INOUT("desc") };
+static const RadParamSpec pLsaSelect[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("block"),
+                                           P_INT("buckets"), P_INT("cap"), P_INT("window"),
+                                           P_INT("sink"), P_INT("top_p"), P_INT("top_k"),
+                                           P_INT("width"), P_INT("blocks"), P_INT("cblocks"),
+                                           P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oLsaSelect[] = { OPD("iq"), OPD("desc"), OPD("bt_desc"), OPD("bt"),
+                                             OPD("pos"), OPD("cu"), OUT("sel"), OUT("nsel"),
+                                             OUT("seqused") };
 /* The residency map of a streamed group (ref_kvstream.cpp says why it takes no `block_size`). */
 static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
                                            P_INT("sel_pitch"), P_INT("block_bytes") };
@@ -1509,6 +1534,25 @@ static const RadOpSchema kSchemas[] = {
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
   "past the count get page -1. nc is each sequence's complete-block count." },
+{ "lsa_index", ARR(pLsaIndex), ARR(oLsaIndex),
+  "LSA's index key and query of every row from the attention's own normed, rotated q and k: the "
+  "position-free lanes rot .. head_dim of each KV head side by side, the query heads of a group "
+  "summed in f32 and rounded to bf16, each times its map [n, kv_heads * (head_dim - rot)] as a "
+  "bf16 GEMM writes it, then L2-normalized in f32. iq is f32, ik the store's dtype." },
+{ "lsa_key_store", ARR(pLsaKeyStore), ARR(oLsaKeyStore),
+  "kv[bt[s][pos / block_size]][0][pos % block_size] = ik[m] for every row a sequence holds; a "
+  "negative page id writes nothing. A page holds block_size index keys of n values." },
+{ "lsa_cluster", ARR(pLsaCluster), ARR(oLsaCluster),
+  "Every cluster block of `block` tokens the batch closes, at most `work`: its pools (the f32 sums "
+  "of each key page's `ratio` index keys) merged by spherical Ward to `buckets` buckets of at most "
+  "`cap` keys, ties to the lower index, and written to the block's descriptor page bt_desc[s][c] "
+  "as each bucket's normalized centroid, then its pools in ascending order, -1 past its size." },
+{ "lsa_select", ARR(pLsaSelect), ARR(oLsaSelect),
+  "One query's page table: the buckets of the blocks closed before its own scored by bf16(iq) . "
+  "centroid, the best top_p (ties to the lower bucket) expanded best first to their pool pages "
+  "between the sinks and the window until top_k / ratio are taken, joined by the sink and window "
+  "pages, ascending (the partial page last), as page ids of bt, then -1 to width + 1. nsel counts "
+  "the entries and seqused is (nsel - 1) * ratio + pos % ratio + 1." },
 { "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
   "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
   "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
@@ -2458,6 +2502,17 @@ SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        ref_qsa_tail_store),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
+SIMPLE("ref_lsa_index", "lsa_index", "attn",
+       "LSA index keys and queries: position-free lanes through the map, L2-normalized", DT_FLOAT,
+       ref_lsa_index),
+SIMPLE("ref_lsa_key_store", "lsa_key_store", "attn",
+       "LSA index keys into their paged store", DT_FLOAT, ref_lsa_key_store),
+SIMPLE("ref_lsa_cluster", "lsa_cluster", "attn",
+       "LSA clustering: each closed block's pools merged by Ward into a descriptor page", DT_FLOAT,
+       ref_lsa_cluster),
+SIMPLE("ref_lsa_select", "lsa_select", "attn",
+       "LSA selection: buckets scored and expanded to an ascending page-id table",
+       "f32 queries, i32 tables", ref_lsa_select),
 SIMPLE("ref_kv_resolve", "kv_resolve", "attn",
        "streamed KV residency map: selected block ids become ring slots, misses copied in",
        "i32 maps, u8 block planes", ref_kv_resolve),

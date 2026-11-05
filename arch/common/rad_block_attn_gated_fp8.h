@@ -87,6 +87,11 @@ struct AttnGatedFP8 {
     /* `sel`'s row pitch is `topk + 1`; the extra slot is the partial page
      * (r4d_qsa_select_bf16.hip). */
     int64_t     qsa_topk = 0;
+    /* An indexer that reads this layer's own q and k (LSA, arch/common/rad_lsa.h) fills the
+     * selection here: step() calls it once the prologue has normed, rotated and stored q and k, and
+     * before the attention reads `qsa_sel`. Null for none, which leaves every graph as it was. */
+    void (*pre_read)(const void* self, RadCtx* c, const RadBatch* batch) = nullptr;
+    const void* pre_read_self = nullptr;
     /* Query rows per sparse attention launch, a scratch budget. The decode kernel's split-KV
      * partials are sized at declare from `max_seqs` and `q_len`, so issuing more rows than
      * `max_seqs` means declaring a larger value, which grows the scratch arena (the maximum over
@@ -681,6 +686,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
 
     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
+    if (pre_read) pre_read(pre_read_self, c, batch);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with

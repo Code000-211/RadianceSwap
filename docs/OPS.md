@@ -3255,6 +3255,74 @@ tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loa
 element once for them, with every row's sum in the same order whatever the group, so a row's bytes
 do not depend on the batch.
 
+## Sparse attention (LSA)
+
+| op | params | operands |
+|---|---|---|
+| `lsa_index` | `M`(range) `n` `heads` `kv_heads` `head_dim` `rot` `dtype` | `q`, `k`, `wq`w, `wk`w → `iq`, `ik` |
+| `lsa_key_store` | `M`(range) `n` `block_size` `seqs` `dtype` | `ik`, `pos`, `cu`, `bt`, `kv`:inout |
+| `lsa_cluster` | `M`(range) `n` `ratio` `block` `buckets` `cap` `seqs` `work` `block_size`/opt `dtype` | `pos`, `cu`, `key`, `bt_key`, `bt_desc`, `desc`:inout |
+| `lsa_select` | `M`(range) `n` `ratio` `block` `buckets` `cap` `window` `sink` `top_p` `top_k` `width` `blocks` `cblocks` `seqs` `dtype` | `iq`, `desc`, `bt_desc`, `bt`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+
+Four ops decompose D-LSA (Flat), Latent Sparse Attention's distilled indexer, which clusters the
+key history once per closed block and scores the cluster centroids instead of every block. Its
+output is a table of the same shape as `qsa_select`'s, so the attention is `attn_paged` as for QSA.
+`docs/LSA.md` is the design and its reference; libref implements all four, and libavx all four for
+the host path, byte for byte (`libavx/avx_lsa.cpp` does not contract).
+
+### `lsa_index`
+
+```
+key[j]   = k[m][h][rot + i]                                            j = h*(head_dim - rot) + i
+query[j] = bf16( sum over g < heads/kv_heads of q[m][h*G + g][rot + i] )      the sum in f32
+ik[m]    = normalize( bf16( key . wk^T ) ),   iq[m] = normalize( bf16( query . wq^T ) )
+```
+
+- **`q` and `k` are the attention's own, after their norms and rope.** The lanes past `rot` are
+  the part of the logit the rotation leaves alone, so the index is position-free. A rotation that
+  mixes lanes (a Hadamard over the whole head) has to come after this op, not before.
+- **The rounding is the reference's**: the summed query rounded to bf16 before its map, each GEMM's
+  output rounded to bf16, the norm in f32 (`F.normalize`, a floor of 1e-12). `iq` stays f32;
+  `ik` takes the store's dtype.
+
+### `lsa_key_store`
+
+The index keys' paged store, one key a token. With `block_size` equal to the attention's page,
+a key page and an attention page cover the same tokens, so one block index means the same in both
+groups. `block_size` sizes the group the op claims.
+
+### `lsa_cluster`
+
+```
+pool[i]   = sum over r < ratio of key[bt_key[s][c*block/ratio + i]][r]            f32
+buckets   = Ward(pool, to `buckets`, at most `cap` keys each)
+desc page = [ normalize(sum of a bucket's pools) ] x buckets, then [ its pools ascending, -1 pad ]
+```
+
+- **One descriptor page a cluster block, written once.** A block is clustered by the batch that
+  closes it, in the page of the token that closes it, so a prefix-cache hit shares a descriptor only
+  with sequences that share the whole block. `block_size` (= `block`) sizes the descriptor group.
+- **Ward is spherical and deterministic.** cost(a, b) = |S_a| + |S_b| - sqrt(|S_a|^2 + |S_b|^2 +
+  2 S_a.S_b); every alive bucket's cheapest allowed partner, the lower index on a tie; mutual pairs
+  merge into the lower index, the cheapest first when more would merge than the block has left. A
+  block the cap leaves short of `buckets` is an error, which `cap >= 2 * block / buckets` rules out.
+- **`work` bounds the closed blocks a batch can hold**, at most `M / block + seqs`.
+
+### `lsa_select`
+
+The table one query's attention reads, in `qsa_select`'s contract: ascending page ids, the partial
+page last, `-1` to `width + 1`, `seqused = (nsel - 1)*ratio + pos % ratio + 1`.
+
+- **Only blocks closed before the query's own are scored**, `c < pos / block`. The open block lies
+  inside the window, so nothing is missed.
+- **Scores are bf16(iq) . centroid in f32; the best `top_p` are picked, a tie to the lower bucket.**
+- **Expansion is best first, by pages**: a picked bucket's pool pages between the sink pages and
+  the window's first page are taken until `top_k / ratio` are. The window is the pages of
+  `[max(0, pos + 1 - window), pos]`, so up to `ratio - 1` keys before the window's first are read
+  too, where the reference reads keys.
+- **Below `top_k + window + sink` tokens of reach every page is selected**, and the table is the
+  sequence's own: the sparse and dense paths then read the same keys in the same order.
+
 ## Draft heads
 
 A drafter is an ordinary graph over ordinary ops except at its two ends: what proposes the

@@ -258,6 +258,11 @@ int ref_qsa_score          (const RadArgs*, RadStream);
 int ref_qsa_select         (const RadArgs*, RadStream);
 int ref_qsa_tail_store     (const RadArgs*, RadStream);
 int ref_qsa_work           (const RadArgs*, RadStream);
+/* LSA's indexer (ref_lsa.cpp) */
+int ref_lsa_index          (const RadArgs*, RadStream);
+int ref_lsa_key_store      (const RadArgs*, RadStream);
+int ref_lsa_cluster        (const RadArgs*, RadStream);
+int ref_lsa_select         (const RadArgs*, RadStream);
 /* the residency map between a streamed group's block ids and its ring slots (ref_kvstream.cpp) */
 int ref_kv_resolve         (const RadArgs*, RadStream);
 int ref_dflash_conv        (const RadArgs*, RadStream);
@@ -519,6 +524,10 @@ REF_SHAPE_FN(ref_qsa_block_key);
 REF_SHAPE_FN(ref_qsa_score);
 REF_SHAPE_FN(ref_qsa_select);
 REF_SHAPE_FN(ref_qsa_tail_store);
+REF_SHAPE_FN(ref_lsa_index);
+REF_SHAPE_FN(ref_lsa_key_store);
+REF_SHAPE_FN(ref_lsa_cluster);
+REF_SHAPE_FN(ref_lsa_select);
 REF_SHAPE_FN(ref_qsa_work);
 REF_SHAPE_FN(ref_kv_resolve);
 REF_SHAPE_FN(ref_dflash_conv);

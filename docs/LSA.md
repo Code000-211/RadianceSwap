@@ -1,10 +1,32 @@
 # LSA on Qwen4-Exp: a design for serving Latent Sparse Attention in place of QSA
 
-Status: **proposal, nothing implemented.** This document plans how D-LSA (Flat), the distilled indexer of
-Latent Sparse Attention ([arXiv 2610.42147](https://arxiv.org/abs/2610.42147),
-[latent-sparse-attention](https://github.com/Code000-211/latent-sparse-attention)), replaces QSA's selection on
-the twelve global layers of Qwen3.8-Flash-Next. Read [QSA.md](QSA.md) first: LSA keeps QSA's
-page-table contract and its attention, and changes only how the table is chosen.
+Status: **phase 1 implemented, on the CPU reference; first on Qwen3.8-27B.** The four ops have libref rows
+(`libref/ref_lsa.cpp`) checked against latent-sparse-attention's own Ward merge and Qwen3.8-27B's released
+distilled map (`tests/ref_test.cpp`, goldens from `tools/lsa/make_golden.py`). Both qwen35 plugins - `qwen35_fp8`
+(Qwen3.8-27B-FP8) and `qwen35_bf16` - wire them behind the container key `lsa.enable` (`arch/common/rad_lsa.h`,
+`tests/arch_test.cpp`), and the engine serves a container that carries a map end to end on the host
+(`tests/engine_e2e_test.cpp`: below the bound it generates the dense model's tokens exactly, above it the sparse
+read changes them and does not depend on the prefill chunk). libavx carries the four ops as host rows, libref's
+arithmetic byte for byte, so the indexer runs without the reference library; no device kernel exists yet, so on
+a card the planner places it on the host (slow at long context). libr4d is phase 2. The Qwen4-Exp (Flash-Next) wiring and tensor
+parallelism follow the same header. This document is the design; where it planned otherwise, the text below says
+what was built.
+
+## Trying it on Qwen3.8-27B
+
+The released map (`d-lsa-weights-v1`, `qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt`, or the training-free
+`...-pca-step0.pt`) goes into a container in two commands:
+
+```
+python tools/lsa/export_map.py qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt lsa_27b.safetensors --key-dim 768
+rad-convert <Qwen3.8-27B-FP8 checkpoint> --reuse q38-27b.rad --in-place --add lsa_27b.safetensors \
+    --set lsa.enable=1
+```
+
+`export_map.py` prints the full `--set` list of the design's knobs; unset, each is the served design's. The map was
+trained under YaRN x40 (10M); serve it with the rotation it was fitted under, `--rope-scaling yarn:40`. The engine
+must run on one rank (tensor parallelism is refused by name for now). Until libr4d has the four ops, libavx's
+host rows run the indexer beside the card, which is a functional test, not a speed one.
 
 Why: QSA's indexer scores every closed 4-token block, so its cost grows linearly with context at decode
 and quadratically at prefill. LSA clusters the history once per 512-token block and scores the cluster
@@ -131,6 +153,11 @@ through the block table.
 
 ### 2.3 Where LSA reads q and k
 
+*Built as a hook rather than a split:* `AttnGatedFP8` carries `pre_read`, which `step()` calls right after
+the KV store and before it decides between the dense and sparse attention. `LsaIndexer::declare` sets it. A
+layer without it issues exactly the graph it did.
+
+
 QSA projects the normed hidden `aw.h` with its own `index_qk_proj`, so it runs before `attn.step()`. LSA reads
 the **attention's own q and k after `q_norm`/`k_norm` and rope**, which exist only inside
 `AttnGatedFP8::step` (`arch/common/rad_block_attn_gated_fp8.h`: prologue, `op_fused*` or
@@ -179,6 +206,10 @@ the KV.
 
 ### 2.5 Ops
 
+*Built with four ops:* the work list is folded into `lsa_cluster`, which finds the blocks a batch closes from
+`cu` and the positions itself (a device kernel launches over `work` = `max_tok / block + max_seqs` items and
+leaves the rest idle). The schemas are in `docs/OPS.md`, "Sparse attention (LSA)".
+
 All five ops are new, with a libref row each (CPU, unconstrained), a schema in `docs/OPS.md`, an entry in
 `tests/ref_test.cpp`'s vocabulary, and later libr4d and libavx rows.
 
@@ -204,6 +235,9 @@ same chunk, as the reference does.
 
 ### 2.6 Loading the map
 
+*Built:* `tools/lsa/export_map.py` writes the safetensors file (torch only) and prints the `rad-convert`
+line, including the `--set` keys of the design.
+
 The maps travel inside the container. Radiance serves no stray side files out of a checkpoint directory
 (`core/format/checkpoint.cpp`, `shard_list`), and a merged weight gets placement, TP replication, the
 warm store and the fingerprint for free:
@@ -220,6 +254,12 @@ The exporter checks the layer set against the checkpoint's global layers and ref
 `input_dim` is not 384.
 
 ### 2.7 Switching it on
+
+*Built for now as a container key:* `lsa.enable=1` (with the design's knobs, `lsa.top_k`, `lsa.top_p`,
+`lsa.window_size`, `lsa.sink_size`, `lsa.cluster_block`, `lsa.bucket_size`, `lsa.bucket_cap`,
+`lsa.pool_size`, `lsa.index_dim`, defaulting to the served design) turns it on in the qwen35 plugins. The
+engine flag below is still the plan for switching one container both ways. Tensor parallelism is refused
+by name until the partial-projection all-reduce exists.
 
 An engine flag, `--sparse-indexer qsa|lsa`, defaulting to `qsa`. It sets a metadata key
 `qwen4exp.sparse_indexer` the way `--rope-scaling` rewrites `rope_parameters` (`Engine::apply_rope_scaling`,

@@ -38,6 +38,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_attn_gated.h>
+#include <arch/rad_lsa.h>
 #include <arch/rad_block_gdn.h>
 #include <arch/rad_block_mlp.h>
 #include <arch/rad_block_vit.h>
@@ -55,6 +56,8 @@ struct Layer {
     AttnGatedBF16 attn;
     GdnBF16       gdn;
     MlpBF16       mlp;
+    /* LSA's indexer, on full layers when the container carries a map (`lsa.enable`). */
+    LsaIndexer    lsa;
 };
 
 struct Model {
@@ -65,6 +68,11 @@ struct Model {
     int64_t         n_main = 0;    /* trunk layers, excluding the MTP block */
 
     rad_kvgroup kv_full = 0, kv_state = 0, kv_conv = 0;
+    /* LSA (docs/LSA.md, arch/common/rad_lsa.h), as in qwen35_fp8. */
+    bool               lsa_on = false;
+    LsaIndexer::Config lsacfg{};
+    LsaIndexer::Wire   lsaw{};
+    rad_kvgroup        kv_lsa_key = 0, kv_lsa_desc = 0;
 
     /* the residual stream and the two vocabulary edges */
     rad_buf b_x = 0, b_h = 0, b_hout = 0, b_logits = 0;
@@ -255,6 +263,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_gate    = decl_b(b, nm.f("attn_gate"),g.act_dtype, {g.max_tok, q_dim});
     m.b_attn    = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, q_dim});
 
+    /* ---- LSA, when the container carries a map (qwen35_fp8.cpp says how the keys are read). */
+    m.lsa_on = rad_meta_geti(meta, "lsa.enable", 0) != 0;
+    if (m.lsa_on) {
+        LsaIndexer::Config& lc = m.lsacfg;
+        lc.n       = rad_meta_geti(meta, "lsa.index_dim", 64);
+        lc.ratio   = rad_meta_geti(meta, "lsa.pool_size", 4);
+        lc.block   = rad_meta_geti(meta, "lsa.cluster_block", 512);
+        lc.buckets = lc.block / rad_meta_geti(meta, "lsa.bucket_size", 8);
+        lc.cap     = rad_meta_geti(meta, "lsa.bucket_cap", 16);
+        lc.window  = rad_meta_geti(meta, "lsa.window_size", 512);
+        lc.sink    = rad_meta_geti(meta, "lsa.sink_size", 4);
+        lc.top_p   = rad_meta_geti(meta, "lsa.top_p", 1024);
+        lc.top_k   = rad_meta_geti(meta, "lsa.top_k", 4096);
+        lc.rot     = m.n_rot;
+        lc.kv_attn = m.kv_full;
+        const int64_t width = LsaIndexer::width(lc);
+        m.lsaw.iq   = decl_b(b, nm.f("lsa_iq"),   RAD_F32,  {g.max_tok, lc.n});
+        m.lsaw.ik   = decl_b(b, nm.f("lsa_ik"),   RAD_BF16, {g.max_tok, lc.n});
+        m.lsaw.sel  = decl_b(b, nm.f("lsa_sel"),  RAD_I32,  {g.max_tok, width + 1});
+        m.lsaw.nsel = decl_b(b, nm.f("lsa_nsel"), RAD_I32,  {g.max_tok});
+        m.lsaw.sequ = decl_b(b, nm.f("lsa_sequ"), RAD_I32,  {g.max_tok});
+        rad_note(b, "lsa: D-LSA (Flat) on every full-attention layer, top_k %lld, top_p %lld, "
+                    "window %lld, cluster block %lld", (long long)lc.top_k, (long long)lc.top_p,
+                 (long long)lc.window, (long long)lc.block);
+    }
+
     m.b_in      = decl_b(b, nm.f("gdn_in"),   g.act_dtype, {g.max_tok, gc.in_dim()});
     m.b_z       = decl_b(b, nm.f("gdn_z"),    g.act_dtype, {g.max_tok, v_dim});
     m.b_gq      = decl_b(b, nm.f("gdn_q"),    g.act_dtype, {g.max_tok, gc.n_head_k, gc.head_k});
@@ -353,7 +387,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
+            if (m.lsa_on) {
+                lay.attn.kv_block = m.lsacfg.ratio;
+                lay.attn.sel      = m.lsaw.sel;
+                lay.attn.nsel     = m.lsaw.nsel;
+                lay.attn.sequ     = m.lsaw.sequ;
+                lay.attn.topk     = LsaIndexer::width(m.lsacfg);
+                lay.attn.exact_to = LsaIndexer::exact_to(m.lsacfg);
+            }
             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as));
+            if (m.lsa_on) {
+                LsaIndexer::Config lc = m.lsacfg;
+                lc.q_map = nm.ckpt("%s.%lld.self_attn.lsa.q_map.weight", pre, (long long)l);
+                lc.k_map = nm.ckpt("%s.%lld.self_attn.lsa.k_map.weight", pre, (long long)l);
+                RAD_ARCH_TRY(lay.lsa.declare(b, nm, g, (int)l, lc, m.lsaw, lay.attn,
+                                             &m.kv_lsa_key, &m.kv_lsa_desc));
+            }
         } else {
             GdnBF16::Src gs{};
             gs.norm     = nm.ckpt("%s.%lld.input_layernorm.weight",           pre, (long long)l);

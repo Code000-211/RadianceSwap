@@ -63,6 +63,17 @@ struct AttnGatedBF16 {
     int64_t     n_rot   = 0;          /* partial rotary: the leading n_rot of head_dim */
     const char* mode    = "mrope";
 
+    /* A sparse indexer's selection (LSA, arch/common/rad_lsa.h), in AttnGatedFP8's form: the KV
+     * page in tokens (0 is RAD_KV_BLOCK), the per-query table `sel` (`topk + 1` wide), its counts
+     * and lengths, the reach below which the dense attention reads the same keys (0: always
+     * sparse), and the hook step() calls once q and k are normed, rotated and stored. Unset, the
+     * block is the dense one it always was. */
+    int64_t     kv_block = 0;
+    rad_buf     sel = 0, nsel = 0, sequ = 0;
+    int64_t     topk = 0, exact_to = 0;
+    void (*pre_read)(const void* self, RadCtx* c, const RadBatch* batch) = nullptr;
+    const void* pre_read_self = nullptr;
+
     rad_weight w_norm = 0, w_qg = 0, w_k = 0, w_v = 0, w_q_norm = 0, w_k_norm = 0, w_o = 0;
 
     rad_op op_norm = 0, op_qg = 0, op_kp = 0, op_vp = 0;
@@ -201,11 +212,17 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                                 RAD_INT("window", 0),
                                 /* Bounds for the kernel's scratch hook: libr4d sizes a split-KV
                                  * partial buffer of num_seqs * q_len * q_heads * splits rows. */
-                                RAD_INT("n_head", g.n_head), RAD_INT("block_size", RAD_KV_BLOCK), RAD_INT("max_seqs", g.max_seqs),
+                                RAD_INT("n_head", g.n_head),
+                                RAD_INT("block_size", kv_block ? kv_block : RAD_KV_BLOCK),
+                                /* a sparse step issues every query as a sequence of its own */
+                                RAD_INT("max_seqs", sel && g.max_tok > g.max_seqs ? g.max_tok
+                                                                                   : g.max_seqs),
                                 RAD_INT("max_ctx", g.max_ctx),
                                 RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
-                 {w.q}, {w.attn});
+                 sel ? std::initializer_list<rad_buf>{w.q, sel, nsel, sequ}
+                     : std::initializer_list<rad_buf>{w.q},
+                 {w.attn});
 
     /* kv_store writes the group's pool, which is not a declared buffer, so its write set is
      * empty. */
@@ -285,7 +302,17 @@ inline void AttnGatedBF16::step(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE(c, op_kv_store,
               brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    if (pre_read) pre_read(pre_read_self, c, batch);
 
+    /* A sparse step issues T queries as T rows of q_len 1, each with its own table and length
+     * (AttnGatedFP8::step says why that is the same kernel); a decode step always, a prefill above
+     * the reach where the dense read is the same. */
+    const int64_t reach = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    if (sel && sequ && (T == batch->n_seq || exact_to <= 0 || reach > exact_to)) {
+        RAD_ISSUE_N(c, op_attn, 1,
+                    brows(w.q, T), kv_cache(kv, layer), brows(sel, T), brows(sequ, T),
+                    RAD_NONE, RAD_NONE, RAD_NONE, brows(w.attn, T));
+    } else
     /* The longest query length, not the token count, selects the attention band: a verify step and
      * a prefill chunk can have the same token count at very different q_len. */
     RAD_ISSUE_N(c, op_attn, batch->max_q_len,

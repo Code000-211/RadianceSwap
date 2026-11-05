@@ -997,6 +997,7 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
+        "lsa_index", "lsa_key_store", "lsa_cluster", "lsa_select",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -8291,6 +8292,225 @@ TEST(snake_aa_applies_snakebeta_between_the_filters) {
     CHECK_NEAR(y.at(2), 1.9048042f, 1e-6);
 }
 
+/* ================================================================== LSA's indexer
+ * docs/OPS.md "Sparse attention (LSA)", docs/LSA.md. The golden cases read tests/data/golden/lsa,
+ * which tools/lsa/make_golden.py writes from latent-sparse-attention's own Ward merge and Qwen3.8-27B's
+ * distilled map (layer 3); the literal cases pin the contract by hand. */
+namespace {
+std::vector<uint8_t> lsa_golden(const char* name) {
+    const std::string path = std::string(RAD_GOLDEN_FIXTURES) + "/lsa/" + name;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::vector<uint8_t> v;
+    if (!f) return v;
+    uint8_t buf[65536];
+    size_t got;
+    while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + got);
+    std::fclose(f);
+    return v;
+}
+
+/* The golden geometry, tools/lsa/make_golden.py's constants. */
+constexpr int64_t kLsaHeads = 24, kLsaKv = 4, kLsaHd = 256, kLsaRot = 64, kLsaN = 64;
+constexpr int64_t kLsaRows = 8, kLsaRatio = 4, kLsaBlock = 512, kLsaBuckets = 64, kLsaCap = 16;
+constexpr int64_t kLsaTokens = 3 * kLsaBlock, kLsaPages = kLsaTokens / kLsaRatio;
+constexpr int64_t kLsaMembers = kLsaCap / kLsaRatio, kLsaDesc = kLsaBuckets * (kLsaN + kLsaMembers);
+const int64_t kLsaQueries[] = { 520, 1023, 1100, 1535 };
+
+/* A permutation of [0, n), so a block table is not the identity and a test reads through it. */
+std::vector<int64_t> lsa_shuffled(int64_t n, int64_t offset) {
+    std::vector<int64_t> v((size_t)n);
+    for (int64_t i = 0; i < n; ++i) v[(size_t)i] = (i * 37 + 11) % n + offset;
+    return v;
+}
+
+/* The golden index keys stored through lsa_key_store and clustered by lsa_cluster. */
+struct LsaClustered { T key, desc; std::vector<int64_t> bt_key, bt_desc; int rc; };
+LsaClustered lsa_cluster_golden() {
+    LsaClustered r{ T(RAD_BF16, { kLsaPages, 1, kLsaRatio, kLsaN }), T(RAD_BF16, { 3, 1, kLsaDesc }),
+                    lsa_shuffled(kLsaPages, 0), { 2, 0, 1 }, -1 };
+    T ik(RAD_BF16, { kLsaTokens, kLsaN }); ik.raw(lsa_golden("ik.bf16"));
+    std::vector<int64_t> pos((size_t)kLsaTokens);
+    for (int64_t t = 0; t < kLsaTokens; ++t) pos[(size_t)t] = t;
+    T po(RAD_I32, { kLsaTokens }); po.n(pos);
+    T cu(RAD_I32, { 2 }); cu.n({ 0, kLsaTokens });
+    T btk(RAD_I32, { 1, kLsaPages }); btk.n(r.bt_key);
+    A st; st.t(ik).t(po).t(cu).t(btk).t(r.key).i("M", kLsaTokens).i("n", kLsaN)
+            .i("block_size", kLsaRatio).i("seqs", 1).s("dtype", "bf16");
+    if ((r.rc = run("lsa_key_store", st)) != RAD_OK) return r;
+    T btd(RAD_I32, { 1, 3 }); btd.n(r.bt_desc);
+    A cl; cl.t(po).t(cu).t(r.key).t(btk).t(btd).t(r.desc).i("M", kLsaTokens).i("n", kLsaN)
+            .i("ratio", kLsaRatio).i("block", kLsaBlock).i("buckets", kLsaBuckets).i("cap", kLsaCap)
+            .i("seqs", 1).i("work", 4).i("block_size", kLsaBlock).s("dtype", "bf16");
+    r.rc = run("lsa_cluster", cl);
+    return r;
+}
+}  /* namespace */
+
+/* lsa_index against latent-sparse-attention's served projection on the real map: each value within
+ * a bf16 rounding of the reference, whose GEMM sums in another order. */
+TEST(lsa_index_matches_the_served_projection_of_the_27b_map) {
+    const auto qb = lsa_golden("q.bf16"), kb = lsa_golden("k.bf16");
+    CHECK(!qb.empty() && !kb.empty());
+    T q(RAD_BF16, { kLsaRows, kLsaHeads * kLsaHd }); q.raw(qb);
+    T k(RAD_BF16, { kLsaRows, kLsaKv * kLsaHd }); k.raw(kb);
+    const int64_t K = kLsaKv * (kLsaHd - kLsaRot);
+    T wq(RAD_BF16, { kLsaN, K }); wq.raw(lsa_golden("wq.bf16"));
+    T wk(RAD_BF16, { kLsaN, K }); wk.raw(lsa_golden("wk.bf16"));
+    T iq(RAD_F32, { kLsaRows, kLsaN }), ik(RAD_BF16, { kLsaRows, kLsaN });
+    A a; a.t(q).t(k).t(wq).t(wk).t(iq).t(ik).i("M", kLsaRows).i("n", kLsaN).i("heads", kLsaHeads)
+          .i("kv_heads", kLsaKv).i("head_dim", kLsaHd).i("rot", kLsaRot).s("dtype", "bf16");
+    CHECK_OK(run("lsa_index", a));
+    T eq(RAD_F32, { kLsaRows, kLsaN }); eq.raw(lsa_golden("iq_rows.f32"));
+    T ek(RAD_BF16, { kLsaRows, kLsaN }); ek.raw(lsa_golden("ik_rows.bf16"));
+    float worst = 0.0f, norm = 0.0f;
+    for (int64_t i = 0; i < kLsaRows * kLsaN; ++i) {
+        worst = std::fmax(worst, std::fabs(iq.at(i) - eq.at(i)));
+        worst = std::fmax(worst, std::fabs(ik.at(i) - ek.at(i)));
+    }
+    for (int64_t i = 0; i < kLsaN; ++i) norm += iq.at(i) * iq.at(i);
+    CHECK_NEAR(norm, 1.0f, 1e-5);
+    CHECK(worst <= 8e-3f);
+}
+
+/* lsa_key_store and lsa_cluster against latent-sparse-attention's Ward merge: through shuffled key
+ * and descriptor tables, every bucket's pools exactly and every centroid within a bf16 rounding. */
+TEST(lsa_cluster_matches_the_reference_ward_merge) {
+    LsaClustered c = lsa_cluster_golden();
+    CHECK_OK(c.rc);
+    T cen(RAD_F32, { 3, kLsaBuckets, kLsaN }); cen.raw(lsa_golden("centroids.f32"));
+    T mem(RAD_I32, { 3, kLsaBuckets, kLsaMembers }); mem.raw(lsa_golden("members.i32"));
+    int64_t member_mismatch = 0;
+    float worst = 0.0f;
+    for (int64_t b = 0; b < 3; ++b) {
+        const int64_t base = c.bt_desc[(size_t)b] * kLsaDesc;
+        for (int64_t u = 0; u < kLsaBuckets; ++u) {
+            for (int64_t j = 0; j < kLsaMembers; ++j)
+                if ((int64_t)c.desc.at(base + kLsaBuckets * kLsaN + u * kLsaMembers + j) !=
+                    mem.iat((b * kLsaBuckets + u) * kLsaMembers + j))
+                    ++member_mismatch;
+            for (int64_t d = 0; d < kLsaN; ++d)
+                worst = std::fmax(worst, std::fabs(c.desc.at(base + u * kLsaN + d) -
+                                                   cen.at((b * kLsaBuckets + u) * kLsaN + d)));
+        }
+    }
+    CHECK_EQ(member_mismatch, (int64_t)0);
+    CHECK(worst <= 4e-3f);
+}
+
+/* lsa_select against the reference's selection at page granularity, at four positions in the three
+ * blocks: the same pages, ascending, through a block table that is not the identity. */
+TEST(lsa_select_matches_the_reference_tables) {
+    LsaClustered c = lsa_cluster_golden();
+    CHECK_OK(c.rc);
+    const int64_t Q = 4, width = 64, window = 128, sink = 4, top_p = 8, top_k = 64;
+    T iq(RAD_F32, { Q, kLsaN }); iq.raw(lsa_golden("iq_sel.f32"));
+    T btd(RAD_I32, { 1, 3 }); btd.n(c.bt_desc);
+    const std::vector<int64_t> attn = lsa_shuffled(kLsaPages, 1000);
+    T bt(RAD_I32, { 1, kLsaPages }); bt.n(attn);
+    T po(RAD_I32, { Q }); po.n({ kLsaQueries[0], kLsaQueries[1], kLsaQueries[2], kLsaQueries[3] });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, Q });
+    T se(RAD_I32, { Q, width + 1 }), ns(RAD_I32, { Q }), su(RAD_I32, { Q });
+    A a; a.t(iq).t(c.desc).t(btd).t(bt).t(po).t(cu).t(se).t(ns).t(su).i("M", Q).i("n", kLsaN)
+          .i("ratio", kLsaRatio).i("block", kLsaBlock).i("buckets", kLsaBuckets).i("cap", kLsaCap)
+          .i("window", window).i("sink", sink).i("top_p", top_p).i("top_k", top_k)
+          .i("width", width).i("blocks", kLsaPages).i("cblocks", 3).i("seqs", 1)
+          .s("dtype", "bf16");
+    CHECK_OK(run("lsa_select", a));
+    T want(RAD_I32, { Q, 64 }); want.raw(lsa_golden("tables.i32"));
+    std::vector<int64_t> logical((size_t)(kLsaPages + 1000), -1);
+    for (int64_t g = 0; g < kLsaPages; ++g) logical[(size_t)attn[(size_t)g]] = g;
+    for (int64_t m = 0; m < Q; ++m) {
+        int64_t count = 0;
+        while (count < 64 && want.iat(m * 64 + count) >= 0) ++count;
+        CHECK_EQ(ns.iat(m), count);
+        for (int64_t i = 0; i < count; ++i)
+            CHECK_EQ(logical[(size_t)se.iat(m * (width + 1) + i)], want.iat(m * 64 + i));
+        CHECK_EQ(se.iat(m * (width + 1) + count), (int64_t)-1);
+        CHECK_EQ(su.iat(m), (count - 1) * kLsaRatio + kLsaQueries[m] % kLsaRatio + 1);
+    }
+}
+
+/* Below top_k + window + sink tokens of reach every page is selected, ascending, partial page last:
+ * the sequence's own table, so the sparse read is the dense one (docs/LSA.md, the exactness bound). */
+TEST(lsa_select_below_the_bound_is_the_whole_table) {
+    LsaClustered c = lsa_cluster_golden();
+    CHECK_OK(c.rc);
+    const int64_t width = 1200, p = 1534;     /* 384 pages of reach; budget 4096 keys, window 512 */
+    std::vector<uint8_t> first = lsa_golden("iq_sel.f32");
+    first.resize((size_t)kLsaN * 4);         /* the first query's row */
+    T iq(RAD_F32, { 1, kLsaN }); iq.raw(first);
+    T btd(RAD_I32, { 1, 3 }); btd.n(c.bt_desc);
+    const std::vector<int64_t> attn = lsa_shuffled(kLsaPages, 7);
+    T bt(RAD_I32, { 1, kLsaPages }); bt.n(attn);
+    T po(RAD_I32, { 1 }); po.n({ p });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, 1 });
+    T se(RAD_I32, { 1, width + 1 }), ns(RAD_I32, { 1 }), su(RAD_I32, { 1 });
+    A a; a.t(iq).t(c.desc).t(btd).t(bt).t(po).t(cu).t(se).t(ns).t(su).i("M", 1).i("n", kLsaN)
+          .i("ratio", kLsaRatio).i("block", kLsaBlock).i("buckets", kLsaBuckets).i("cap", kLsaCap)
+          .i("window", 512).i("sink", 4).i("top_p", 1024).i("top_k", 4096).i("width", width)
+          .i("blocks", kLsaPages).i("cblocks", 3).i("seqs", 1).s("dtype", "bf16");
+    CHECK_OK(run("lsa_select", a));
+    CHECK_EQ(ns.iat(0), p / kLsaRatio + 1);
+    for (int64_t g = 0; g <= p / kLsaRatio; ++g) CHECK_EQ(se.iat(g), attn[(size_t)g]);
+    CHECK_EQ(su.iat(0), p + 1);
+}
+
+/* Equal scores go to the lower bucket, and the expansion stops at top_k / ratio pages, cutting the
+ * last bucket; sink and window pages join, and a bucket page inside the window is not taken twice. */
+TEST(lsa_select_breaks_ties_to_the_lower_bucket_and_cuts_the_last_one) {
+    const int64_t n = 2, ratio = 4, block = 16, buckets = 2, cap = 8, members = 2;
+    /* One block of 4 pools: bucket 0 = pools {1, 2}, bucket 1 = pools {0, 3}, equal centroids. */
+    T desc(RAD_F32, { 1, 1, buckets * (n + members) });
+    desc.f({ 1, 0, 1, 0, /* members */ 1, 2, 0, 3 });
+    T btd(RAD_I32, { 1, 1 }); btd.n({ 0 });
+    T bt(RAD_I32, { 1, 8 }); bt.n({ 10, 11, 12, 13, 14, 15, 16, 17 });
+    T iq(RAD_F32, { 1, n }); iq.f({ 1, 0 });
+    T po(RAD_I32, { 1 }); po.n({ 29 });      /* window 8: keys 22..29, pages 5..7; block 0 closed */
+    T cu(RAD_I32, { 2 }); cu.n({ 0, 1 });
+    T se(RAD_I32, { 1, 9 }), ns(RAD_I32, { 1 }), su(RAD_I32, { 1 });
+    A a; a.t(iq).t(desc).t(btd).t(bt).t(po).t(cu).t(se).t(ns).t(su).i("M", 1).i("n", n)
+          .i("ratio", ratio).i("block", block).i("buckets", buckets).i("cap", cap).i("window", 8)
+          .i("sink", 4).i("top_p", 2).i("top_k", 4).i("width", 8).i("blocks", 8).i("cblocks", 1)
+          .i("seqs", 1).s("dtype", "f32");
+    CHECK_OK(run("lsa_select", a));
+    /* sink page 0, bucket 0's page 1 (budget one page: page 2 cut), window pages 5, 6, 7 */
+    const int64_t want[] = { 10, 11, 15, 16, 17, -1 };
+    for (int i = 0; i < 6; ++i) CHECK_EQ(se.iat(i), want[i]);
+    CHECK_EQ(ns.iat(0), (int64_t)5);
+    CHECK_EQ(su.iat(0), (int64_t)(4 * 4 + 29 % 4 + 1));
+}
+
+/* lsa_key_store writes nothing for a row whose page id is negative, and lsa_cluster refuses a cap
+ * that leaves a block short of its bucket count. */
+TEST(lsa_key_store_skips_absent_pages_and_cluster_refuses_a_short_cap) {
+    T ik(RAD_F32, { 2, 2 }); ik.f({ 1, 2, 3, 4 });
+    T po(RAD_I32, { 2 }); po.n({ 0, 4 });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, 2 });
+    T bt(RAD_I32, { 1, 2 }); bt.n({ 1, -1 });
+    T kv(RAD_F32, { 2, 1, 4, 2 }); kv.f(std::vector<float>(16, 9.0f));
+    A a; a.t(ik).t(po).t(cu).t(bt).t(kv).i("M", 2).i("n", 2).i("block_size", 4).i("seqs", 1)
+          .s("dtype", "f32");
+    CHECK_OK(run("lsa_key_store", a));
+    CHECK_EQ(kv.at(8), 1.0f);
+    CHECK_EQ(kv.at(9), 2.0f);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(kv.at(i), 9.0f);   /* page 0 is no row's */
+    for (int i = 10; i < 16; ++i) CHECK_EQ(kv.at(i), 9.0f); /* row 1's page is absent */
+
+    /* 4 pools of 4 keys to 1 bucket under a cap of 8: two merges, then none allowed */
+    T key(RAD_F32, { 4, 1, 4, 2 });
+    std::vector<float> kvals(32);
+    for (int i = 0; i < 32; ++i) kvals[(size_t)i] = (float)((i * 7) % 5) - 2.0f;
+    key.f(kvals);
+    T po2(RAD_I32, { 1 }); po2.n({ 15 });
+    T cu2(RAD_I32, { 2 }); cu2.n({ 0, 1 });
+    T btk(RAD_I32, { 1, 4 }); btk.n({ 0, 1, 2, 3 });
+    T btd(RAD_I32, { 1, 1 }); btd.n({ 0 });
+    T desc(RAD_F32, { 1, 1, 1 * (2 + 2) });
+    A c; c.t(po2).t(cu2).t(key).t(btk).t(btd).t(desc).i("M", 1).i("n", 2).i("ratio", 4)
+          .i("block", 16).i("buckets", 1).i("cap", 8).i("seqs", 1).i("work", 1).s("dtype", "f32");
+    CHECK_EQ(run("lsa_cluster", c), RAD_E_INVAL);
+}
+
 /* ================================================================== the QSA indexer and dflash_conv
  * docs/OPS.md "Sparse attention (QSA)" and "Draft heads". */
 
@@ -9730,6 +9950,17 @@ std::vector<Geo> geometries() {
                                  .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                                     .s("dtype", "bf16")),
+        G("lsa_index", "M", 3, a.i("M", R).i("n", 8).i("heads", 4).i("kv_heads", 2)
+                                  .i("head_dim", 8).i("rot", 2).s("dtype", "f32")),
+        G("lsa_key_store", "M", 4, a.i("M", R).i("n", 8).i("block_size", 4).i("seqs", 2)
+                                      .s("dtype", "f32")),
+        G("lsa_cluster", "M", 4, a.i("M", R).i("n", 8).i("ratio", 4).i("block", 16)
+                                    .i("buckets", 2).i("cap", 16).i("seqs", 2).i("work", 2)
+                                    .s("dtype", "f32")),
+        G("lsa_select", "M", 4, a.i("M", R).i("n", 8).i("ratio", 4).i("block", 16)
+                                   .i("buckets", 2).i("cap", 16).i("window", 8).i("sink", 4)
+                                   .i("top_p", 2).i("top_k", 8).i("width", 8).i("blocks", 12)
+                                   .i("cblocks", 3).i("seqs", 2).s("dtype", "f32")),
         G("qsa_work", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                               .i("work", 8).s("dtype", "bf16")),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)

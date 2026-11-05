@@ -50,6 +50,7 @@ set(AVX_KERNEL_SRC
   avx_pixtral.cpp
   avx_sam_attn.cpp
   avx_qsa.cpp
+  avx_lsa.cpp
   avx_moe.cpp
   avx_gdn.cpp
   avx_sample.cpp
@@ -78,6 +79,9 @@ set(AVX_FLAGS_3 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx2 -mfma -mf16c)
 
 find_package(OpenMP QUIET)
 
+# LSA's indexer is held to libref byte for byte (its Ward merges and tables are discrete), so it does
+# not contract; a source's options come after its target's, so this wins over -ffp-contract=fast.
+set_source_files_properties(avx_lsa.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 foreach(lvl RANGE 0 3)
   add_library(avx_lvl${lvl} OBJECT ${AVX_KERNEL_SRC})
   target_compile_definitions(avx_lvl${lvl} PRIVATE AVX_LEVEL=${lvl})

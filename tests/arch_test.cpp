@@ -7937,6 +7937,124 @@ TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
 }
 
+/* LSA (docs/LSA.md, arch/common/rad_lsa.h) on the dense fp8 model: a container that says
+ * `lsa.enable` gets the four ops on every full layer, the index-key and descriptor groups, and an
+ * attention paged at the pool size whose sparse path reads LSA's table. */
+MetaKV q35fp8_lsa_meta() {
+    MetaKV k = q35fp8_meta();
+    k.set("lsa.enable", "1");
+    return k;
+}
+
+TEST(qwen35_fp8_lsa_declares_its_ops_and_groups_on_every_full_layer) {
+    MetaKV mk = q35fp8_lsa_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    int index = 0, store = 0, cluster = 0, select = 0;
+    for (const RecOp& o : b.ops) {
+        index   += o.op == "lsa_index";
+        store   += o.op == "lsa_key_store";
+        cluster += o.op == "lsa_cluster";
+        select  += o.op == "lsa_select";
+    }
+    CHECK_EQ(index, 2);       /* two full-attention layers in the fixture */
+    CHECK_EQ(store, 2);
+    CHECK_EQ(cluster, 2);
+    CHECK_EQ(select, 2);
+    bool key = false, desc = false;
+    for (const RecKV& g : b.kv_groups) {
+        key  |= g.name.find("kv_lsa_key") != std::string::npos;
+        desc |= g.name.find("kv_lsa_desc") != std::string::npos;
+    }
+    CHECK(key && desc);
+    /* the maps come from the container under the layer's name */
+    bool qmap = false;
+    for (const RecMap& m : b.maps)
+        for (const std::string& src : m.src) qmap |= src.find("self_attn.lsa.q_map.weight") != std::string::npos;
+    CHECK(qmap);
+}
+
+TEST(qwen35_fp8_without_lsa_declares_none_of_it) {
+    MetaKV mk = q35fp8_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK(find_op(b, "lsa_select") == nullptr);
+    CHECK(find_op(b, "lsa_index") == nullptr);
+}
+
+/* At decode every layer indexes, stores, clusters and selects after its prologue and before its
+ * attention, which reads LSA's table in place of the sequence's. */
+TEST(qwen35_fp8_lsa_selects_between_the_prologue_and_a_sparse_decode) {
+    MetaKV mk = q35fp8_lsa_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto dec = kit(b, { 1, 1 }, {}, 6000);
+    const auto v = run_passes(b, qwen35_fp8::step, { dec.get() });
+    CHECK(steps_ok(v));
+    CHECK_LINT(b, v[0].get());
+    std::vector<std::string> order;
+    int sparse = 0, attn = 0;
+    rad_buf sel = 0;
+    for (const auto& i : v[0]->issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op.rfind("lsa_", 0) == 0 || o->op == "attn_paged" || o->op == "attn_paged_gate_quant" ||
+            o->op == "kv_store" || o->op == "qk_norm_rope_gate_kv")
+            order.push_back(o->op);
+        if (o->op == "lsa_select") sel = i.opd[6].handle;
+        if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+            ++attn;
+            if (i.opd[2].handle == sel) ++sparse;
+        }
+    }
+    CHECK_EQ(attn, 2);
+    CHECK_EQ(sparse, 2);      /* a decode step is always sparse */
+    /* per layer: the four LSA ops in order, then the attention */
+    std::vector<std::string> lsa;
+    for (const std::string& op : order)
+        if (op.rfind("lsa_", 0) == 0 || op.rfind("attn_paged", 0) == 0) lsa.push_back(op);
+    const std::vector<std::string> want = { "lsa_index", "lsa_key_store", "lsa_cluster", "lsa_select" };
+    REQUIRE_EQ(lsa.size(), (size_t)10);
+    for (size_t l = 0; l < 2; ++l) {
+        for (size_t j = 0; j < 4; ++j) CHECK_EQ(lsa[l * 5 + j], want[j]);
+        CHECK(lsa[l * 5 + 4].rfind("attn_paged", 0) == 0);
+    }
+}
+
+/* Below LSA's exactness bound a prefill takes the dense attention - the selection still runs,
+ * since its keys and descriptors must be written - and above it the sparse one. */
+TEST(qwen35_fp8_lsa_prefill_is_dense_below_the_bound_and_sparse_above) {
+    MetaKV mk = q35fp8_lsa_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    auto count = [&](int64_t history, int* selects, int* sparse) {
+        const auto pre = kit(b, {}, { 6 }, history);
+        const auto v = run_passes(b, qwen35_fp8::step, { pre.get() });
+        CHECK(steps_ok(v));
+        CHECK_LINT(b, v[0].get());
+        rad_buf sel = 0;
+        *selects = *sparse = 0;
+        for (const auto& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            if (o->op == "lsa_select") { ++*selects; sel = i.opd[6].handle; }
+            if ((o->op == "attn_paged" || o->op == "attn_paged_gate_quant") && i.opd[2].handle == sel)
+                ++*sparse;
+        }
+    };
+    int selects = 0, sparse = 0;
+    count(20, &selects, &sparse);
+    CHECK_EQ(selects, 2);
+    CHECK_EQ(sparse, 0);
+    count(9000, &selects, &sparse);
+    CHECK_EQ(selects, 2);
+    CHECK(sparse >= 2);
+}
+
 /* A mixed step's dense attention is issued once per band (AttnGatedFP8::step): the decode
  * sequences as a prefix at their own band, then the prefill chunks at the op's top band with
  * their per-sequence arrays past the decode sequences and q, out and cu at absolute rows. A pure

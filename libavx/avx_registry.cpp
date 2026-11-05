@@ -414,6 +414,28 @@ static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
+/* LSA's indexer, libref's schemas exactly (libref/ref_registry.cpp). */
+static const RadParamSpec pLsaIndex[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("kv_heads"),
+                                          P_INT("head_dim"), P_INT("rot"), P_STR("dtype") };
+static const RadOperandSpec oLsaIndex[] = { OPD("q"), OPD("k"), WGT("wq"), WGT("wk"), OUT("iq"),
+                                            OUT("ik") };
+static const RadParamSpec pLsaKeyStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"),
+                                             P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oLsaKeyStore[] = { OPD("ik"), OPD("pos"), OPD("cu"), OPD("bt"),
+                                               INOUT("kv") };
+static const RadParamSpec pLsaCluster[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("block"),
+                                            P_INT("buckets"), P_INT("cap"), P_INT("seqs"),
+                                            P_CAP("work"), P_INTO("block_size"), P_STR("dtype") };
+static const RadOperandSpec oLsaCluster[] = { OPD("pos"), OPD("cu"), OPD("key"), OPD("bt_key"),
+                                              OPD("bt_desc"), INOUT("desc") };
+static const RadParamSpec pLsaSelect[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("block"),
+                                           P_INT("buckets"), P_INT("cap"), P_INT("window"),
+                                           P_INT("sink"), P_INT("top_p"), P_INT("top_k"),
+                                           P_INT("width"), P_INT("blocks"), P_INT("cblocks"),
+                                           P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oLsaSelect[] = { OPD("iq"), OPD("desc"), OPD("bt_desc"), OPD("bt"),
+                                             OPD("pos"), OPD("cu"), OUT("sel"), OUT("nsel"),
+                                             OUT("seqused") };
 
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
@@ -1107,6 +1129,25 @@ static const RadOpSchema kSchemas[] = {
   "identity row, and into the ring slot only when the residency map says the block is resident. A "
   "negative slot is skipped; the mirror is the truth and a block absent from the ring is copied in "
   "whole by kv_resolve." },
+{ "lsa_index", ARR(pLsaIndex), ARR(oLsaIndex),
+  "LSA's index key and query of every row from the attention's own normed, rotated q and k: the "
+  "position-free lanes rot .. head_dim of each KV head side by side, the query heads of a group "
+  "summed in f32 and rounded to bf16, each times its map [n, kv_heads * (head_dim - rot)] as a "
+  "bf16 GEMM writes it, then L2-normalized in f32. iq is f32, ik the store's dtype." },
+{ "lsa_key_store", ARR(pLsaKeyStore), ARR(oLsaKeyStore),
+  "kv[bt[s][pos / block_size]][0][pos % block_size] = ik[m] for every row a sequence holds; a "
+  "negative page id writes nothing. A page holds block_size index keys of n values." },
+{ "lsa_cluster", ARR(pLsaCluster), ARR(oLsaCluster),
+  "Every cluster block of `block` tokens the batch closes, at most `work`: its pools (the f32 sums "
+  "of each key page's `ratio` index keys) merged by spherical Ward to `buckets` buckets of at most "
+  "`cap` keys, ties to the lower index, and written to the block's descriptor page bt_desc[s][c] "
+  "as each bucket's normalized centroid, then its pools in ascending order, -1 past its size." },
+{ "lsa_select", ARR(pLsaSelect), ARR(oLsaSelect),
+  "One query's page table: the buckets of the blocks closed before its own scored by bf16(iq) . "
+  "centroid, the best top_p (ties to the lower bucket) expanded best first to their pool pages "
+  "between the sinks and the window until top_k / ratio are taken, joined by the sink and window "
+  "pages, ascending (the partial page last), as page ids of bt, then -1 to width + 1. nsel counts "
+  "the entries and seqused is (nsel - 1) * ratio + pos % ratio + 1." },
 { "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
   "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
   "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
@@ -1766,6 +1807,17 @@ SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
        L(qsa_tail_store)),
 SIMPLE("avx_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, L(qsa_work)),
+SIMPLE("avx_lsa_index", "lsa_index", "attn",
+       "LSA index keys and queries: position-free lanes through the map, L2-normalized", DT_FLOAT,
+       L(lsa_index)),
+SIMPLE("avx_lsa_key_store", "lsa_key_store", "attn",
+       "LSA index keys into their paged store", DT_FLOAT, L(lsa_key_store)),
+SIMPLE("avx_lsa_cluster", "lsa_cluster", "attn",
+       "LSA clustering: each closed block's pools merged by Ward into a descriptor page", DT_FLOAT,
+       L(lsa_cluster)),
+SIMPLE("avx_lsa_select", "lsa_select", "attn",
+       "LSA selection: buckets scored and expanded to an ascending page-id table",
+       "f32 queries, i32 tables", L(lsa_select)),
 
 SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        L(router_topk)),
