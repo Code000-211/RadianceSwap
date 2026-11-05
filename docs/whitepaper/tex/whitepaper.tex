@@ -1,621 +1,854 @@
-% RadianceSwap whitepaper. Build: make -C docs/whitepaper pdf
-\documentclass[11pt,a4paper]{article}
+% RadianceSwap technical report. Build: make -C docs/whitepaper pdf
+\documentclass[10pt,conference,a4paper]{IEEEtran}
+\IEEEoverridecommandlockouts
 
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
-\usepackage{mathpazo}
-\usepackage[scaled=0.92]{helvet}
-\renewcommand{\ttdefault}{lmtt}
 \usepackage{amsmath,amssymb}
 \usepackage{microtype}
-\usepackage[a4paper,margin=2.4cm,headheight=14pt]{geometry}
 \usepackage{graphicx}
 \usepackage{booktabs}
-\usepackage{tabularx}
+\usepackage{multirow}
 \usepackage{array}
 \usepackage{xcolor}
-\usepackage{enumitem}
-\usepackage{caption}
-\usepackage{float}
-\usepackage{titlesec}
-\usepackage{fancyhdr}
+\usepackage{cite}
 \usepackage{listings}
-\usepackage[most]{tcolorbox}
-\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usepackage{pgfplots}
 \usepackage[hidelinks]{hyperref}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
 
-% ---------------------------------------------------------------- colours
-\definecolor{accent}{HTML}{2A78D6}
-\definecolor{accent2}{HTML}{EB6834}
-\definecolor{ink2}{HTML}{52514E}
-\definecolor{rule}{HTML}{C9C8C2}
-\definecolor{panel}{HTML}{F3F2EE}
-\hypersetup{colorlinks=true,linkcolor=accent,urlcolor=accent,citecolor=accent}
+% ---------------------------------------------------------------- colours and styles
+\definecolor{cA}{HTML}{2A78D6}   % series 1
+\definecolor{cB}{HTML}{EB6834}   % series 2
+\definecolor{cC}{HTML}{1BAF7A}   % series 3
+\definecolor{ink}{HTML}{3A3936}
+\definecolor{soft}{HTML}{8A8983}
+\definecolor{panel}{HTML}{F2F1ED}
 
-% ---------------------------------------------------------------- layout
-\setlength{\parindent}{0pt}
-\setlength{\parskip}{0.55em}
-\setlist{itemsep=0.25em,topsep=0.3em,leftmargin=1.4em}
-\renewcommand{\arraystretch}{1.25}
-\newcolumntype{L}{>{\raggedright\arraybackslash}X}
-\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+\pgfplotsset{
+  paper/.style={
+    width=0.97\columnwidth, height=4.2cm,
+    tick label style={font=\scriptsize}, label style={font=\footnotesize},
+    legend style={font=\scriptsize, draw=none, fill=none},
+    axis line style={ink!70}, tick style={ink!70},
+    major grid style={ink!12}, ymajorgrids=false, xmajorgrids=true,
+    every node near coord/.append style={font=\scriptsize, text=ink},
+  },
+}
+\tikzset{
+  box/.style={draw=ink!70, fill=white, rounded corners=2pt, align=center, font=\footnotesize, inner sep=3pt},
+  boxA/.style={box, draw=cA, fill=cA!8},
+  boxB/.style={box, draw=cB, fill=cB!8},
+  boxC/.style={box, draw=cC, fill=cC!8},
+  boxG/.style={box, fill=panel},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick, draw=ink},
+  darr/.style={arr, dashed},
+  lab/.style={font=\scriptsize, text=ink, fill=white, inner sep=1pt},
+}
 
-\titleformat{\section}{\sffamily\Large\bfseries\color{black}}{\color{accent}\thesection}{0.8em}{}
-\titleformat{\subsection}{\sffamily\large\bfseries}{\color{accent}\thesubsection}{0.8em}{}
-\titlespacing*{\section}{0pt}{1.6em}{0.6em}
-\titlespacing*{\subsection}{0pt}{1.2em}{0.4em}
+\lstset{basicstyle=\ttfamily\scriptsize, columns=fullflexible, keepspaces=true, breaklines=true,
+  frame=lines, rulecolor=\color{ink!40}, showstringspaces=false, upquote=true, aboveskip=4pt, belowskip=4pt}
 
-\captionsetup{font={small,sf},labelfont={bf,color=accent},labelsep=period,justification=raggedright,singlelinecheck=false}
-
-\pagestyle{fancy}
-\fancyhf{}
-\fancyhead[L]{\sffamily\small\color{ink2}RadianceSwap Whitepaper}
-\fancyhead[R]{\sffamily\small\color{ink2}\nouppercase{\leftmark}}
-\fancyfoot[C]{\sffamily\small\color{ink2}\thepage}
-\renewcommand{\headrulewidth}{0.4pt}
-\renewcommand{\headrule}{{\color{rule}\hrule width\headwidth height\headrulewidth}}
-\renewcommand{\sectionmark}[1]{\markboth{#1}{}}
-
-\lstdefinestyle{code}{
-  basicstyle=\ttfamily\small,
-  backgroundcolor=\color{panel},
-  frame=single, rulecolor=\color{rule}, framesep=6pt,
-  xleftmargin=6pt, xrightmargin=6pt,
-  columns=fullflexible, keepspaces=true, breaklines=true,
-  showstringspaces=false, upquote=true,
-  aboveskip=0.8em, belowskip=0.6em}
-\lstset{style=code}
-
-\newtcolorbox{keybox}[1][]{enhanced,colback=accent!6,colframe=accent,boxrule=0.6pt,
-  arc=3pt,left=8pt,right=8pt,top=6pt,bottom=6pt,fonttitle=\sffamily\bfseries,#1}
-\newtcolorbox{warnbox}[1][]{enhanced,colback=accent2!7,colframe=accent2,boxrule=0.6pt,
-  arc=3pt,left=8pt,right=8pt,top=6pt,bottom=6pt,fonttitle=\sffamily\bfseries,#1}
-
-\newcommand{\code}[1]{\texttt{\small #1}}
-\newcommand{\fig}[3]{% file, width, caption
-  \begin{figure}[!htbp]\centering
-  \includegraphics[width=#2]{fig/#1}
-  \caption{#3}\label{fig:#1}
-  \end{figure}}
-\newcommand{\src}[1]{\href{https://github.com/Code000-211/RadianceSwap/blob/main/#1}{\code{#1}}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\GiB}{\,GiB}
+\newcommand{\MiB}{\,MiB}
 
 \begin{document}
 
-% ================================================================ title page
-\begin{titlepage}
-\thispagestyle{empty}
-\vspace*{3.2cm}
-{\sffamily\color{accent}\bfseries\large WHITEPAPER\par}
-\vspace{0.6em}
-{\sffamily\bfseries\fontsize{38}{42}\selectfont RadianceSwap\par}
-\vspace{0.8em}
-{\sffamily\Large\color{ink2} Several large language models behind one endpoint,\\
-on the same GPUs, without restarting the process.\par}
-\vspace{2.2em}
-{\color{accent}\rule{\linewidth}{1.2pt}}
-\vspace{1.2em}
+\title{RadianceSwap: In-Process Multi-Model\\ LLM Serving with Dynamic VRAM Sharing}
 
-\begin{tabularx}{\linewidth}{@{}P{3.4cm}L@{}}
-\sffamily\color{ink2} Version  & November 2026, code at \code{86d4503} \\
-\sffamily\color{ink2} Project  & \url{https://github.com/Code000-211/RadianceSwap} \\
-\sffamily\color{ink2} Based on & Radiance (\url{https://codeberg.org/StillDeadcode/radiance}), Apache-2.0 \\
-\sffamily\color{ink2} Test rig & 2$\times$ AMD Radeon AI PRO R9700 (gfx1201, 31.86\,GiB each), TP\,=\,2, 48 vCPU, 170\,GiB RAM \\
-\end{tabularx}
+\author{\IEEEauthorblockN{The RadianceSwap Contributors}
+\IEEEauthorblockA{\url{https://github.com/Code000-211/RadianceSwap}\\
+Technical report, November 2026 (code at \code{86d4503})}}
 
-\vfill
-\begin{warnbox}[title=Status: experimental]
-Tested on exactly one system, with one MoE model (Qwen3.8-Flash-Next) and small dense models.
-Meant for testing and feedback, not for production. Every number in this paper comes from
-\src{docs/swap/gpu-acceptance.md} and \src{docs/GUIDE.md} \S4.12; nothing was re-measured for it.
-\end{warnbox}
-\end{titlepage}
+\maketitle
 
-\tableofcontents
-\clearpage
+% ================================================================ abstract
+\begin{abstract}
+Serving several large language models from one GPU group usually means running one inference
+process per model and restarting processes as demand shifts. Each restart re-parses the
+checkpoint, re-lays out the weights and rebuilds tokenizer and execution state, and a request for
+one model can wait for another model's longest generation. We present RadianceSwap, an extension of
+the Radiance inference engine that serves several models from a single process behind one
+OpenAI-compatible endpoint. Models are activated by their first request, deactivated when idle, and
+kept in host RAM in GPU-ready form, so that re-activation needs no parsing, relayout or disk read.
+Several models can be active at once: each runs as an independent runtime, a ticket-based
+sequencer gives all tensor-parallel collectives one group-wide order, and a group planner moves
+expert, KV-cache and static-weight memory between models at run time. On two AMD Radeon AI PRO
+R9700 GPUs (TP\,=\,2), RadianceSwap adds no measurable overhead for a single model
+($-0.3\,\%$ to $+0.1\,\%$), re-activates a dense 0.8B model in 2.1\,s, keeps outputs bit-identical
+to single-model serving, and lets an idle MoE model hand $\sim$3\GiB\ per card to a busy one within
+30\,s. The approach is experimental and was evaluated on one system.
+\end{abstract}
 
-% ================================================================ 1
-\section{Summary}
+\begin{IEEEkeywords}
+LLM serving, multi-model inference, GPU memory management, mixture of experts, tensor parallelism
+\end{IEEEkeywords}
 
-\begin{keybox}[title=In one paragraph]
-RadianceSwap is an experimental branch of the inference engine Radiance. With \code{--manifest},
-\textbf{one process serves several models} through \textbf{one} OpenAI-compatible endpoint. A model is
-activated by its first request, deactivated when idle, and then stays GPU-ready in host RAM. Several
-models can be active at the same time and move VRAM between each other while they run.
-\end{keybox}
+% ================================================================ 1 intro
+\section{Introduction}
 
+Operators of on-premise inference servers increasingly want to offer several models at once: a
+large mixture-of-experts (MoE) model for quality, a small dense model for latency, an embedding or
+image model beside them. GPU memory, however, rarely holds all of them. The common practice is to
+run one inference server per model behind a proxy that starts and stops server processes on demand,
+as in llama-swap~\cite{llamaswap}. Two costs follow from that design. First, every switch pays the
+full start-up path: checkpoint parsing, weight relayout and the construction of tokenizer, chat
+template and execution plans; for a 113.6\GiB\ MoE container this exceeds a minute. Second, when
+only one model fits at a time, a request for model B waits for model A's longest running
+generation, which is unbounded, unless running generations are aborted.
+
+RadianceSwap removes both costs inside the Radiance engine~\cite{radiance}. A single process owns
+the HTTP listener and the GPU group; models come and go as \emph{runtimes} within it. The design
+rests on three decisions, recorded as architecture decision records (ADRs) in the repository:
+switching happens in process (ADR~0001); several models may be active at the same time and share
+VRAM (ADR~0002); and active models run as separate, truly parallel runtimes whose collectives
+follow one group-wide order (ADR~0003).
+
+This report makes the following contributions:
 \begin{itemize}
-  \item \textbf{Guarantees.} A running generation is \textbf{never cut}. Output is
-        \textbf{bit-identical} to single-model mode with \code{--model} (checked: greedy, seeded
-        sampling, streaming, MTP, abort).
-  \item \textbf{Cost.} With no second model there is no measurable overhead ($-0.3\,\%$ to
-        $+0.1\,\%$). Switching between two models that are already active costs 0\,ms. Two models
-        busy at the same time each get about \textbf{half} the decode throughput.
-  \item \textbf{Versus llama-swap.} llama-swap is a \textbf{proxy that starts and stops server
-        processes}. RadianceSwap works \textbf{inside the engine} and shares VRAM dynamically, but
-        only works with Radiance (Section~\ref{sec:llamaswap}).
+  \item A \textbf{model lifecycle} with a host-resident, GPU-ready \emph{prepared store} that turns
+        re-activation into an upload without parsing, relayout or disk I/O, together with a
+        host-memory budget that refuses an activation before allocation instead of triggering the
+        kernel's OOM killer (\S\ref{sec:lifecycle}, \S\ref{sec:host}).
+  \item \textbf{Run-time VRAM sharing} between active models: a heat-driven group planner for
+        expert memory, an elastic expert slab that returns memory physically, cross-model KV-cache
+        lending, and streaming of static weights from host RAM when a model does not fit
+        (\S\ref{sec:vram}).
+  \item A \textbf{collective sequencer} that prevents cross-model deadlock of spinning all-reduce
+        kernels on a tensor-parallel group (\S\ref{sec:collectives}).
+  \item An \textbf{evaluation} on two AMD GPUs covering overhead, activation latency, time to first
+        token, concurrency, memory movement, and four defects found during acceptance
+        (\S\ref{sec:eval}), and a comparison with process-swapping proxies (\S\ref{sec:related}).
 \end{itemize}
 
-% ================================================================ 2
-\section{The problem}
+Without the \code{-{}-manifest} option, Radiance behaves exactly as before; everything described
+here applies only to manifest mode.
 
-A plain Radiance process serves \textbf{exactly one model}. Serving several large models on the same
-GPUs left only awkward options:
+% ================================================================ 2 background
+\section{Background}
 
-\begin{itemize}
-  \item \textbf{Stop and restart the process.} Every restart parses the checkpoint again and rebuilds
-        layout, tokenizer and tapes. For a 113\,GiB MoE that takes more than a minute, and the
-        endpoint is gone meanwhile.
-  \item \textbf{Wait until model A is done.} Under mixed load, a request for model B waits for A's
-        longest running generation. The wait is \textbf{unbounded}.
-  \item \textbf{Abort running generations.} Not acceptable.
-\end{itemize}
+\paragraph{Radiance} Radiance is a C++ inference engine with architecture and kernel plugins and a
+ROCm/HIP device layer~\cite{radiance}. It loads \code{.rad} containers or Hugging Face checkpoints,
+converts them into the kernels' packed layouts, and serves an OpenAI-compatible API. Its placement
+layer already supports tiered expert residency: a planner fills a fixed number of VRAM expert slots,
+and a mover promotes and demotes experts by observed routing \emph{heat}, serving the rest from a
+pinned host pool.
 
-\textbf{Goal:} a request for model B runs \textbf{right away}, even while A is busy, and nothing of A
-is cut.
+\paragraph{Tensor parallelism} With tensor parallelism (TP)~\cite{megatron}, each layer's weights
+are sharded across the ranks of a GPU group, and partial results are combined by an all-reduce after
+attention and MLP blocks. Radiance's all-reduce kernels busy-wait on a flag written by the peer
+rank. Two independent models issuing such collectives concurrently can therefore deadlock if the
+ranks disagree on the order.
 
-% ================================================================ 3
-\section{The idea in one picture}
+\paragraph{Mixture of experts} MoE layers~\cite{shazeer2017,fedus2022} route each token to a small
+subset of experts. Expert popularity is skewed and changes with the workload, which makes experts
+the natural unit for moving memory between models: a cold expert can be served from host memory at
+low cost, as exploited by offloading systems~\cite{eliseev2023,flexgen,dsinference}.
 
-\fig{architecture.pdf}{0.86\linewidth}{Architecture. One process owns the listener and the GPU
-coordination; each active model is a runtime inside it.}
+% ================================================================ 3 design
+\section{Design}\label{sec:design}
 
-Three building blocks carry the design:
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[node distance=6mm]
+  % clients
+  \node[boxG, minimum width=22mm] (c1) at (0, 1.1) {client\\[-2pt]\code{model: big}};
+  \node[boxG, minimum width=22mm] (c2) at (0, 0)   {client\\[-2pt]\code{model: small}};
+  \node[boxG, minimum width=22mm] (c3) at (0,-1.1) {client\\[-2pt]no \code{model}};
+  % router
+  \node[boxC, minimum width=30mm, minimum height=16mm] (router) at (3.9,0)
+     {\textbf{ModelRouter}\\[-1pt]route by \code{model}\\[-1pt]before tokenization};
+  \node[boxG, minimum width=30mm] (reg) at (3.9,-1.75) {ModelRegistry\\[-2pt]\scriptsize manifest, states};
+  % queues
+  \node[box, minimum width=17mm] (qa) at (7.3, 1.0) {queue \code{big}};
+  \node[box, minimum width=17mm] (qb) at (7.3,-1.0) {queue \code{small}};
+  % runtimes
+  \node[boxA, minimum width=36mm, minimum height=15mm] (ra) at (11.0, 1.0)
+     {\textbf{runtime \code{big}} (MoE)\\[-1pt]\scriptsize scheduler, streams, KV partition,\\[-3pt]\scriptsize expert slab, frontend};
+  \node[boxB, minimum width=36mm, minimum height=15mm] (rb) at (11.0,-1.0)
+     {\textbf{runtime \code{small}} (dense)\\[-1pt]\scriptsize scheduler, streams, KV partition,\\[-3pt]\scriptsize statics, frontend};
+  % services
+  \node[boxG, minimum width=30mm] (gp) at (11.0, 2.75) {GroupPlanner\\[-2pt]\scriptsize expert budget by heat};
+  \node[boxG, minimum width=30mm] (cs) at (15.0, 0) {Collective-\\[-2pt]Sequencer\\[-2pt]\scriptsize tickets};
+  \node[boxG, minimum width=30mm] (st) at (7.3,-2.75) {PreparedWeightStore\\[-2pt]\scriptsize GPU-ready weights in RAM};
+  \node[boxG, minimum width=30mm] (hb) at (11.0,-2.75) {host budget\\[-2pt]\scriptsize LRU, admission};
+  % gpu group
+  \node[box, draw=ink, minimum width=20mm, minimum height=10mm] (g0) at (18.6, 0.75) {GPU 0\\[-2pt]\scriptsize rank 0};
+  \node[box, draw=ink, minimum width=20mm, minimum height=10mm] (g1) at (18.6,-0.75) {GPU 1\\[-2pt]\scriptsize rank 1};
+  \begin{scope}[on background layer]
+    \node[draw=ink!50, dashed, rounded corners=4pt, fit=(router)(reg)(gp)(cs)(st)(hb)(ra)(rb), inner sep=7pt,
+          label={[font=\footnotesize\itshape, text=ink]above left:one \code{radiance -{}-manifest} process}] (proc) {};
+    \node[draw=ink!50, rounded corners=4pt, fit=(g0)(g1), inner sep=5pt,
+          label={[font=\footnotesize\itshape, text=ink]above:GPU group, TP\,=\,2}] (grp) {};
+  \end{scope}
+  % edges
+  \foreach \c in {c1,c2,c3} \draw[arr] (\c.east) -- (router.west);
+  \draw[arr] (router) -- (reg);
+  \draw[arr] (router.east) -- (qa.west);
+  \draw[arr] (router.east) -- (qb.west);
+  \draw[arr] (qa) -- (ra);
+  \draw[arr] (qb) -- (rb);
+  \draw[darr] (st.north) -- node[lab, right=1pt]{warm activation} (qb.south);
+  \draw[darr] (gp) -- (ra);
+  \draw[darr] (gp.east) to[bend left=35] (rb.east);
+  \draw[arr] (ra.east) -- (cs);
+  \draw[arr] (rb.east) -- (cs);
+  \draw[arr] (cs.east) -- (g0.west);
+  \draw[arr] (cs.east) -- (g1.west);
+  \draw[darr] (hb) -- (st);
+\end{tikzpicture}}
+\caption{Architecture of RadianceSwap. One process owns the listener and the GPU group. The router
+resolves the model before any tokenizer is touched; each active model is an independent runtime.
+Shared services decide expert budgets (GroupPlanner), order collectives (CollectiveSequencer) and
+hold deactivated models in GPU-ready form (PreparedWeightStore) under a host-memory budget.}
+\label{fig:arch}
+\end{figure*}
 
-\begin{enumerate}
-  \item \textbf{One process instead of many} (ADR 0001). The HTTP listener, the plugin registry and
-        the GPU coordination belong to the process. Models come and go as \textbf{runtimes} inside it.
-  \item \textbf{Several active models at once} (ADR 0002). They share VRAM. What does not fit is
-        streamed from host RAM.
-  \item \textbf{Real parallelism} (ADR 0003). Each runtime has its own streams and threads. Only the
-        cross-GPU communication (all-reduce) runs in one shared order.
-\end{enumerate}
+Fig.~\ref{fig:arch} shows the components. A JSON \emph{manifest} names the GPU group, cache
+policies and the models with their per-model engine options; it replaces \code{-{}-model}. Unknown
+keys are rejected, so a typo cannot become a silent default.
 
-Without \code{--manifest}, Radiance behaves \textbf{exactly as before}.
+\subsection{Process model and routing}
 
-% ================================================================ 4
-\section{Terms}
+HTTP listener, plugin and tool registries and the coordination of the GPU group belong to the
+process; a model runtime cannot close them (ADR~0001). The \emph{ModelRouter} reads a request's
+\code{model} field \emph{before} tokenization, so every request uses the tokenizer, chat template,
+grammar and context limit of its own model. A request without \code{model} goes to the default
+model; an unknown id yields HTTP~404. Requests for a model that is not active join that model's
+bounded queue (64 by default, HTTP~429 beyond). All concurrent first requests share a single
+activation, which runs on its own thread so that no HTTP thread builds an engine. Image and audio
+requests are routed the same way; video jobs and WebSocket sessions are refused with HTTP~501 in
+manifest mode, and LoRA adapters are rejected at start-up because an adapter belongs to one base
+model.
 
-\begin{table}[H]\small
-\begin{tabularx}{\linewidth}{@{}P{3.9cm}L@{}}
-\toprule
-\textbf{Term} & \textbf{Meaning} \\
-\midrule
-Model & One base artifact (\code{.rad} container or HF checkpoint). The unit that gets activated. \\
-GPU group & The GPUs that compute together with tensor parallelism (TP). All models in a manifest share it. \\
-Active model & Has a runtime on the GPU group and serves requests. Several at once are possible. \\
-Prepared model & Not active; weights sit \textbf{GPU-ready} in host RAM. \\
-Cold model & No copy in RAM. Activation reads from disk. \\
-Activation / deactivation & A model gains or loses its runtime, without a process restart. \\
-Group heat & How often each model's experts are routed. Scarce expert VRAM is split by it. \\
-KV lending & One model's KV cache partition grows into VRAM another model gave back. \\
-RAM streaming & Weights that do not fit in VRAM are read over PCIe during inference. \\
-\bottomrule
-\end{tabularx}
-\end{table}
+\subsection{Model lifecycle}\label{sec:lifecycle}
 
-% ================================================================ 5
-\section{The path of a request}
-
-\fig{request-path.pdf}{\linewidth}{A request for model \code{b}. If \code{b} is active it is
-forwarded at once; otherwise it waits on a single activation shared by all concurrent requests.}
-
-\begin{itemize}
-  \item \textbf{Routing before tokenization.} Every request uses the tokenizer, chat template, grammar
-        and limits of \textbf{its own} model. Mix-ups cannot happen.
-  \item \textbf{No \code{model} field} goes to the default model. An \textbf{unknown id} is a 404
-        \code{model\_not\_found}, listing the ids served.
-  \item \textbf{Image and audio requests} are routed by \code{model} too. In manifest mode only
-        \code{/v1/videos} and the WebSocket sessions (\code{/v1/realtime},
-        \code{/v1/audio/speech/stream}) are refused with a 501.
-  \item \textbf{TTFT is split.} Every response and \code{/metrics} show separately how long a request
-        waited for activation, for the scheduler and for prefill.
-\end{itemize}
-
-\begin{table}[H]\small
-\caption{What a client sees when its model is not ready.}
-\begin{tabularx}{\linewidth}{@{}P{1.1cm}P{5.0cm}L@{}}
-\toprule
-\textbf{Status} & \textbf{Code} & \textbf{When} \\
-\midrule
-404 & \code{model\_not\_found} & the id is not in the manifest \\
-429 & \code{model\_queue\_full} & too many requests already wait for this model (64 by default) \\
-503 & \code{model\_activation\_failed} & activation failed; the message names the cause \\
-503 & \code{model\_activation\_backoff} & failed recently; \code{Retry-After} says when to try again \\
-503 & \code{model\_activation\_timeout} & not active within 10 minutes \\
-503 & \code{gpu\_group\_unhealthy} & device error; the process needs a restart \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-% ================================================================ 6
-\section{Lifecycle of a model}
-
-\begin{figure}[H]\centering
-\begin{tikzpicture}[
-  st/.style={draw=#1,fill=#1!10,rounded corners=4pt,minimum width=2.5cm,minimum height=0.85cm,font=\sffamily\small},
-  st/.default=ink2,
-  lab/.style={font=\sffamily\scriptsize,text=ink2,fill=white,inner sep=1.5pt},
-  ar/.style={-{Stealth[length=2.4mm]},thick,draw=ink2}]
-  \node[st=ink2] (cold) at (0,0) {cold};
-  \node[st=accent] (act) at (5,0) {activating};
-  \node[st=accent] (active) at (10,0) {active};
-  \node[st=accent2] (fail) at (5,2.3) {failed};
-  \node[st=accent2!70!ink2] (deact) at (10,-2.6) {deactivating};
-  \node[st=ink2] (prep) at (5,-2.6) {prepared};
-  \fill[ink2] (-2.0,0) circle (3pt); \draw[ar] (-1.9,0) -- (cold);
-  \draw[ar] (cold) -- node[lab,above=2pt]{first request} (act);
-  \draw[ar] (act) -- node[lab,above=2pt]{all ranks ready} (active);
-  \draw[ar] (act.north west) to[bend left=25] node[lab,left=2pt,align=right]{OOM, no RAM,\\ rank error} (fail.south west);
-  \draw[ar] (fail.south east) to[bend left=25] node[lab,right=2pt,align=left]{next request\\ after backoff} (act.north east);
-  \draw[ar] (active) -- node[lab,right=3pt,align=left]{idle timeout or\\ VRAM pressure} (deact);
-  \draw[ar] (deact) -- node[lab,above=2pt]{weights stay in RAM} (prep);
-  \draw[ar] (prep) -- node[lab,right=3pt,align=left]{first request\\ (warm, from RAM)} (act);
-  \draw[ar] (prep.west) -| node[lab,pos=0.25,below=2pt]{RAM budget full (LRU)} (cold.south);
-\end{tikzpicture}
-\caption{States of one model as \code{/radiance/models} reports them.}\label{fig:lifecycle}
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[st/.style={box, minimum width=20mm, minimum height=7mm}]
+  \node[st, fill=panel] (cold) at (0,0) {\code{cold}};
+  \node[st, draw=cA, fill=cA!8] (act) at (4,0) {\code{activating}};
+  \node[st, draw=cA, fill=cA!8] (active) at (8,0) {\code{active}};
+  \node[st, draw=cB, fill=cB!8] (fail) at (4,1.9) {\code{failed}};
+  \node[st, draw=cB!70!ink, fill=cB!5] (deact) at (8,-2.1) {\code{deactivating}};
+  \node[st, fill=panel] (prep) at (4,-2.1) {\code{prepared}};
+  \fill[ink] (-1.5,0) circle (2.2pt); \draw[arr] (-1.4,0) -- (cold);
+  \draw[arr] (cold) -- node[lab, above=1pt]{first request} (act);
+  \draw[arr] (act) -- node[lab, above=1pt]{all ranks ready} (active);
+  \draw[arr] (act.north west) to[bend left=25] node[lab, left=1pt, align=right]{OOM, no RAM,\\rank error} (fail.south west);
+  \draw[arr] (fail.south east) to[bend left=25] node[lab, right=1pt, align=left]{after\\backoff} (act.north east);
+  \draw[arr] (active) -- node[lab, right=2pt, align=left]{idle timeout or\\VRAM pressure} (deact);
+  \draw[arr] (deact) -- node[lab, above=1pt]{weights kept} (prep);
+  \draw[arr] (prep) -- node[lab, right=2pt, align=left]{first request\\(warm)} (act);
+  \draw[arr] (prep.west) -| node[lab, pos=0.25, below=1pt]{host budget full (LRU)} (cold.south);
+\end{tikzpicture}}
+\caption{Lifecycle of one model, as reported by \code{/radiance/models}.}
+\label{fig:lifecycle}
 \end{figure}
 
-\begin{table}[H]\small
-\begin{tabularx}{\linewidth}{@{}P{2.4cm}L@{}}
-\toprule
-\textbf{State} & \textbf{What happens} \\
-\midrule
-\code{cold} & Nothing loaded. Activation reads from disk. \\
-\code{prepared} & VRAM freed, weights GPU-ready in RAM. The next activation skips parsing, relayout and disk reads. \\
-\code{activating} & Runs on its own thread. Other models keep serving. New requests wait on the \textbf{same} activation. \\
-\code{active} & Serving. \textbf{Running generations are never interrupted}; a deactivation waits for them. \\
-\code{deactivating} & Taken out of the route table, runtime being torn down. KV, prefix and recurrent state are gone afterwards; weights and expert heat stay. \\
-\code{failed} & \textbf{Every} partial allocation on \textbf{every} rank released; other models keep running. Backoff 1\,s, doubling up to 60\,s. \\
-\bottomrule
-\end{tabularx}
-\end{table}
+Each model moves through the states of Fig.~\ref{fig:lifecycle}. Only the default model is started
+with the process; every other model starts \code{cold}. A model is \code{active} only once all ranks
+are ready. Deactivation is triggered by an idle timeout or by VRAM pressure. A model is idle only if
+no request lies between routing and the end of its response, so a streaming response keeps it busy
+until its last chunk; \emph{a running generation is never interrupted}. Deactivation discards KV,
+prefix-cache and recurrent state but keeps weights, tokenizer, configuration and expert heat.
 
-\textbf{When a model is deactivated:}
-\begin{itemize}
-  \item \textbf{Idle timeout:} no request for \code{cache.idle\_timeout\_ms}. A streaming response
-        counts as load until its last chunk.
-  \item \textbf{VRAM pressure:} a new model finds the cards full. The model that has been \textbf{idle
-        the longest} is deactivated. A model that is generating is \textbf{never} chosen.
-  \item \textbf{Device errors} mark the whole GPU group \code{unhealthy} instead of retrying forever.
-\end{itemize}
+Under VRAM pressure, a model that finds the cards full causes the router to deactivate the active
+model that has been idle the longest; a model that is generating is never chosen, and one request
+triggers at most one such round per configured model. A failed activation (insufficient VRAM or
+host memory, a bad container, a rank error) releases every partial allocation on every rank and
+leaves other models untouched; retries back off exponentially from 1\,s to 60\,s. A device error
+instead marks the whole GPU group unhealthy, since retrying cannot help.
 
-% ================================================================ 7
-\section{Memory: where the weights live}
+\paragraph{Prepared weight store} The first activation of a model copies its weights, in the packed
+form the kernels read, into a process-owned \emph{PreparedWeightStore}. Weights are never
+dequantized or requantized. The store holds anonymous process memory rather than references to the
+container's page-cache mapping, because the kernel may reclaim page cache at any time; only the
+store makes ``the second activation reads no checkpoint bytes'' true. A re-activation from the store
+is an upload through a pinned staging ring.
 
-\fig{memory-tiers.pdf}{0.92\linewidth}{Memory tiers. A model's state decides which tier holds its weights.}
+\subsection{Memory hierarchy}
 
-\begin{itemize}
-  \item \textbf{The key number.} PCIe delivers $\approx 28$\,GB/s, VRAM 600--870\,GB/s. Anything read
-        over PCIe is 20 to 30 times slower.
-  \item \textbf{The prepared store} is why a warm activation is fast: the weights are already in the
-        form the kernels read. They are \textbf{never dequantized or requantized}.
-  \item \textbf{Page cache does not count.} The kernel can take it back at any time, so RadianceSwap
-        copies weights into its own anonymous memory on purpose.
-\end{itemize}
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[tier/.style={box, minimum height=8.5mm, text width=#1, align=left, inner xsep=5pt}]
+  \node[tier=62mm, draw=cA, fill=cA!8] (v) at (0,0) {\textbf{VRAM} (31.9\GiB\ per card)\\[-2pt]\scriptsize statics, KV cache, hot experts of active models};
+  \node[tier=56mm, draw=cC, fill=cC!8] (p) at (0,-1.15) {\textbf{pinned host pool}\\[-2pt]\scriptsize cold experts, streamed statics};
+  \node[tier=50mm, draw=cB, fill=cB!8] (s) at (0,-2.3) {\textbf{prepared store} (host RAM)\\[-2pt]\scriptsize deactivated models, GPU-ready};
+  \node[tier=44mm, fill=panel] (d) at (0,-3.45) {\textbf{disk / page cache}\\[-2pt]\scriptsize cold models, full load path};
+  \node[font=\scriptsize, text=ink, anchor=west] at (3.6,0) {600--870\,GB/s};
+  \node[font=\scriptsize, text=ink, anchor=west] at (3.6,-1.15) {$\approx$28\,GB/s (PCIe)};
+  \node[font=\scriptsize, text=ink, anchor=west] at (3.6,-2.3) {upload, 0.25\,s / 2.4\,GB};
+  \node[font=\scriptsize, text=ink, anchor=west] at (3.6,-3.45) {2.5--3.1\,GB/s};
+\end{tikzpicture}}
+\caption{Where a model's weights can live, with bandwidths measured on the test system.}
+\label{fig:tiers}
+\end{figure}
 
-% ================================================================ 8
-\section{Sharing VRAM between active models}
+Fig.~\ref{fig:tiers} summarizes the tiers. The ratio between VRAM and PCIe bandwidth, roughly
+20--30$\times$, governs every trade-off below: anything read over PCIe during decoding is expensive,
+so host-resident weights are a bridge, not a steady state.
 
-\fig{vram-card.pdf}{0.92\linewidth}{How two active models share one card (schematic).}
+\subsection{Sharing VRAM between active models}\label{sec:vram}
 
-Each model gets a \textbf{fixed share} of VRAM when it starts. Inside those shares, memory is moved
-at runtime. These mechanisms work together:
+Each model is assigned a fixed \emph{share} of the free VRAM of the group's tightest card, less
+headroom, divided by $\min(n, m)$ where $n$ is the number of models and $m$ is
+\code{max\_active\_models}. The share caps the model's static weights, KV cache and experts. Inside
+the shares, four mechanisms move memory at run time (Fig.~\ref{fig:vram}).
 
-\begin{table}[H]\small
-\begin{tabularx}{\linewidth}{@{}P{3.1cm}LP{4.1cm}@{}}
-\toprule
-\textbf{Mechanism} & \textbf{What it does} & \textbf{Result (measured)} \\
-\midrule
-GroupPlanner & Splits the expert slots of all MoE models by group heat $\times$ bytes. Every model keeps a minimum share. & Sum of grants $\le$ pool in 7,736 of 7,736 samples \\
-Elastic expert slab & Expert VRAM in $\sim$128\,MiB chunks. An idle model gives chunks back \textbf{physically}; a busy one maps them. & $\sim$3\,GiB per card moves to the loaded model within 20--30\,s \\
-Cross-model KV lending & The KV partition of a model with waiting prompts grows into slab bytes given back. Running sequences are never evicted. & +468--702\,MiB per card under load, back after 13--20\,s \\
-Static-weight streaming & A model whose static weights do not fit starts anyway and reads the rest over PCIe; the weights move back once VRAM frees up. & Activation succeeds with full VRAM; output identical \\
-Heat warm-up & A deactivated model's expert heat is saved; on re-activation the hottest experts go onto the card first. & Hit rate 83.45\,\% $\to$ \textbf{89.12\,\%} with a 12\,GiB budget \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\subsection{The elastic slab at work}
-\fig{elastic-slab.pdf}{0.92\linewidth}{Two Flash-Next entries on one GPU group. Source: \code{gpu-acceptance.md} \S9.}
-
-\subsection{What streaming costs}
-\fig{streaming.pdf}{0.92\linewidth}{Decode throughput while part of the static weights is read over
-PCIe. Source: \code{gpu-acceptance.md} \S10.}
-
-\begin{itemize}
-  \item \textbf{How to read this.} Streaming is a \textbf{bridge, not a steady state} (ADR 0002). It
-        lets a model answer \textbf{right away} instead of waiting; it only becomes fast once its
-        weights are back in VRAM.
-  \item \textbf{Prefill} streams only through a staging ring, never through direct zero-copy access.
-\end{itemize}
-
-% ================================================================ 9
-\section{Parallel runtimes and the collective order}
-
-With TP\,=\,2 the two GPUs exchange partial results after every layer (all-reduce). The kernels
-busy-wait on a flag from the other side. With two models running at once, GPU\,0 could wait on model A
-while GPU\,1 is already working on model B: a \textbf{deadlock}.
-
-\begin{figure}[H]\centering
-\begin{tikzpicture}[
-  a/.style={draw=accent,fill=accent!10,rounded corners=3pt,minimum width=2.6cm,minimum height=0.75cm,font=\sffamily\small},
-  b/.style={draw=accent2,fill=accent2!10,rounded corners=3pt,minimum width=2.6cm,minimum height=0.75cm,font=\sffamily\small},
-  ar/.style={-{Stealth[length=2.2mm]},thick,draw=ink2},
-  rk/.style={font=\sffamily\small\bfseries,anchor=east}]
-  \foreach \y/\r/\k in {0/Rank 0 (GPU 0)/r0, -1.5/Rank 1 (GPU 1)/r1} {
-    \node[rk] at (-0.3,\y) {\r};
-    \node[a] (x1\k) at (1.6,\y) {A: all-reduce \#1};
-    \node[b] (x2\k) at (5.0,\y) {B: all-reduce \#1};
-    \node[a] (x3\k) at (8.4,\y) {A: all-reduce \#2};
-    \draw[ar] (x1\k) -- (x2\k); \draw[ar] (x2\k) -- (x3\k);
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}
+  \draw[ink!60, rounded corners=3pt, fill=panel] (0,0) rectangle (8.6,1.0);
+  \foreach \x/\w/\c/\t in {0.1/0.9/cA/A: statics, 1.05/1.0/cA/A: KV, 2.1/2.15/cA/A: expert slab,
+                          4.3/2.15/cB/B: expert slab, 6.5/1.0/cB/B: KV, 7.55/0.95/cB/B: statics}{
+     \draw[draw=\c, fill=\c!10, rounded corners=2pt] (\x,0.12) rectangle ++(\w,0.76);
+     \node[font=\tiny] at (\x+\w/2,0.5) {\t};
   }
-  \node[draw=ink2,fill=panel,rounded corners=3pt,font=\sffamily\small,align=center,minimum width=4.2cm] (seq) at (5.0,-3.2)
-    {CollectiveSequencer\\[-1pt]{\scriptsize\color{ink2}tickets: same order on every rank}};
-  \foreach \x in {1,2,3} \draw[dashed,ink2] (x\x r1.south) -- ++(0,-0.55);
-  \draw[ink2,dashed] ([yshift=-0.55cm]x1r1.south) -- ([yshift=-0.55cm]x3r1.south);
-  \node[font=\sffamily\scriptsize,text=ink2,anchor=west] at (9.8,-0.75) {time $\rightarrow$};
-\end{tikzpicture}
-\caption{The CollectiveSequencer gives every collective of every model one order, the same on every
-rank, so no rank can wait on model A while the other already runs model B.}\label{fig:collective}
+  \draw[{Stealth[length=1.8mm]}-{Stealth[length=1.8mm]}, semithick, draw=ink] (3.45,-0.25) -- (5.15,-0.25);
+  \node[font=\scriptsize, text=ink] at (4.3,-0.55) {elastic boundary, 128\MiB\ chunks};
+  \draw[darr] (1.55,1.0) .. controls (2.6,1.65) and (5.9,1.65) .. (7.0,1.0);
+  \node[lab] at (4.3,1.55) {KV lending};
+  \node[font=\scriptsize\bfseries, anchor=west] at (0,-1.05) {Order in which freed bytes are granted:};
+  \node[boxA, text width=22mm] (o1) at (1.25,-1.75) {1. streamed statics\\[-2pt]\scriptsize back to the card};
+  \node[boxC, text width=22mm] (o2) at (4.3,-1.75) {2. KV cache\\[-2pt]\scriptsize of a waiting model};
+  \node[boxB, text width=22mm] (o3) at (7.35,-1.75) {3. expert slab\\[-2pt]\scriptsize growth by heat};
+  \draw[arr] (o1) -- (o2); \draw[arr] (o2) -- (o3);
+\end{tikzpicture}}
+\caption{Two active models on one card (schematic). Freed bytes go first to streamed static
+weights, then to the KV cache of a model with waiting prompts, and last to expert-slab growth.}
+\label{fig:vram}
 \end{figure}
 
-\begin{itemize}
-  \item \textbf{Solution.} A process-wide \textbf{CollectiveSequencer} puts all collectives of all
-        models into one order that is the same on every rank. Deadlocks are ruled out.
-  \item \textbf{Price.} Two models never communicate at the same time. With both busy, throughput
-        splits roughly in half. You do \textbf{not get twice the work}; you get \textbf{the second
-        model without waiting}.
-\end{itemize}
+\paragraph{Group planner} The expert bytes a model's share leaves are its \emph{offer}; the group's
+expert pool $P$ is the sum of the offers. Algorithm~\ref{alg:planner} computes per-rank targets.
+Every model keeps a minimum, the larger of its \emph{expert floor} (what its host pool cannot hold)
+and a fraction of the equal share $P/n$. The remainder goes to the most valuable expert units of the
+whole group, where an expert's worth is its heat times its bytes per byte of slot it occupies,
+which makes models with different expert sizes comparable. Running models apply new targets only
+at step boundaries, by capping their mover's resident slots. A model alone in the group receives
+exactly its offer, so single-model behaviour is unchanged.
 
-\fig{concurrency.pdf}{0.92\linewidth}{Throughput of two concurrently active dense models. Source:
-\code{gpu-acceptance.md} \S8.}
+\begin{algorithm}[t]
+\caption{Expert budget per rank (GroupPlanner)}\label{alg:planner}
+\small
+\begin{algorithmic}[1]
+\Require models $i=1..n$ with offer $o_i$, floor $f_i$, expert plane $E_i$, heat per unit
+\State $P \gets \sum_i o_i$; \quad $s \gets \textit{min\_share}\cdot P/n$
+\For{each model $i$}
+  \State $k_i \gets \min(\max(f_i, s),\ |E_i|)$ \Comment{guaranteed minimum}
+\EndFor
+\State $R \gets P - \sum_i k_i$
+\State $U \gets$ expert units of all models, by $w(u)=\frac{\mathit{heat}(u)\cdot \mathit{bytes}(u)}{\mathit{slot}(u)}$, desc.
+\For{$u \in U$ \textbf{while} $R>0$}
+  \State $i \gets \mathrm{owner}(u)$
+  \If{$k_i + \mathit{slot}(u) \le c_i$} \Comment{$c_i=o_i$, or $P$ if elastic}
+     \State $k_i \gets k_i + \mathit{slot}(u)$; \quad $R \gets R - \mathit{slot}(u)$
+  \EndIf
+\EndFor
+\State \Return targets $k_i$ \Comment{ties share room by bytes}
+\end{algorithmic}
+\end{algorithm}
 
-\textbf{Fix 2 in detail.} The hand-off between the rank threads used
-\code{condition\_variable::wait}. Sleeping and waking cost $\sim$0.5\,ms, 48 times per decode step.
-The thread now spins for 300\,\textmu s before it sleeps: \textbf{5$\times$ the throughput} per model.
+\paragraph{Elastic expert slab} Logical targets alone do not move memory: a shrinking model's slab
+would remain one reservation. On cards with virtual-memory management and in manifests with more
+than one model, the expert slab is therefore \emph{elastic}. It is mapped in chunks of about
+128\MiB; a model may be granted up to the whole pool, but growth is paid only from chunks no member
+holds, and the receiver is granted bytes only after the giver reports their release, so the sum of
+committed slabs never exceeds the pool. Heat of an idle model halves every 4\,s and counts as cold
+after 20\,s, so an idle model shrinks to its minimum. Every chunk is mapped on \emph{fresh} virtual
+address space; \S\ref{sec:lessons} explains why. Each rank reserves 8\,TiB of address space per
+model, about 65{,}000 chunk changes, after which the slab degrades to logical shrinking.
 
-% ================================================================ 10
-\section{Host RAM: budget and sizing}
+\paragraph{Cross-model KV lending} A model's share fixes only its initial KV cache (its
+\emph{carve}); its ceiling is the context length times the number of sequences. When running or
+waiting prompts need more blocks than the carve holds, the cache claims chunks of 128--256\MiB\
+(32{,}768 tokens per growing group) from the group's expert pool. The planner takes the bytes from
+the coldest experts of any model, each model keeping its minimum, and grants them once the pages are
+back. Running sequences are never touched, and a chunk is returned five seconds after demand ends.
 
-\begin{warnbox}[title=The most common planning mistake]
-An active model's weights are in memory \textbf{twice}: on the card and in the prepared store.
-\end{warnbox}
+\paragraph{Static-weight streaming} If a model's non-expert weights do not fit the VRAM left to it,
+it starts anyway: what does not fit stays in the pinned host pool and is read over PCIe, zero-copy
+for decode and through a staged ring for prefill. Output is bit-identical. As soon as VRAM frees up,
+the streamed weights move to the card, and they are first in line for freed bytes
+(Fig.~\ref{fig:vram}). Deterministic mode refuses streamed statics, because prefill without a stager
+would read weights in place over PCIe.
 
-\textbf{Rule of thumb:}
-\begin{align*}
-\text{RAM} \;\gtrsim\;& \textstyle\sum \text{store copies of the models you want warm} \\
-&+ \textstyle\sum \text{host pools of the models active together (streaming models need more)} \\
-&+ \text{staging of the largest load (up to 4\,GiB)} \\
-&+ \text{\code{--host-headroom-mib} (4096 by default)} + \text{the page cache you still want}
-\end{align*}
+\paragraph{Heat warm-up} A deactivated model keeps its expert heat for the lifetime of the
+process. With a warm-up budget, the next activation ranks experts by that heat and places the
+hottest on the card at load time, instead of starting from the container's static profile.
 
-\textbf{What happens when the budget (\code{cache.host\_budget\_mib}) runs out:}
-\begin{enumerate}
-  \item The \textbf{prepared} model idle the longest drops out of the store and becomes \code{cold} (LRU).
-  \item Then the store copy of an \textbf{active} model (it keeps running, but is cold after deactivation).
-  \item If it still does not fit, the activation is refused with a \textbf{503 before} anything is
-        allocated. The kernel's OOM killer never gets involved.
-\end{enumerate}
+\subsection{Parallel runtimes and collective ordering}\label{sec:collectives}
 
-\begin{table}[H]\small
-\caption{Host RAM in use, measured on the 170\,GiB host with Qwen3.8-Flash-Next.}
-\begin{tabularx}{\linewidth}{@{}LP{5.6cm}@{}}
-\toprule
-\textbf{Setup} & \textbf{Host RAM in use} \\
-\midrule
-Flash-Next prepared (store 72.5\,GB) & 75\,GiB \\
-Flash-Next active, store copy kept & \textbf{153\,GiB} \\
-Two Flash-Next entries active & \textbf{160\,GiB} (only the first one in the store) \\
-\bottomrule
-\end{tabularx}
-\end{table}
+Each active model owns its streams, threads, contexts, pools and collective buffers per rank, and
+its forward passes run truly in parallel with other models' (ADR~0003). The danger lies in the
+all-reduce kernels, which spin on a peer flag: if rank~0 enters model A's all-reduce while rank~1
+enters model B's, both spin forever. RadianceSwap applies the classical remedy of imposing a total
+order on resource acquisition~\cite{havender1968}: a process-wide \emph{CollectiveSequencer}
+assigns monotonic tickets on rank~0, and all other ranks issue their collectives in that exact
+sequence (Fig.~\ref{fig:collective}). A device-side event chain enforces the order on the streams
+without stalling the host, and with a single registered engine the sequencer reduces to a relaxed
+atomic check.
 
-% ================================================================ 11
-\section{Measurements}
-
-\fig{activation.pdf}{0.92\linewidth}{Activation time from disk and from the RAM store. Source:
-\code{gpu-acceptance.md} \S1--2.}
-
-\begin{table}[H]\small
-\caption{Summary of the acceptance runs.}
-\begin{tabularx}{\linewidth}{@{}P{6.4cm}L@{}}
-\toprule
-\textbf{Situation} & \textbf{Result} \\
-\midrule
-Manifest with one model vs.\ \code{--model} & no measurable difference ($-0.3\,\%$ \dots $+0.1\,\%$) \\
-Switching between two \textbf{active} models & 0\,ms activation, $<1$\,ms queue \\
-Dense 0.8B cold / warm & 2.6\,s / 2.1\,s (only 0.25\,s of that is weights) \\
-MoE cold / warm (n-gram table in RAM) & 70\,s / 60\,s \\
-MoE warm with \code{--ngram-placement disk} & weights in 6.3--7.6\,s \\
-Deactivation & 0.7\,s (dense) to 1.4\,s (MoE) \\
-120 activate/deactivate cycles & VRAM back to 266\,MiB per card every time; no leak in queues, threads, fds \\
-Output vs.\ \code{--model} & identical (greedy, seeded sampling, streaming, MTP, long prompt, abort) \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\begin{table}[H]\small
-\caption{Time to first token of a dense 0.8B model, 1,700-token prompt, p50 in ms.}
-\begin{tabularx}{\linewidth}{@{}Lrrrr@{}}
-\toprule
-\textbf{Case} & \textbf{Queue} & \textbf{Activation} & \textbf{Prefill} & \textbf{TTFT} \\
-\midrule
-model active & 0.1 & 0 & 23.7 & 24.0 \\
-cold & 0.5 & 1,968 & 37.9 & 2,008 \\
-prepared (warm) & 0.4 & 2,125 & 28.8 & 2,155 \\
-active, 32 clients on 8 sequences & 1,403 & 0 & 27.1 & 1,431 \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\textbf{How to read it:} for a model that is not active, activation is almost the whole wait. For an
-overloaded model, the scheduler queue is.
-
-% ================================================================ 12
-\section{How it differs from llama-swap}\label{sec:llamaswap}
-
-llama-swap (\url{https://github.com/mostlygeek/llama-swap}) looks like it solves the same problem:
-\textbf{one endpoint, many models, switch on demand.} The approach is fundamentally different.
-
-\fig{vs-llama-swap.pdf}{0.92\linewidth}{Two architectures for ``one endpoint, many models''.}
-
-\subsection{The core principle}
-\begin{itemize}
-  \item \textbf{llama-swap is a proxy.} A Go program reads the \code{model} field, starts the matching
-        server process through \code{cmd} (e.g.\ \code{llama-server}, vLLM, stable-diffusion.cpp) and
-        forwards the request: ``If the wrong upstream server is running, it will be replaced with the
-        correct one.'' Switching means \textbf{stopping one process and starting another}.
-  \item \textbf{RadianceSwap is an engine change.} There is \textbf{no} second process. Models are
-        runtimes inside Radiance. Switching means \textbf{tearing down a runtime while the weights
-        stay GPU-ready in RAM}.
-  \item \textbf{Link to the design.} ADR 0001 considered exactly the llama-swap approach (``an
-        external router that restarts a process per model, weights warm in the page cache'',
-        translated from German) and \textbf{rejected} it because of the switch latency and the extra
-        component.
-\end{itemize}
-
-\subsection{Side by side}
-
-\begin{table}[H]\footnotesize
-\begin{tabularx}{\linewidth}{@{}P{2.5cm}LL@{}}
-\toprule
-\textbf{Aspect} & \textbf{llama-swap} & \textbf{RadianceSwap} \\
-\midrule
-Architecture & External reverse proxy (Go), one binary & Inside the engine, one process (C++/HIP) \\
-Backends & \textbf{Any} OpenAI- or Anthropic-compatible server: llama.cpp, vLLM, sd.cpp, ComfyUI and more & \textbf{Radiance only} (\code{.rad} or HF checkpoint) \\
-Hardware & Whatever the backend supports: CUDA, Vulkan, Metal, CPU; Linux, macOS, Windows, FreeBSD & ROCm, Linux; tested only on AMD R9700 (gfx1201) \\
-Switch & End the process (\code{unloadTimeout}, then kill), start a new one & Tear down the runtime; the next activation comes from the prepared store \\
-Warm restart & Depends on the backend; at best the weights are in the OS page cache & Weights GPU-ready in the process's own RAM: no parsing, no relayout, no disk read \\
-Several models at once & Default: one. More through \code{groups} (\code{swap}/\code{exclusive}/\code{persistent}), the \code{matrix} DSL with \code{evict\_costs}, or \code{capacity} pools & Default: all, bounded only by the budget (\code{max\_active\_models} optional) \\
-VRAM split & \textbf{Fixed} per process. The operator declares what fits together; \code{capacity} has ``no automatic measurement'' per its docs & \textbf{Dynamic}: expert slab, KV lending and static streaming move VRAM at runtime \\
-Model does not fit & Another model has to go (eviction by group or matrix) & Starts anyway and streams the rest over PCIe; idle models can also be deactivated \\
-Running generation during a switch & Unload is graceful with a timeout; exact behavior not checked here & \textbf{Never cut}; deactivation waits \\
-Multi-GPU & Up to the backend (e.g.\ TP in vLLM) & One GPU group with TP for all models; the CollectiveSequencer prevents deadlocks \\
-Host RAM & Not managed & Budget with LRU, admission check before allocating (503 instead of an OOM kill) \\
-Output & Backend output passed through unchanged & Bit-identical to \code{--model}, measured \\
-Operations & Web UI with playground, log streaming, aliases, request filters, profiles, preload hooks, API keys & \code{/radiance/models}, per-model Prometheus metrics, TTFT split, Grafana dashboard \\
-Maturity & Established; its README says it is used by ``thousands of people''; ready-made Docker images & Experimental, one test system \\
-License & MIT & Apache-2.0 (derived from Radiance) \\
-\bottomrule
-\end{tabularx}
-\caption*{\footnotesize llama-swap details are taken from its README and \code{docs/config.example.yaml} (November 2026).}
-\end{table}
-
-\subsection{Which one to use}
-
-\begin{figure}[H]\centering
-\begin{tikzpicture}[
-  q/.style={draw=ink2,fill=panel,rounded corners=3pt,align=center,font=\sffamily\small,text width=4.4cm,minimum height=1.0cm},
-  ls/.style={draw=accent2,fill=accent2!12,rounded corners=3pt,align=center,font=\sffamily\small\bfseries,text width=3.2cm,minimum height=0.9cm},
-  rs/.style={draw=accent,fill=accent!12,rounded corners=3pt,align=center,font=\sffamily\small\bfseries,text width=3.2cm,minimum height=0.9cm},
-  ar/.style={-{Stealth[length=2.2mm]},thick,draw=ink2},
-  lab/.style={font=\sffamily\scriptsize,text=ink2,fill=white,inner sep=1.5pt}]
-  \node[q] (q1) at (0,0) {Do you use engines other than Radiance (llama.cpp, vLLM, ComfyUI \dots)?};
-  \node[q] (q2) at (0,-2.4) {Should several large models run on the same GPUs at the same time?};
-  \node[q] (q3) at (0,-4.8) {Is your models' restart time a problem?};
-  \node[ls] (l1) at (6.2,0) {llama-swap};
-  \node[rs] (r1) at (6.2,-2.4) {RadianceSwap};
-  \node[ls] (l2) at (-5.4,-4.8) {llama-swap is enough\\[-1pt]{\scriptsize\mdseries simpler, mature}};
-  \node[rs] (r2) at (6.2,-4.8) {RadianceSwap};
-  \draw[ar] (q1) -- node[lab,above=2pt]{yes} (l1);
-  \draw[ar] (q1) -- node[lab,right=2pt]{no} (q2);
-  \draw[ar] (q2) -- node[lab,below=3pt,align=center]{yes, VRAM should\\follow the load} (r1);
-  \draw[ar] (q2) -- node[lab,right=2pt]{no, one after another is fine} (q3);
-  \draw[ar] (q3) -- node[lab,above=2pt]{no} (l2);
-  \draw[ar] (q3) -- node[lab,above=2pt]{yes} (r2);
-\end{tikzpicture}
-\caption{Choosing between the two.}\label{fig:which}
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[a/.style={boxA, minimum width=21mm, minimum height=6mm}, b/.style={boxB, minimum width=21mm, minimum height=6mm}]
+  \foreach \y/\r/\k in {0/rank 0/r0, -1.1/rank 1/r1} {
+    \node[font=\footnotesize\bfseries, anchor=east] at (-0.2,\y) {\r};
+    \node[a] (x1\k) at (1.2,\y) {A: all-reduce 1};
+    \node[b] (x2\k) at (3.9,\y) {B: all-reduce 1};
+    \node[a] (x3\k) at (6.6,\y) {A: all-reduce 2};
+    \draw[arr] (x1\k) -- (x2\k); \draw[arr] (x2\k) -- (x3\k);
+  }
+  \node[boxG, minimum width=40mm] (seq) at (3.9,-2.35) {CollectiveSequencer: tickets 1, 2, 3 \dots};
+  \draw[darr] (seq.north -| x1r1) -- (x1r1.south);
+  \draw[darr] (seq.north -| x2r1) -- (x2r1.south);
+  \draw[darr] (seq.north -| x3r1) -- (x3r1.south);
+  \draw[arr, draw=ink!60] (7.9,-0.55) -- node[lab, above=1pt]{time} (8.9,-0.55);
+\end{tikzpicture}}
+\caption{All collectives of all models follow one ticket order, identical on every rank, so no rank
+can spin on model A while its peer has entered model B.}
+\label{fig:collective}
 \end{figure}
 
-\begin{minipage}{\linewidth}
-\begin{itemize}
-  \item \textbf{Choose llama-swap} if you mix backends, run on NVIDIA, Apple or CPU, need a stable
-        tool, or want the web UI.
-  \item \textbf{Choose RadianceSwap} if you run Radiance on AMD cards, want large MoE models side by
-        side, and need switches in seconds rather than minutes.
-  \item \textbf{Combine them} (hypothesis, not tested). Radiance speaks the OpenAI API, so llama-swap
-        could run a RadianceSwap process as one of its upstreams, for example next to a llama.cpp
-        server on other hardware.
-\end{itemize}
+The cost is that two models never communicate at the same time. Two busy models therefore share,
+rather than add, the communication capacity of the group; the benefit is that the second model is
+served without waiting for the first.
 
-\begin{keybox}[title=What was not compared]
-llama-swap has not been measured on the same hardware. ``RadianceSwap switches faster'' is
-well-founded by the design for the \textbf{warm} case (no parsing, no relayout), but
-\textbf{not measured directly}.
-\end{keybox}
-\end{minipage}
+\subsection{Host-memory budget and admission control}\label{sec:host}
 
-% ================================================================ 13
-\section{Limits and open points}
+Host RAM is the binding constraint for large MoE models, because an active model's weights exist
+twice: on the card (or in its host pool) and in the prepared store. RadianceSwap books three kinds of
+host memory against \code{cache.host\_budget\_mib}: store copies, the host pools of active models
+(enlarged by streaming), and load staging. Page cache is never counted. When a booking does not fit,
+the longest-idle prepared model is dropped to \code{cold} (LRU~\cite{denning1968}), then the store
+copy of an active model, and finally the activating model's own copy. After planning and
+\emph{before} allocating, an activation checks its whole host bill against the budget,
+\code{MemAvailable}, all enclosing memory cgroups and a headroom; if it still does not fit, the
+activation is refused with HTTP~503 and nothing that runs is affected. Before this check, a streaming
+model beside a 138\GiB\ MoE ended in a kernel kill of the whole process. A practical sizing rule is
+\begin{equation*}
+\begin{aligned}
+\mathrm{RAM} \gtrsim{} & \textstyle\sum \text{store copies} + \sum \text{active host pools}\\
+ & + \text{staging} + \text{headroom}.
+\end{aligned}
+\end{equation*}
 
-\begin{table}[H]\small
-\begin{tabularx}{\linewidth}{@{}LP{3.4cm}@{}}
+% ================================================================ 4 implementation
+\section{Implementation}
+
+RadianceSwap is implemented in C++20 and HIP within the Radiance tree. The main components are the
+\code{ModelRegistry} (manifest parsing and per-model records), the \code{ModelRouter} (routing,
+queues, activation threads, idle and pressure deactivation), the \code{PreparedWeightStore}
+(\code{core/model/weight\_store.h}), the \code{GroupPlanner} (\code{core/place/group\_planner.cpp}),
+which hands each engine a byte budget that its existing planner and mover fill, so that there is no
+second placement algorithm, and the \code{CollectiveSequencer}
+(\code{core/runtime/collective\_sequencer.cpp}). Enabling the lifecycle required splitting the
+engine's \code{serve()} into execution start/stop and independent HTTP serving, and turning
+stack-local bridges into a lifetime-managed per-model frontend whose leases keep tokenizer and
+response sinks valid across a deactivation.
+
+Testing follows three seams. HTTP behaviour is tested through \code{Router::dispatch} with fake model
+runtimes (routing, single activation under concurrency, cancellation while waiting, idle timeout, LRU,
+rollback, metrics, LoRA rejection). The group planner is tested directly (heat allocation, minima,
+slot release, KV reclaim, streaming fallback). GPU acceptance runs on real hardware
+(\S\ref{sec:eval}).
+
+% ================================================================ 5 evaluation
+\section{Evaluation}\label{sec:eval}
+
+\paragraph{Setup} All measurements were taken on 2$\times$ AMD Radeon AI PRO R9700 (gfx1201,
+31.86\GiB\ each) with TP\,=\,2, a host with 48 vCPUs and 170\GiB\ RAM, and a build for gfx1201. The
+dense model is Qwen3.5-0.8B (2.4\,GB of weights); the MoE model is Qwen3.8-Flash-Next, a
+113.6\GiB\ container with 67.5\GiB\ of weights and a 47.7\GiB\ memory-mapped n-gram table.
+C1 denotes one request generating 256 tokens with \code{ignore\_eos}; C8 denotes eight concurrent
+requests, aggregated. Unless stated otherwise each value is the min--max range over three
+repetitions. All numbers are taken from the repository's acceptance record
+(\code{docs/swap/gpu-acceptance.md}); none were re-measured for this report.
+
+\subsection{Overhead}
+
+\begin{table}[t]
+\caption{Single-model overhead: unmodified engine (main) vs.\ RadianceSwap, \code{-{}-model} mode, TP\,=\,2. Throughput in tok/s.}
+\label{tab:overhead}
+\centering\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llrrr@{}}
 \toprule
-\textbf{Point} & \textbf{Status} \\
+Model & Build & C1 & C8 & Prefill \\
 \midrule
-\textbf{One TP size per GPU group.} Plugins that only run with \code{--tp 1} (e.g.\ LFM2) can't join a TP\,=\,2 group. & Known limit \\
-\textbf{A cold model still reserves a VRAM share.} A large MoE can be $\sim$9\,\% slower even if the second model never activates (issue \#56). Workaround: \code{--gpu-headroom-mib} per model. & Measured, not fixed \\
-\textbf{Large MoEs need a lot of host RAM.} One Flash-Next active and prepared uses $\sim$153 of 170\,GiB. & Measured \\
-\textbf{A second active model costs $\sim$10\,\%}, even while idle (tapes are bypassed while several engines are registered). & Measured, cause known \\
-\textbf{Not in manifest mode:} LoRA adapters, \code{/v1/videos}, WebSocket sessions. & Deliberate limit \\
-\textbf{\code{gpu\_group.devices}} is checked but not yet used to pick cards. & Known limit \\
-\textbf{Slab error ``no finite logit''}: caused by re-mapping the same address in the driver; fixed by giving every chunk fresh address space (30 load cycles, 5,776 requests, 0 errors). A long-run check is still open (issue \#58). & Fixed, long-run check open \\
-\textbf{Narrow test coverage:} one MoE, small dense models, one system. Not checked: more than two models, MoE/MoE with \code{host\_budget\_mib}. & Open \\
+\multirow{2}{*}{Dense 0.8B} & main & 325--332 & 2032--2056 & 57{,}000--65{,}100 \\
+                            & RadianceSwap & 326--333 & 2015--2039 & 57{,}300--64{,}700 \\
+\midrule
+\multirow{2}{*}{MoE, determ.} & main & 73.8--77.7 & 129--151 & 4645--4866 \\
+                              & RadianceSwap & 72.8--89.0 & 137--226 & 4697--5150 \\
 \bottomrule
-\end{tabularx}
+\end{tabular}
 \end{table}
 
-% ================================================================ 14
-\section{Quick start}
+Table~\ref{tab:overhead} compares single-model serving before and after the changes. Dense C1 and
+C8 agree within 1\,\%; prefill varies by $\pm$5\,\% from run to run in both builds. A manifest that
+holds one model matches \code{-{}-model} within $-0.3\,\%$ to $+0.1\,\%$. Outputs are identical to
+\code{-{}-model} for greedy decoding, seeded sampling ($T=0.8$, top-$p=0.9$), streaming, a 2{,}421-token
+prompt and MTP speculation, for dense and MoE models, also while another model is active.
 
-\code{models.json}:
+\subsection{Activation latency}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[paper, width=0.9\columnwidth, height=3.9cm, xbar=1pt, bar width=6pt, xmode=log, log origin=infty,
+  xmin=1, xmax=300, xlabel={activation latency (s, log scale)},
+  symbolic y coords={MoE,Dense}, ytick={MoE,Dense}, yticklabels={MoE 113.6\,GiB, Dense 0.8B},
+  enlarge y limits=0.45, point meta=rawx,
+  nodes near coords={\pgfmathprintnumber[fixed,precision=1]{\pgfplotspointmeta}\,s},
+  nodes near coords align={horizontal},
+  legend style={at={(0.5,1.03)}, anchor=south}, legend columns=2]
+\addplot[fill=cB, draw=none] coordinates {(2.61,Dense) (70.2,MoE)};
+\addplot[fill=cA, draw=none] coordinates {(2.125,Dense) (60.0,MoE)};
+\legend{cold (disk), warm (store)}
+\end{axis}
+\end{tikzpicture}
+\caption{Activation latency from disk and from the prepared store. Dense warm: p50 over 118
+activations. The MoE warm activation is dominated by re-copying the mapped n-gram table; with
+\code{-{}-ngram-placement disk} its weights load in 6.3--7.6\,s.}
+\label{fig:activation}
+\end{figure}
+
+Fig.~\ref{fig:activation} shows activation latency. For the dense model, a warm activation takes
+2.1\,s (p50; p95 2.2\,s), of which only 0.25\,s is weight upload; the remaining $\sim$1.9\,s are
+planning, all-reduce initialization, arena and kernel set-up. For the MoE model the store saves only
+10\,s of 70\,s, because the store holds the 67.5\GiB\ of weights ($\approx$6\,s to upload) but the
+47.7\GiB\ n-gram table is backed by page cache and is copied again at each activation; since the
+store displaces the page cache, that copy comes from disk. Placing the table on disk reduces the warm
+weight load to 6.3--7.6\,s. Deactivation takes 0.7\,s (dense) to 1.4\,s (MoE). Switching between two
+models that are both already active costs no activation at all.
+
+\subsection{Time to first token}
+
+\begin{table}[t]
+\caption{TTFT decomposition, dense 0.8B, 1{,}700-token prompt, p50\,/\,p95 in ms. The parts sum to TTFT within 0.6\,ms.}
+\label{tab:ttft}
+\centering\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Case & Queue & Activation & Prefill & TTFT \\
+\midrule
+model active        & 0.1\,/\,0.2   & 0              & 23.7\,/\,25.0  & 24.0\,/\,25.5 \\
+cold                & 0.5\,/\,0.8   & 1968\,/\,2007  & 37.9\,/\,38.1  & 2008\,/\,2045 \\
+prepared (warm)     & 0.4\,/\,0.8   & 2125\,/\,2227  & 28.8\,/\,29.5  & 2155\,/\,2256 \\
+32 clients, 8 seqs  & 1403\,/\,1461 & 0              & 27.1\,/\,103.6 & 1431\,/\,1490 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every response reports TTFT split into router wait for activation, scheduler queue and prefill, and
+\code{/metrics} exports the same parts as per-model histograms. Table~\ref{tab:ttft} shows that for a
+model that is not active, activation is almost the whole TTFT, while for an overloaded active model
+the scheduler queue dominates. Activating a second model under that load took as long as without it,
+and its own queue stayed below 1\,ms.
+
+\subsection{Concurrent models}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[paper, width=0.88\columnwidth, height=3.6cm, xbar stacked, bar width=8pt, xmin=0, xmax=420,
+  xlabel={decode throughput, C1 (tok/s)},
+  symbolic y coords={today,cv,alone}, ytick={today,cv,alone},
+  yticklabels={{A+B, spin 300\,\textmu s}, {A+B, condvar}, A alone},
+  enlarge y limits=0.3,
+  legend style={at={(0.5,1.03)}, anchor=south}, legend columns=2]
+\addplot[fill=cA, draw=white, line width=0.6pt] coordinates {(329,alone) (31,cv) (154,today)};
+\addplot[fill=cB, draw=white, line width=0.6pt] coordinates {(0,alone) (31,cv) (154,today)};
+\node[font=\scriptsize, anchor=west] at (axis cs:331,alone) {329};
+\node[font=\scriptsize, anchor=west] at (axis cs:64,cv) {31\,+\,31};
+\node[font=\scriptsize, anchor=west] at (axis cs:310,today) {154\,+\,154};
+\legend{model A, model B}
+\end{axis}
+\end{tikzpicture}
+\caption{Two dense models busy at once. With a condition-variable hand-off between rank threads,
+each model fell to 31\,tok/s; spinning for 300\,\textmu s before sleeping restores the serial bound
+of about half the single-model rate each.}
+\label{fig:concurrency}
+\end{figure}
+
+\begin{table}[t]
+\caption{Throughput with two active models (tok/s). ``Busy'' means the other model is under load at the same time.}
+\label{tab:concurrent}
+\centering\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llr@{}}
+\toprule
+Workload & Configuration & Throughput \\
+\midrule
+Dense C1      & alone                           & 326--332 \\
+              & other model active, idle        & 294--300 \\
+              & other model busy                & 154 + 154 \\
+Dense C8      & alone                           & 2026--2029 \\
+              & both busy                       & 1287--1366 + 716--725 \\
+Dense prefill & alone                           & 69{,}000--71{,}000 \\
+              & beside busy model               & 36{,}000--47{,}000 \\
+MoE C1        & alone (manifest, 1 model)       & 74.8--74.9 \\
+              & beside busy dense model         & 59.3--59.4 \\
+Two MoE, C8   & one busy / both busy            & 102 / 38.4 + 35.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:concurrency} and Table~\ref{tab:concurrent} quantify the cost of collective ordering.
+Two busy dense models obtain about half the single-model decode rate each, so aggregate throughput
+stays near the single-model level; the gain is availability, not capacity. A second active but idle
+model costs about 10\,\% because execution tapes are bypassed while several engines are registered.
+With two MoE models, host RAM is saturated (160\GiB\ of 170\GiB\ in use), and part of the drop
+stems from page-cache pressure; the two causes were not separated.
+
+\subsection{Moving memory between models}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[paper, height=3.7cm, xbar stacked, bar width=8pt, xmin=0, xmax=22.5,
+  xlabel={committed expert slab, rank 0 (GiB)},
+  symbolic y coords={p3,p2,p1}, ytick={p3,p2,p1},
+  yticklabels={load on m2, transition, load on m1}, enlarge y limits=0.3,
+  legend style={at={(0.5,1.02)}, anchor=south}, legend columns=2]
+\addplot[fill=cA, draw=white, line width=0.6pt] coordinates {(13.13,p1) (8.41,p2) (7.05,p3)};
+\addplot[fill=cB, draw=white, line width=0.6pt] coordinates {(7.06,p1) (8.69,p2) (13.14,p3)};
+\draw[ink, dashed] (axis cs:20.20,p3) ++(0pt,-8pt) -- ++(0pt,60pt) node[font=\scriptsize, anchor=south] {pool};
+\draw[soft, dotted, thick] (axis cs:10.07,p3) ++(0pt,-8pt) -- ++(0pt,60pt) node[font=\scriptsize, anchor=south, text=soft] {offer};
+\legend{m1, m2}
+\end{axis}
+\end{tikzpicture}
+\caption{Elastic expert slab with two Flash-Next entries. The loaded model grows about 3\GiB\ past
+its offer while the idle model shrinks to its minimum; the sum never exceeds the pool.}
+\label{fig:elastic}
+\end{figure}
+
+Fig.~\ref{fig:elastic} shows the elastic slab with two entries of the MoE model, each offering
+10.07\GiB\ per rank from a pool of 20.20\GiB. Under load on m1 alone, m1 commits 13.1\GiB\ while m2
+falls to 7.1\GiB; reversing the load reverses the split. A change of load reaches its target within
+20--30\,s, moving 128\MiB\ per step and 5\GiB\ within a few seconds. Across 7{,}736 samples under a
+continuously shifting load, the sum of committed slabs never exceeded the pool (before four fixes,
+3{,}561 of 4{,}793 samples did, by up to 3.4\GiB). Greedy outputs of both models matched the
+reference after every phase. With KV lending, a cache with a 1.9\GiB\ carve grew by 468--702\MiB\
+per card under 12--16 concurrent long prompts while the other model's slab returned 2.8--3.5\GiB, and
+it shrank back 13--20\,s after the load, with no lost sequence.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[paper, height=4.0cm, xmin=-3, xmax=103, ymin=0, ymax=108,
+  xlabel={static weights streamed from host (\%)}, ylabel={decode C1 (\% of baseline)},
+  ymajorgrids=true, xmajorgrids=false, xtick={0,25,50,75,100}, ytick={0,25,50,75,100},
+  legend style={at={(0.98,0.97)}, anchor=north east}]
+\addplot[cA, thick, mark=*, mark size=1.6pt] coordinates {(0,100) (25.6,60.8) (50.8,19.2) (85.5,9.9)};
+\addplot[cB, thick, mark=square*, mark size=1.5pt] coordinates {(0,100) (15.4,23.1) (42.7,15.2) (96.5,7.1)};
+\legend{dense 0.8B (326 tok/s), MoE ($\approx$160 tok/s)}
+\end{axis}
+\end{tikzpicture}
+\caption{Cost of streaming static weights over PCIe, normalized to the non-streaming baseline
+(midpoints of min--max ranges). For the MoE model the drop combines streamed statics and experts,
+which lose their VRAM slots at the same time.}
+\label{fig:streaming}
+\end{figure}
+
+Fig.~\ref{fig:streaming} quantifies static-weight streaming. Streaming 25.6\,\% of the dense model's
+statics costs 39\,\% of decode throughput, and 85.5\,\% costs 90\,\%; output remains identical, and
+throughput recovers within 1--2\,s once VRAM frees up and the weights move back. An activation that
+finds the cards full succeeds in every tested case, which is the purpose of streaming: the new model
+answers immediately while it waits for memory.
+
+\paragraph{Heat warm-up} For the MoE model, the early expert hit rate (first 64 steps, 246{,}817
+routed experts) after a warm re-activation was 83.45\,\% without a warm-up budget and 89.12\,\% with
+12\GiB, compared with 83.6\,\% after the cold start.
+
+\subsection{Robustness}
+
+Over 120 activate/deactivate cycles, VRAM returned to 266\MiB\ per card after every cycle; kfd queues,
+threads and file descriptors stayed constant, and host RSS grew by at most 17\MiB\ over the last 72
+cycles. Failed activations (a model that can never fit, and a malformed container) were rolled back to
+the exact pre-activation free VRAM while a 3{,}000-token generation of another model continued
+undisturbed. With \code{max\_active\_models}\,=\,2 and three models, each request for the third model
+deactivated the longest-idle model and was served after 4.9--5.1\,s. With \code{host\_budget\_mib}
+set too low, a second MoE activation was refused with HTTP~503 and no kernel kill.
+
+\subsection{Defects found during acceptance}\label{sec:lessons}
+
+Four defects illustrate where multi-model serving stresses assumptions of a single-model engine.
+(i)~\emph{Queue-id exhaustion}: each activation created $\sim$46 AQL streams whose ids were never
+reused; the 1{,}024-entry table overflowed at the 23rd activation, surfaced as a misleading
+out-of-memory error, and marked the group unhealthy. The table now has $2^{20}$ entries.
+(ii)~\emph{Wake-up latency}: the collective hand-off between rank threads used a condition variable
+whose sleep--wake cycle cost $\sim$0.5\,ms, 48 times per decode step, reducing two concurrent
+models to 31\,tok/s each; spinning for 300\,\textmu s first restored 154\,tok/s.
+(iii)~\emph{Mis-counted capacity}: the store's capacity check included the memory-mapped n-gram
+table, which is never copied, so the MoE model was never prepared. (iv)~\emph{Virtual-address
+aliasing}: on the tested ROCm stack, re-mapping a previously unmapped virtual address had no effect,
+so the address kept pointing at its first physical page; once another model owned that page, two
+experts aliased and a request occasionally produced no finite logit. Mapping every chunk on fresh
+address space removed the error (30 load cycles with external observers, 5{,}776 requests,
+0 errors).
+
+% ================================================================ 6 related work
+\section{Related Work}\label{sec:related}
+
+\begin{table*}[t]
+\caption{RadianceSwap compared with llama-swap, a process-swapping proxy (llama-swap details from its README and example configuration, November 2026).}
+\label{tab:llamaswap}
+\centering\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{3.0cm}p{6.6cm}p{6.6cm}@{}}
+\toprule
+Aspect & llama-swap~\cite{llamaswap} & RadianceSwap \\
+\midrule
+Architecture & external reverse proxy (Go) that starts and stops upstream server processes & in-engine, one process (C++/HIP) \\
+Backends & any OpenAI- or Anthropic-compatible server (llama.cpp, vLLM, stable-diffusion.cpp, \dots) & Radiance only (\code{.rad} or Hugging Face checkpoint) \\
+Platforms & whatever the backend supports; binaries for Linux, macOS, Windows, FreeBSD & Linux, ROCm; evaluated on AMD gfx1201 only \\
+Switch & stop process (graceful \code{unloadTimeout}, then kill), start another & tear down runtime; re-activate from the prepared store \\
+Warm restart & depends on backend; at best weights in the OS page cache & GPU-ready weights in process memory; no parsing, relayout or disk read \\
+Co-residency & one model by default; \code{groups}, a \code{matrix} DSL with eviction costs, or operator-declared \code{capacity} pools & all models by default, bounded by memory budgets \\
+VRAM split & fixed per process, declared by the operator & dynamic: group planner, elastic slab, KV lending, static streaming \\
+Model does not fit & evict another model & start and stream from host RAM; deactivate idle models \\
+Running generations & graceful unload with timeout (not examined here) & never interrupted \\
+Multi-GPU & delegated to the backend & one TP group shared by all models, ordered collectives \\
+Host memory & not managed & budget, LRU and admission control \\
+Maturity & widely deployed, web UI, aliases, request filters, profiles & experimental, one test system \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Process-level model swapping} llama-swap~\cite{llamaswap} places a proxy in front of
+independent inference servers such as llama.cpp~\cite{llamacpp} and replaces the running server
+when a request names another model; operators declare which models may be co-resident. Ollama
+similarly loads models on demand and unloads them after a keep-alive period~\cite{ollama}. These
+systems are backend-agnostic and portable, which RadianceSwap is not. RadianceSwap's ADR~0001
+considered exactly this design, an external router restarting one process per model with weights
+warm in the page cache, and rejected it for switch latency and the extra component.
+Table~\ref{tab:llamaswap} contrasts the two approaches. A combination is plausible but untested:
+since Radiance serves the OpenAI API, a RadianceSwap process could be one upstream of llama-swap.
+No benchmark compares the two on the same hardware; the latency advantage of warm in-process
+activation follows from the design but was not measured against llama-swap.
+
+\paragraph{Multi-model serving systems} Clockwork~\cite{clockwork} and PipeSwitch~\cite{pipeswitch}
+reduce the cost of swapping DNN models on GPUs through predictable scheduling and pipelined
+transfer of layers. AlpaServe~\cite{alpaserve} shows that model parallelism enables statistical
+multiplexing of several models across devices, and MuxServe~\cite{muxserve} multiplexes several
+LLMs spatially and temporally on shared GPUs. ServerlessLLM~\cite{serverlessllm} accelerates
+cold starts with a loading-optimized checkpoint format and multi-tier storage. RadianceSwap shares
+the goals of fast activation and co-location but operates inside a single engine on a fixed
+tensor-parallel group, and adds run-time movement of expert, KV and static-weight memory between
+co-located models.
+
+\paragraph{Offloading and memory management} FlexGen~\cite{flexgen} and
+DeepSpeed-Inference~\cite{dsinference} offload weights and KV cache to host memory to run models
+larger than GPU memory, and Eliseev and Mazur~\cite{eliseev2023} cache MoE experts on the GPU while
+offloading the rest. PagedAttention~\cite{vllm} manages the KV cache in blocks to reduce
+fragmentation. RadianceSwap reuses Radiance's existing expert tiering and block-paged KV cache and
+extends them across model boundaries. S-LoRA~\cite{slora} serves many adapters of one base model;
+RadianceSwap instead serves distinct base models and refuses adapters in manifest mode.
+
+% ================================================================ 7 limitations
+\section{Limitations and Future Work}
+
+The evaluation covers one system, one MoE model and small dense models; more than two models and
+MoE/MoE combinations under an explicit host budget were not tested. All models in a manifest share
+one TP size, so plugins that run only with TP\,=\,1 cannot join a TP\,=\,2 group, and the
+\code{devices} key is validated but not yet used to select cards. A cold model still reserves its VRAM
+share, which can make a large MoE $\sim$9\,\% slower even if the second model never activates
+(issue~\#56). A second active model costs $\sim$10\,\% even when idle. KV, prefix and recurrent state
+are discarded on deactivation; preserving them in host memory is future work. A long-run check of
+the elastic slab after the address-aliasing fix is still open (issue~\#58), as is lending one model's
+idle KV blocks to another model's expert slab.
+
+% ================================================================ 8 conclusion
+\section{Conclusion}
+
+RadianceSwap shows that multi-model serving can be moved from a process-swapping proxy into the
+inference engine itself. Keeping deactivated models GPU-ready in host memory makes re-activation an
+upload; ordering collectives makes truly parallel runtimes safe on a tensor-parallel group; and a
+heat-driven planner with an elastic slab, KV lending and static streaming lets VRAM follow the load.
+On the tested system this costs nothing for a single model, preserves bit-identical outputs, and
+turns the wait for a second model from an unbounded drain into seconds. The price is coupling to one
+engine and a narrow evaluation, which we hope testers on other hardware will broaden.
+
+% ================================================================ appendix
+\appendices
+\section{Example manifest}
 \begin{lstlisting}
 {
-  "gpu_group": { "devices": [0, 1], "tp": 2 },
-  "cache": { "idle_timeout_ms": 300000, "warmup_budget_mib": 12288 },
-  "models": [
-    { "id": "big",   "path": "/models/big-moe.rad", "default": true,
-      "engine": ["--placement", "expert_tiered", "--max-model-len", "16384"] },
-    { "id": "small", "path": "/models/small",
-      "engine": ["--max-model-len", "16384"] }
-  ]
+ "gpu_group": { "devices": [0, 1], "tp": 2 },
+ "cache": {
+   "idle_timeout_ms": 300000,
+   "warmup_budget_mib": 12288
+ },
+ "models": [
+   { "id": "big", "default": true,
+     "path": "/models/big-moe.rad",
+     "engine": ["--placement", "expert_tiered",
+                "--max-model-len", "16384"] },
+   { "id": "small",
+     "path": "/models/small",
+     "engine": ["--max-model-len", "16384"] }
+ ]
 }
 \end{lstlisting}
+Started with \code{radiance -{}-manifest models.json -{}-port 8000}; a request selects a model through
+its \code{model} field, and \code{/radiance/models} reports each model's state, VRAM and host
+memory. The full reference is \code{docs/GUIDE.md} \S4.12.
 
-Start the server, pick a model per request, and look at every model's state:
-\begin{lstlisting}
-radiance --manifest models.json --port 8000
+% ================================================================ references
+\begin{thebibliography}{99}\footnotesize
 
-curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "small", "messages": [{"role": "user", "content": "hi"}]}'
+\bibitem{radiance} Deadcode and the radiance contributors, ``radiance,'' source repository, 2026. [Online]. Available: \url{https://codeberg.org/StillDeadcode/radiance}
 
-curl localhost:8000/radiance/models
-\end{lstlisting}
+\bibitem{llamaswap} mostlygeek, ``llama-swap,'' source repository, 2026. [Online]. Available: \url{https://github.com/mostlygeek/llama-swap}
 
-\begin{itemize}
-  \item \code{engine} takes the usual Radiance options per model and validates them like the command line.
-  \item An unknown key in the manifest stops the startup, so a typo is never a silent default.
-  \item Full reference: \src{docs/GUIDE.md} \S4.12.
-\end{itemize}
+\bibitem{llamacpp} G.~Gerganov \emph{et al.}, ``llama.cpp,'' source repository. [Online]. Available: \url{https://github.com/ggml-org/llama.cpp}
 
-% ================================================================ 15
-\section{Sources in this repository}
+\bibitem{ollama} Ollama, source repository. [Online]. Available: \url{https://github.com/ollama/ollama}
 
-\begin{table}[H]\small
-\begin{tabularx}{\linewidth}{@{}P{5.6cm}L@{}}
-\toprule
-\textbf{Document} & \textbf{Contents} \\
-\midrule
-\src{SPEC.md} & Original specification with 46 user stories (German) \\
-\src{GLOSSARY.md} & Terms (German) \\
-\src{docs/adr/} & Decisions: in-process (0001), several active models (0002), parallel runtimes (0003) \\
-\src{docs/swap/} & Design notes: elastic slab, KV lending, static streaming, host budget, heat warm-up \\
-\src{docs/swap/gpu-acceptance.md} & Every GPU measurement, with setup and scripts \\
-\src{docs/GUIDE.md} \S4.12 & Operator reference: manifest, lifecycle, sizing, metrics \\
-\bottomrule
-\end{tabularx}
-\end{table}
+\bibitem{megatron} M.~Shoeybi, M.~Patwary, R.~Puri, P.~LeGresley, J.~Casper, and B.~Catanzaro, ``Megatron-LM: Training multi-billion parameter language models using model parallelism,'' arXiv:1909.08053, 2019.
 
-Please report bugs as an issue with your manifest, command line, GPU(s), ROCm version and server log.
+\bibitem{shazeer2017} N.~Shazeer, A.~Mirhoseini, K.~Maziarz, A.~Davis, Q.~Le, G.~Hinton, and J.~Dean, ``Outrageously large neural networks: The sparsely-gated mixture-of-experts layer,'' in \emph{Proc. ICLR}, 2017.
+
+\bibitem{fedus2022} W.~Fedus, B.~Zoph, and N.~Shazeer, ``Switch Transformers: Scaling to trillion parameter models with simple and efficient sparsity,'' \emph{J. Mach. Learn. Res.}, vol.~23, no.~120, 2022.
+
+\bibitem{eliseev2023} A.~Eliseev and D.~Mazur, ``Fast inference of mixture-of-experts language models with offloading,'' arXiv:2312.17238, 2023.
+
+\bibitem{flexgen} Y.~Sheng, L.~Zheng, B.~Yuan, Z.~Li, M.~Ryabinin, B.~Chen, P.~Liang, C.~R\'e, I.~Stoica, and C.~Zhang, ``FlexGen: High-throughput generative inference of large language models with a single GPU,'' in \emph{Proc. ICML}, 2023.
+
+\bibitem{dsinference} R.~Y.~Aminabadi, S.~Rajbhandari, A.~A.~Awan, C.~Li, D.~Li, E.~Zheng, O.~Ruwase, S.~Smith, M.~Zhang, J.~Rasley, and Y.~He, ``DeepSpeed-Inference: Enabling efficient inference of transformer models at unprecedented scale,'' in \emph{Proc. SC}, 2022.
+
+\bibitem{havender1968} J.~W.~Havender, ``Avoiding deadlock in multitasking systems,'' \emph{IBM Systems Journal}, vol.~7, no.~2, pp.~74--84, 1968.
+
+\bibitem{denning1968} P.~J.~Denning, ``The working set model for program behavior,'' \emph{Commun. ACM}, vol.~11, no.~5, pp.~323--333, 1968.
+
+\bibitem{clockwork} A.~Gujarati, R.~Karimi, S.~Alzayat, W.~Hao, A.~Kaufmann, Y.~Vigfusson, and J.~Mace, ``Serving DNNs like Clockwork: Performance predictability from the bottom up,'' in \emph{Proc. OSDI}, 2020.
+
+\bibitem{pipeswitch} Z.~Bai, Z.~Zhang, Y.~Zhu, and X.~Jin, ``PipeSwitch: Fast pipelined context switching for deep learning applications,'' in \emph{Proc. OSDI}, 2020.
+
+\bibitem{alpaserve} Z.~Li, L.~Zheng, Y.~Zhong, V.~Liu, Y.~Sheng, X.~Jin, Y.~Huang, Z.~Chen, H.~Zhang, J.~E.~Gonzalez, and I.~Stoica, ``AlpaServe: Statistical multiplexing with model parallelism for deep learning serving,'' in \emph{Proc. OSDI}, 2023.
+
+\bibitem{muxserve} J.~Duan, R.~Lu, H.~Duanmu, X.~Li, X.~Zhang, D.~Lin, I.~Stoica, and H.~Zhang, ``MuxServe: Flexible spatial-temporal multiplexing for multiple LLM serving,'' in \emph{Proc. ICML}, 2024.
+
+\bibitem{serverlessllm} Y.~Fu, L.~Xue, Y.~Huang, A.-O.~Brabete, D.~Ustiugov, Y.~Patel, and L.~Mai, ``ServerlessLLM: Low-latency serverless inference for large language models,'' in \emph{Proc. OSDI}, 2024.
+
+\bibitem{vllm} W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu, J.~E.~Gonzalez, H.~Zhang, and I.~Stoica, ``Efficient memory management for large language model serving with PagedAttention,'' in \emph{Proc. SOSP}, 2023.
+
+\bibitem{slora} Y.~Sheng, S.~Cao, D.~Li, C.~Hooper, N.~Lee, S.~Yang, C.~Chou, B.~Zhu, L.~Zheng, K.~Keutzer, J.~E.~Gonzalez, and I.~Stoica, ``S-LoRA: Serving thousands of concurrent LoRA adapters,'' in \emph{Proc. MLSys}, 2024.
+
+\end{thebibliography}
 
 \end{document}

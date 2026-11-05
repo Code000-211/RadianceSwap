@@ -2,7 +2,7 @@
 
 **Several large language models behind one endpoint, on the same GPUs, without restarting the process.**
 
-> PDF version: [`RadianceSwap-Whitepaper.pdf`](RadianceSwap-Whitepaper.pdf) (LaTeX source in [`tex/`](tex/), build with `make -C docs/whitepaper`).
+> PDF version, written as a technical report with related work and references: [`RadianceSwap-Whitepaper.pdf`](RadianceSwap-Whitepaper.pdf) (LaTeX source in [`tex/`](tex/), build with `make -C docs/whitepaper pdf`).
 
 As of November 2026, code at `86d4503`. Every number comes from
 [`docs/swap/gpu-acceptance.md`](../swap/gpu-acceptance.md) and
