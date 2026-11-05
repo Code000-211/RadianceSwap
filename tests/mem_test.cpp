@@ -408,6 +408,39 @@ static VramFacts big_moe_facts() {
     return f;
 }
 
+/* A model with no cache (an image model) whose statics stream: the statics and the ring take all
+ * the card gives, and the cache pool still gets its MiB, which the pools need to see the split as
+ * resolved (#62). */
+TEST(a_model_with_no_cache_whose_statics_stream_still_gets_a_cache_pool) {
+    const int64_t MiB = 1LL << 20, GiB = 1LL << 30;
+    VramFacts f = big_moe_facts();
+    f.statics    = 40 * GiB;
+    f.experts    = 0;
+    f.kv_ceiling = 0;
+    f.kv_one     = 0;
+    f.static_layer_max = 600 * MiB;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.statics_streamed > 0);
+    CHECK_EQ(c.vram_kv_mib, (int64_t)1);
+}
+
+/* The floor is for a model with no cache only. One that needs a cache and is left none, its
+ * statics filling a card it may not stream from, keeps a zero, which the pools refuse: a pool of
+ * one MiB would start the model and refuse every prompt. */
+TEST(a_model_that_needs_a_cache_and_is_left_none_gets_no_cache_pool) {
+    const int64_t GiB = 1LL << 30;
+    VramFacts f = big_moe_facts();
+    f.statics = 40 * GiB;
+    f.experts = 0;
+    Config c = derive_config();
+    c.placement = "all_vram";
+    VramBudget b;
+    const int rc = vram_budget_resolve(c, { f }, &b);
+    CHECK(rc != RAD_OK || c.vram_kv_mib == 0);
+}
+
 /* RAM-Streaming of statics (ticket #18): when the static weights do not fit beside a workable
  * cache (one full-length sequence, at most a GiB), the card holds the statics that fit after that
  * cache and the prefill ring, and the rest is the host pool's. A model that fits is untouched,
@@ -677,6 +710,7 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     f.statics    = 2LL << 30;
     f.experts    = 200LL << 30;
     f.kv_ceiling = 100LL << 30;
+    f.kv_one     = 1LL << 30;   /* a cache that needs nothing would get the pools' 1 MiB floor */
     VramBudget b0;
     CHECK_OK(vram_budget_resolve(c, { f }, &b0));
 

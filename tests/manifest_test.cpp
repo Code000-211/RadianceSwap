@@ -12,8 +12,10 @@
 #include "manifest.h"
 #include "rad_core.h"
 
+#include <algorithm>
 #include <fstream>
 #include <string>
+#include <vector>
 
 using namespace rad;
 
@@ -194,6 +196,65 @@ TEST(a_models_headroom_leaves_its_share_and_never_less_than_the_default) {
     CHECK_EQ(manifest_headroom_mib(20000, 8000, 96), (int64_t)12000);
     /* A share the card cannot spare keeps the model's own headroom. */
     CHECK_EQ(manifest_headroom_mib(5000, 8000, 96), (int64_t)96);
+}
+
+/* The driver's free figure as read once per poll; the last value repeats. */
+struct Card {
+    std::vector<int64_t> reads;
+    size_t at = 0;
+    int64_t slept = 0;
+    int64_t settle(int64_t poll = 20, int64_t quiet = 300, int64_t max = 5000) {
+        return manifest_settled_free_mib(
+            [&] { return reads[std::min(at++, reads.size() - 1)]; },
+            [&](int64_t ms) { slept += ms; }, poll, quiet, max);
+    }
+};
+
+TEST(the_free_vram_after_a_deactivation_is_read_once_the_driver_has_released_it) {
+    /* #62 on an RX 9060 XT: the figure stayed at about 8 GiB for some 60 ms after ~Engine, then
+     * the 6 GiB the model held came back at once. */
+    Card c{ { 8247, 8247, 8247, 8247, 14208, 14214, 14199 } };
+    CHECK_EQ(c.settle(), (int64_t)14199);
+    CHECK_EQ(c.slept, (int64_t)(4 * 20 + 300));   /* the release, then a quiet stretch */
+
+    /* A release that comes in steps counts each step; the display's few MiB of drift do not. */
+    Card s{ { 1000, 1000, 3000, 3000, 6000, 6010, 5995, 6004 } };
+    CHECK_EQ(s.settle(), (int64_t)6004);
+    CHECK_EQ(s.slept, (int64_t)(4 * 20 + 300));
+}
+
+TEST(a_settled_read_never_waits_past_its_bound_and_stops_at_an_unknown_figure) {
+    Card rising{ {} };
+    for (int64_t v = 0; v < 1000; ++v) rising.reads.push_back(v * 100);
+    rising.settle(20, 300, 1000);
+    CHECK_EQ(rising.slept, (int64_t)1000);
+
+    Card none{ { -1 } };
+    CHECK_EQ(none.settle(), (int64_t)-1);
+    CHECK_EQ(none.slept, (int64_t)0);
+    Card lost{ { 5000, -1 } };
+    CHECK_EQ(lost.settle(), (int64_t)-1);
+    CHECK_EQ(lost.slept, (int64_t)20);
+}
+
+TEST(only_another_active_activating_or_deactivating_model_holds_vram) {
+    ModelRegistry r;
+    for (const char* id : { "a", "b", "c" }) {
+        ModelRecord m;
+        m.id = id;
+        r.add(std::move(m));
+    }
+    CHECK(!manifest_others_hold_vram(r, "a"));
+    r.set_state("a", ModelState::Active);
+    CHECK(!manifest_others_hold_vram(r, "a"));   /* itself does not count */
+    CHECK(manifest_others_hold_vram(r, "b"));
+    r.set_state("a", ModelState::Prepared);
+    r.set_state("c", ModelState::Failed);
+    CHECK(!manifest_others_hold_vram(r, "b"));
+    for (ModelState s : { ModelState::Activating, ModelState::Deactivating }) {
+        r.set_state("c", s);
+        CHECK(manifest_others_hold_vram(r, "b"));
+    }
 }
 
 RAD_TEST_MAIN()
