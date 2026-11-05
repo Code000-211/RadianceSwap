@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" width="760" height="420" role="img" aria-label="RadianceSwap memory tiers">
+<title>RadianceSwap memory tiers</title>
+
+<style>
+  .bg{fill:#fcfcfb}
+  .t1{fill:#0b0b0b} .t2{fill:#52514e} .t3{fill:#7a7975}
+  .grid{stroke:#e6e5e1;stroke-width:1}
+  .axis{stroke:#b9b8b2;stroke-width:1}
+  .s1{fill:#2a78d6} .s2{fill:#eb6834} .s3{fill:#1baf7a}
+  .l1{stroke:#2a78d6} .l2{stroke:#eb6834}
+  .box{fill:#f3f2ee;stroke:#c9c8c2;stroke-width:1}
+  .box1{fill:#e3eefb;stroke:#2a78d6;stroke-width:1.2}
+  .box2{fill:#fde9e0;stroke:#eb6834;stroke-width:1.2}
+  .box3{fill:#ddf3ea;stroke:#1baf7a;stroke-width:1.2}
+  .boxd{fill:none;stroke:#9a9993;stroke-width:1.2;stroke-dasharray:5 4}
+  .arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+  .ah{fill:#52514e}
+  .gap{stroke:#fcfcfb;stroke-width:2}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19}
+    .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#9a998f}
+    .grid{stroke:#2e2e2c} .axis{stroke:#55544f}
+    .s1{fill:#3987e5} .s2{fill:#d95926} .s3{fill:#199e70}
+    .l1{stroke:#3987e5} .l2{stroke:#d95926}
+    .box{fill:#252523;stroke:#4a4945}
+    .box1{fill:#16263b;stroke:#3987e5}
+    .box2{fill:#3a1f14;stroke:#d95926}
+    .box3{fill:#12301f;stroke:#199e70}
+    .boxd{stroke:#77766f}
+    .arrow{stroke:#c3c2b7} .ah{fill:#c3c2b7}
+    .gap{stroke:#1a1a19}
+  }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="ah"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="420" rx="10"/>
+<text x="24" y="34" class="t1" font-size="16" text-anchor="start" font-weight="600">Where a model's weights can live</text>
+<text x="24" y="54" class="t2" font-size="12" text-anchor="start" font-weight="normal">Faster at the top, larger at the bottom · bandwidths measured on 2× R9700 / PCIe</text>
+<rect x="24" y="78" width="712" height="64" rx="8" class="box1"/>
+<text x="40" y="104" class="t1" font-size="14" text-anchor="start" font-weight="600">VRAM (31.9 GiB per card)</text>
+<text x="720" y="104" class="t2" font-size="12" text-anchor="end" font-weight="normal">600–870 GB/s</text>
+<text x="40" y="126" class="t2" font-size="12" text-anchor="start" font-weight="normal">active models: static weights, KV cache, hot experts</text>
+<rect x="50" y="156" width="660" height="64" rx="8" class="box3"/>
+<text x="66" y="182" class="t1" font-size="14" text-anchor="start" font-weight="600">Pinned host pool (RAM)</text>
+<text x="694" y="182" class="t2" font-size="12" text-anchor="end" font-weight="normal">≈ 28 GB/s over PCIe</text>
+<text x="66" y="204" class="t2" font-size="12" text-anchor="start" font-weight="normal">RAM streaming: cold experts, static weights that do not fit in VRAM</text>
+<rect x="76" y="234" width="608" height="64" rx="8" class="box2"/>
+<text x="92" y="260" class="t1" font-size="14" text-anchor="start" font-weight="600">Prepared store (RAM)</text>
+<text x="668" y="260" class="t2" font-size="12" text-anchor="end" font-weight="normal">upload ≈ 0.25 s / 2.4 GB</text>
+<text x="92" y="282" class="t2" font-size="12" text-anchor="start" font-weight="normal">deactivated models, packed GPU-ready: no parsing, no relayout</text>
+<rect x="102" y="312" width="556" height="64" rx="8" class="box"/>
+<text x="118" y="338" class="t1" font-size="14" text-anchor="start" font-weight="600">Disk / page cache</text>
+<text x="642" y="338" class="t2" font-size="12" text-anchor="end" font-weight="normal">2.5–3.1 GB/s measured</text>
+<text x="118" y="360" class="t2" font-size="12" text-anchor="start" font-weight="normal">cold models: .rad container or HF checkpoint, full load path</text>
+<text x="24" y="404" class="t2" font-size="11" text-anchor="start" font-weight="normal">States: active = VRAM (+ host pool) · prepared = store · cold = disk only. Page cache does not count as RAM backing.</text>
+</svg>

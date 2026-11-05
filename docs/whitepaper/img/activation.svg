@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" role="img" aria-label="Activation time, cold vs. warm">
+<title>Activation time, cold vs. warm</title>
+
+<style>
+  .bg{fill:#fcfcfb}
+  .t1{fill:#0b0b0b} .t2{fill:#52514e} .t3{fill:#7a7975}
+  .grid{stroke:#e6e5e1;stroke-width:1}
+  .axis{stroke:#b9b8b2;stroke-width:1}
+  .s1{fill:#2a78d6} .s2{fill:#eb6834} .s3{fill:#1baf7a}
+  .l1{stroke:#2a78d6} .l2{stroke:#eb6834}
+  .box{fill:#f3f2ee;stroke:#c9c8c2;stroke-width:1}
+  .box1{fill:#e3eefb;stroke:#2a78d6;stroke-width:1.2}
+  .box2{fill:#fde9e0;stroke:#eb6834;stroke-width:1.2}
+  .box3{fill:#ddf3ea;stroke:#1baf7a;stroke-width:1.2}
+  .boxd{fill:none;stroke:#9a9993;stroke-width:1.2;stroke-dasharray:5 4}
+  .arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+  .ah{fill:#52514e}
+  .gap{stroke:#fcfcfb;stroke-width:2}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19}
+    .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#9a998f}
+    .grid{stroke:#2e2e2c} .axis{stroke:#55544f}
+    .s1{fill:#3987e5} .s2{fill:#d95926} .s3{fill:#199e70}
+    .l1{stroke:#3987e5} .l2{stroke:#d95926}
+    .box{fill:#252523;stroke:#4a4945}
+    .box1{fill:#16263b;stroke:#3987e5}
+    .box2{fill:#3a1f14;stroke:#d95926}
+    .box3{fill:#12301f;stroke:#199e70}
+    .boxd{stroke:#77766f}
+    .arrow{stroke:#c3c2b7} .ah{fill:#c3c2b7}
+    .gap{stroke:#1a1a19}
+  }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="ah"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="350" rx="10"/>
+<text x="24" y="34" class="t1" font-size="16" text-anchor="start" font-weight="600">Activation time: cold (from disk) vs. warm (from the RAM store)</text>
+<text x="24" y="54" class="t2" font-size="12" text-anchor="start" font-weight="normal">2× Radeon AI PRO R9700, TP=2 · seconds, shorter is better</text>
+<rect x="24" y="72" width="12" height="12" rx="3" class="s2"/>
+<text x="42" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">cold</text>
+<rect x="80.4" y="72" width="12" height="12" rx="3" class="s1"/>
+<text x="98.4" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">warm</text>
+<text x="24" y="116" class="t1" font-size="13" text-anchor="start" font-weight="600">Dense · Qwen3.5-0.8B</text>
+<line x1="120.0" y1="124" x2="120.0" y2="186" class="grid"/>
+<text x="120.0" y="200" class="t3" font-size="11" text-anchor="middle" font-weight="normal">0 s</text>
+<line x1="280.0" y1="124" x2="280.0" y2="186" class="grid"/>
+<text x="280.0" y="200" class="t3" font-size="11" text-anchor="middle" font-weight="normal">1 s</text>
+<line x1="440.0" y1="124" x2="440.0" y2="186" class="grid"/>
+<text x="440.0" y="200" class="t3" font-size="11" text-anchor="middle" font-weight="normal">2 s</text>
+<line x1="600.0" y1="124" x2="600.0" y2="186" class="grid"/>
+<text x="600.0" y="200" class="t3" font-size="11" text-anchor="middle" font-weight="normal">3 s</text>
+<line x1="120" y1="124" x2="120" y2="186" class="axis"/>
+<text x="110" y="143" class="t2" font-size="12" text-anchor="end" font-weight="normal">cold</text>
+<path d="M120,128 H533.5999999999999 Q537.5999999999999,128 537.5999999999999,132 V146 Q537.5999999999999,150 533.5999999999999,150 H120 Z" class="s2"/>
+<text x="545.5999999999999" y="143" class="t1" font-size="12" text-anchor="start" font-weight="normal">2.6 s</text>
+<text x="110" y="175" class="t2" font-size="12" text-anchor="end" font-weight="normal">warm</text>
+<path d="M120,160 H456.0 Q460.0,160 460.0,164 V178 Q460.0,182 456.0,182 H120 Z" class="s1"/>
+<text x="468.0" y="175" class="t1" font-size="12" text-anchor="start" font-weight="normal">2.1 s (p50, 120 cycles)</text>
+<text x="24" y="232" class="t1" font-size="13" text-anchor="start" font-weight="600">MoE · Qwen3.8-Flash-Next (113.6 GiB)</text>
+<line x1="120.0" y1="240" x2="120.0" y2="302" class="grid"/>
+<text x="120.0" y="316" class="t3" font-size="11" text-anchor="middle" font-weight="normal">0 s</text>
+<line x1="240.0" y1="240" x2="240.0" y2="302" class="grid"/>
+<text x="240.0" y="316" class="t3" font-size="11" text-anchor="middle" font-weight="normal">20 s</text>
+<line x1="360.0" y1="240" x2="360.0" y2="302" class="grid"/>
+<text x="360.0" y="316" class="t3" font-size="11" text-anchor="middle" font-weight="normal">40 s</text>
+<line x1="480.0" y1="240" x2="480.0" y2="302" class="grid"/>
+<text x="480.0" y="316" class="t3" font-size="11" text-anchor="middle" font-weight="normal">60 s</text>
+<line x1="600.0" y1="240" x2="600.0" y2="302" class="grid"/>
+<text x="600.0" y="316" class="t3" font-size="11" text-anchor="middle" font-weight="normal">80 s</text>
+<line x1="120" y1="240" x2="120" y2="302" class="axis"/>
+<text x="110" y="259" class="t2" font-size="12" text-anchor="end" font-weight="normal">cold</text>
+<path d="M120,244 H537.2 Q541.2,244 541.2,248 V262 Q541.2,266 537.2,266 H120 Z" class="s2"/>
+<text x="549.2" y="259" class="t1" font-size="12" text-anchor="start" font-weight="normal">70 s</text>
+<text x="110" y="291" class="t2" font-size="12" text-anchor="end" font-weight="normal">warm</text>
+<path d="M120,276 H476.0 Q480.0,276 480.0,280 V294 Q480.0,298 476.0,298 H120 Z" class="s1"/>
+<text x="488.0" y="291" class="t1" font-size="12" text-anchor="start" font-weight="normal">60 s</text>
+<text x="24" y="332" class="t2" font-size="11" text-anchor="start" font-weight="normal">MoE warm with --ngram-placement disk: weights in 6.3–7.6 s (the n-gram table is then not copied).</text>
+</svg>

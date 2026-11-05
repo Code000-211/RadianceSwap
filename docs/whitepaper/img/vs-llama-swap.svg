@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" width="760" height="420" role="img" aria-label="llama-swap and RadianceSwap compared">
+<title>llama-swap and RadianceSwap compared</title>
+
+<style>
+  .bg{fill:#fcfcfb}
+  .t1{fill:#0b0b0b} .t2{fill:#52514e} .t3{fill:#7a7975}
+  .grid{stroke:#e6e5e1;stroke-width:1}
+  .axis{stroke:#b9b8b2;stroke-width:1}
+  .s1{fill:#2a78d6} .s2{fill:#eb6834} .s3{fill:#1baf7a}
+  .l1{stroke:#2a78d6} .l2{stroke:#eb6834}
+  .box{fill:#f3f2ee;stroke:#c9c8c2;stroke-width:1}
+  .box1{fill:#e3eefb;stroke:#2a78d6;stroke-width:1.2}
+  .box2{fill:#fde9e0;stroke:#eb6834;stroke-width:1.2}
+  .box3{fill:#ddf3ea;stroke:#1baf7a;stroke-width:1.2}
+  .boxd{fill:none;stroke:#9a9993;stroke-width:1.2;stroke-dasharray:5 4}
+  .arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+  .ah{fill:#52514e}
+  .gap{stroke:#fcfcfb;stroke-width:2}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19}
+    .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#9a998f}
+    .grid{stroke:#2e2e2c} .axis{stroke:#55544f}
+    .s1{fill:#3987e5} .s2{fill:#d95926} .s3{fill:#199e70}
+    .l1{stroke:#3987e5} .l2{stroke:#d95926}
+    .box{fill:#252523;stroke:#4a4945}
+    .box1{fill:#16263b;stroke:#3987e5}
+    .box2{fill:#3a1f14;stroke:#d95926}
+    .box3{fill:#12301f;stroke:#199e70}
+    .boxd{stroke:#77766f}
+    .arrow{stroke:#c3c2b7} .ah{fill:#c3c2b7}
+    .gap{stroke:#1a1a19}
+  }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="ah"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="420" rx="10"/>
+<text x="24" y="34" class="t1" font-size="16" text-anchor="start" font-weight="600">Two ways to “one endpoint, many models”</text>
+<text x="24" y="66" class="t1" font-size="14" text-anchor="start" font-weight="600">llama-swap</text>
+<text x="24" y="84" class="t2" font-size="12" text-anchor="start" font-weight="normal">Proxy in front of separate server processes</text>
+<text x="396" y="66" class="t1" font-size="14" text-anchor="start" font-weight="600">RadianceSwap</text>
+<text x="396" y="84" class="t2" font-size="12" text-anchor="start" font-weight="normal">One process, one engine, shared cards</text>
+<rect x="24" y="100" width="340" height="40" rx="8" class="box"/>
+<text x="194.0" y="125" class="t1" font-size="12" text-anchor="middle" font-weight="normal">llama-swap (Go): reads model, starts/stops cmd</text>
+<rect x="44" y="170" width="300" height="52" rx="8" class="box1"/>
+<text x="60" y="192" class="t1" font-size="13" text-anchor="start" font-weight="600">Process A</text>
+<text x="60" y="210" class="t2" font-size="11" text-anchor="start" font-weight="normal">llama-server · running</text>
+<path d="M194.0,140 V170" class="arrow" marker-end="url(#ah)" />
+<rect x="44" y="240" width="300" height="52" rx="8" class="boxd"/>
+<text x="60" y="262" class="t1" font-size="13" text-anchor="start" font-weight="600">Process B</text>
+<text x="60" y="280" class="t2" font-size="11" text-anchor="start" font-weight="normal">stopped · started on demand</text>
+<path d="M358,140 V266 H346" class="arrow" stroke-dasharray="4 3" marker-end="url(#ah)"/>
+<rect x="24" y="312" width="340" height="40" rx="8" class="box"/>
+<text x="194.0" y="330" class="t1" font-size="12" text-anchor="middle" font-weight="normal">GPU: VRAM fixed per process</text>
+<text x="194.0" y="345" class="t2" font-size="11" text-anchor="middle" font-weight="normal">co-residency via groups / matrix / capacity (operator)</text>
+<rect x="396" y="100" width="340" height="252" rx="10" class="box"/>
+<text x="412" y="122" class="t1" font-size="12" text-anchor="start" font-weight="600">radiance --manifest (C++/HIP)</text>
+<rect x="412" y="134" width="308" height="30" rx="6" class="box3"/>
+<text x="566.0" y="154" class="t1" font-size="12" text-anchor="middle" font-weight="normal">ModelRouter → ModelManager (queue, activation)</text>
+<rect x="412.0" y="176" width="150.0" height="52" rx="6" class="box1"/>
+<text x="487.0" y="198" class="t1" font-size="13" text-anchor="middle" font-weight="600">Runtime A</text>
+<text x="487.0" y="216" class="t2" font-size="11" text-anchor="middle" font-weight="normal">runs in parallel</text>
+<rect x="570.0" y="176" width="150.0" height="52" rx="6" class="box2"/>
+<text x="645.0" y="198" class="t1" font-size="13" text-anchor="middle" font-weight="600">Runtime B</text>
+<text x="645.0" y="216" class="t2" font-size="11" text-anchor="middle" font-weight="normal">runs in parallel</text>
+<rect x="412" y="240" width="308" height="30" rx="6" class="box"/>
+<text x="566.0" y="260" class="t1" font-size="12" text-anchor="middle" font-weight="normal">CollectiveSequencer · GroupPlanner · Store</text>
+<rect x="412" y="282" width="308" height="56" rx="6" class="box"/>
+<text x="566.0" y="304" class="t1" font-size="12" text-anchor="middle" font-weight="normal">GPU group (TP): VRAM shared dynamically</text>
+<text x="566.0" y="322" class="t2" font-size="11" text-anchor="middle" font-weight="normal">expert slab, KV lending, static streaming</text>
+<text x="24" y="384" class="t2" font-size="11" text-anchor="start" font-weight="normal">llama-swap: any OpenAI-compatible backend, any platform, mature. Switch = stop one process, start another.</text>
+<text x="24" y="402" class="t2" font-size="11" text-anchor="start" font-weight="normal">RadianceSwap: Radiance engine only (ROCm), experimental. Switch = runtime in the same process, weights warm in RAM.</text>
+</svg>

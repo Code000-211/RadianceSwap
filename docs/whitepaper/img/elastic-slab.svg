@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" role="img" aria-label="Elastic expert slab under changing load">
+<title>Elastic expert slab under changing load</title>
+
+<style>
+  .bg{fill:#fcfcfb}
+  .t1{fill:#0b0b0b} .t2{fill:#52514e} .t3{fill:#7a7975}
+  .grid{stroke:#e6e5e1;stroke-width:1}
+  .axis{stroke:#b9b8b2;stroke-width:1}
+  .s1{fill:#2a78d6} .s2{fill:#eb6834} .s3{fill:#1baf7a}
+  .l1{stroke:#2a78d6} .l2{stroke:#eb6834}
+  .box{fill:#f3f2ee;stroke:#c9c8c2;stroke-width:1}
+  .box1{fill:#e3eefb;stroke:#2a78d6;stroke-width:1.2}
+  .box2{fill:#fde9e0;stroke:#eb6834;stroke-width:1.2}
+  .box3{fill:#ddf3ea;stroke:#1baf7a;stroke-width:1.2}
+  .boxd{fill:none;stroke:#9a9993;stroke-width:1.2;stroke-dasharray:5 4}
+  .arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+  .ah{fill:#52514e}
+  .gap{stroke:#fcfcfb;stroke-width:2}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19}
+    .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#9a998f}
+    .grid{stroke:#2e2e2c} .axis{stroke:#55544f}
+    .s1{fill:#3987e5} .s2{fill:#d95926} .s3{fill:#199e70}
+    .l1{stroke:#3987e5} .l2{stroke:#d95926}
+    .box{fill:#252523;stroke:#4a4945}
+    .box1{fill:#16263b;stroke:#3987e5}
+    .box2{fill:#3a1f14;stroke:#d95926}
+    .box3{fill:#12301f;stroke:#199e70}
+    .boxd{stroke:#77766f}
+    .arrow{stroke:#c3c2b7} .ah{fill:#c3c2b7}
+    .gap{stroke:#1a1a19}
+  }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="ah"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="350" rx="10"/>
+<text x="24" y="34" class="t1" font-size="16" text-anchor="start" font-weight="600">Elastic expert slab: VRAM follows the load</text>
+<text x="24" y="54" class="t2" font-size="12" text-anchor="start" font-weight="normal">Two Flash-Next entries, rank 0, committed MiB per model · shared pool 20,680 MiB</text>
+<rect x="24" y="72" width="12" height="12" rx="3" class="s1"/>
+<text x="42" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">m1</text>
+<rect x="67.2" y="72" width="12" height="12" rx="3" class="s2"/>
+<text x="85.2" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">m2</text>
+<line x1="200.0" y1="104" x2="200.0" y2="254" class="grid"/>
+<text x="200.0" y="270" class="t3" font-size="11" text-anchor="middle" font-weight="normal">0</text>
+<line x1="316.6666666666667" y1="104" x2="316.6666666666667" y2="254" class="grid"/>
+<text x="316.6666666666667" y="270" class="t3" font-size="11" text-anchor="middle" font-weight="normal">5 GiB</text>
+<line x1="433.33333333333337" y1="104" x2="433.33333333333337" y2="254" class="grid"/>
+<text x="433.33333333333337" y="270" class="t3" font-size="11" text-anchor="middle" font-weight="normal">10 GiB</text>
+<line x1="550.0" y1="104" x2="550.0" y2="254" class="grid"/>
+<text x="550.0" y="270" class="t3" font-size="11" text-anchor="middle" font-weight="normal">15 GiB</text>
+<line x1="666.6666666666667" y1="104" x2="666.6666666666667" y2="254" class="grid"/>
+<text x="666.6666666666667" y="270" class="t3" font-size="11" text-anchor="middle" font-weight="normal">20 GiB</text>
+<line x1="200" y1="104" x2="200" y2="254" class="axis"/>
+<text x="188" y="130" class="t2" font-size="12" text-anchor="end" font-weight="normal">load on m1 only</text>
+<path d="M200,110 H511.78666666666663 V140 H200 Z" class="s1"/>
+<path d="M513.7866666666666,110 H678.51 Q682.51,110 682.51,114 V136 Q682.51,140 678.51,140 H513.7866666666666 Z" class="s2"/>
+<text x="356.8933333333333" y="130" font-size="11" text-anchor="middle" fill="#ffffff">13,448</text>
+<text x="598.1483333333333" y="130" font-size="11" text-anchor="middle" fill="#ffffff">7,231</text>
+<text x="188" y="184" class="t2" font-size="12" text-anchor="end" font-weight="normal">switching to m2</text>
+<path d="M200,164 H398.97 V194 H200 Z" class="s1"/>
+<path d="M400.97,164 H604.4966666666667 Q608.4966666666667,164 608.4966666666667,168 V190 Q608.4966666666667,194 604.4966666666667,194 H400.97 Z" class="s2"/>
+<text x="300.485" y="184" font-size="11" text-anchor="middle" fill="#ffffff">8,613</text>
+<text x="504.73333333333335" y="184" font-size="11" text-anchor="middle" fill="#ffffff">8,894</text>
+<text x="188" y="238" class="t2" font-size="12" text-anchor="end" font-weight="normal">load on m2 only</text>
+<path d="M200,218 H366.4666666666667 V248 H200 Z" class="s1"/>
+<path d="M368.4666666666667,218 H678.5333333333333 Q682.5333333333333,218 682.5333333333333,222 V244 Q682.5333333333333,248 678.5333333333333,248 H368.4666666666667 Z" class="s2"/>
+<text x="284.23333333333335" y="238" font-size="11" text-anchor="middle" fill="#ffffff">7,220</text>
+<text x="525.5" y="238" font-size="11" text-anchor="middle" fill="#ffffff">13,460</text>
+<line x1="682.5333333333333" y1="96" x2="682.5333333333333" y2="254" class="arrow" stroke-dasharray="4 3"/>
+<text x="682.5333333333333" y="92" class="t2" font-size="11" text-anchor="middle" font-weight="normal">pool</text>
+<line x1="440.65999999999997" y1="96" x2="440.65999999999997" y2="254" class="axis" stroke-dasharray="2 3"/>
+<text x="440.65999999999997" y="92" class="t3" font-size="11" text-anchor="middle" font-weight="normal">offer per model (10.3 GiB)</text>
+<text x="24" y="316" class="t2" font-size="11" text-anchor="start" font-weight="normal">The busy model grows ~3 GiB past its offer, the idle one falls to its minimum. Σ committed ≤ pool in every</text>
+<text x="24" y="332" class="t2" font-size="11" text-anchor="start" font-weight="normal">sample. Moves in 128 MiB chunks, target reached in 20–30 s; greedy output of both models unchanged.</text>
+</svg>

@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" width="760" height="340" role="img" aria-label="Throughput of two concurrently active models">
+<title>Throughput of two concurrently active models</title>
+
+<style>
+  .bg{fill:#fcfcfb}
+  .t1{fill:#0b0b0b} .t2{fill:#52514e} .t3{fill:#7a7975}
+  .grid{stroke:#e6e5e1;stroke-width:1}
+  .axis{stroke:#b9b8b2;stroke-width:1}
+  .s1{fill:#2a78d6} .s2{fill:#eb6834} .s3{fill:#1baf7a}
+  .l1{stroke:#2a78d6} .l2{stroke:#eb6834}
+  .box{fill:#f3f2ee;stroke:#c9c8c2;stroke-width:1}
+  .box1{fill:#e3eefb;stroke:#2a78d6;stroke-width:1.2}
+  .box2{fill:#fde9e0;stroke:#eb6834;stroke-width:1.2}
+  .box3{fill:#ddf3ea;stroke:#1baf7a;stroke-width:1.2}
+  .boxd{fill:none;stroke:#9a9993;stroke-width:1.2;stroke-dasharray:5 4}
+  .arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+  .ah{fill:#52514e}
+  .gap{stroke:#fcfcfb;stroke-width:2}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19}
+    .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#9a998f}
+    .grid{stroke:#2e2e2c} .axis{stroke:#55544f}
+    .s1{fill:#3987e5} .s2{fill:#d95926} .s3{fill:#199e70}
+    .l1{stroke:#3987e5} .l2{stroke:#d95926}
+    .box{fill:#252523;stroke:#4a4945}
+    .box1{fill:#16263b;stroke:#3987e5}
+    .box2{fill:#3a1f14;stroke:#d95926}
+    .box3{fill:#12301f;stroke:#199e70}
+    .boxd{stroke:#77766f}
+    .arrow{stroke:#c3c2b7} .ah{fill:#c3c2b7}
+    .gap{stroke:#1a1a19}
+  }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="ah"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="340" rx="10"/>
+<text x="24" y="34" class="t1" font-size="16" text-anchor="start" font-weight="600">Two models busy at once: who gets how much?</text>
+<text x="24" y="54" class="t2" font-size="12" text-anchor="start" font-weight="normal">Dense 0.8B, one request per model (C1), tok/s · bar = sum of both models</text>
+<rect x="24" y="72" width="12" height="12" rx="3" class="s1"/>
+<text x="42" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">Model A</text>
+<rect x="100.19999999999999" y="72" width="12" height="12" rx="3" class="s2"/>
+<text x="118.19999999999999" y="82" class="t2" font-size="12" text-anchor="start" font-weight="normal">Model B</text>
+<line x1="230.0" y1="104" x2="230.0" y2="250" class="grid"/>
+<text x="230.0" y="266" class="t3" font-size="11" text-anchor="middle" font-weight="normal">0</text>
+<line x1="347.1428571428571" y1="104" x2="347.1428571428571" y2="250" class="grid"/>
+<text x="347.1428571428571" y="266" class="t3" font-size="11" text-anchor="middle" font-weight="normal">100</text>
+<line x1="464.2857142857143" y1="104" x2="464.2857142857143" y2="250" class="grid"/>
+<text x="464.2857142857143" y="266" class="t3" font-size="11" text-anchor="middle" font-weight="normal">200</text>
+<line x1="581.4285714285714" y1="104" x2="581.4285714285714" y2="250" class="grid"/>
+<text x="581.4285714285714" y="266" class="t3" font-size="11" text-anchor="middle" font-weight="normal">300</text>
+<line x1="230" y1="104" x2="230" y2="250" class="axis"/>
+<text x="218" y="130" class="t2" font-size="12" text-anchor="end" font-weight="normal">A alone</text>
+<path d="M230,110 H611.4 Q615.4,110 615.4,114 V136 Q615.4,140 611.4,140 H230 Z" class="s1"/>
+<text x="623.4" y="130" class="t1" font-size="12" text-anchor="start" font-weight="normal">329 tok/s</text>
+<text x="218" y="182" class="t2" font-size="12" text-anchor="end" font-weight="normal">A + B, before fix 2</text>
+<path d="M230,162 H264.3142857142857 V192 H230 Z" class="s1"/>
+<path d="M266.3142857142857,162 H298.6285714285714 Q302.6285714285714,162 302.6285714285714,166 V188 Q302.6285714285714,192 298.6285714285714,192 H266.3142857142857 Z" class="s2"/>
+<text x="310.6285714285714" y="182" class="t1" font-size="12" text-anchor="start" font-weight="normal">31 + 31 = 62 tok/s</text>
+<text x="218" y="234" class="t2" font-size="12" text-anchor="end" font-weight="normal">A + B, today</text>
+<path d="M230,214 H408.4 V244 H230 Z" class="s1"/>
+<path d="M410.4,214 H586.8 Q590.8,214 590.8,218 V240 Q590.8,244 586.8,244 H410.4 Z" class="s2"/>
+<text x="598.8" y="234" class="t1" font-size="12" text-anchor="start" font-weight="normal">154 + 154 = 308 tok/s</text>
+<text x="24" y="306" class="t2" font-size="11" text-anchor="start" font-weight="normal">All models' collectives run in one group-wide order (ADR 0003): no deadlock, but no parallel communication</text>
+<text x="24" y="322" class="t2" font-size="11" text-anchor="start" font-weight="normal">either. Fix 2: the hand-off spins 300 µs before the thread sleeps (before: ~0.5 ms wake-up cost × 48 per decode step).</text>
+</svg>

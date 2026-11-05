@@ -173,6 +173,7 @@ Building, Docker images and all single-model options are documented in
 
 | Document | Contents |
 |---|---|
+| [`docs/whitepaper/WHITEPAPER.md`](docs/whitepaper/WHITEPAPER.md) | Illustrated overview: how it works, measurements, comparison with llama-swap |
 | [`docs/GUIDE.md`](docs/GUIDE.md) §4.12 | Manifest reference, lifecycle, RAM/VRAM sizing, metrics |
 | [`docs/swap/gpu-acceptance.md`](docs/swap/gpu-acceptance.md) | Every GPU measurement |
 | [`docs/swap/`](docs/swap/) | Design notes: elastic slab, KV lending, static streaming, host budget, heat warm-up |
