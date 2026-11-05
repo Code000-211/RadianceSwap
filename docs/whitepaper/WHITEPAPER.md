@@ -2,6 +2,8 @@
 
 **Several large language models behind one endpoint, on the same GPUs, without restarting the process.**
 
+> PDF version: [`RadianceSwap-Whitepaper.pdf`](RadianceSwap-Whitepaper.pdf) (LaTeX source in [`tex/`](tex/), build with `make -C docs/whitepaper`).
+
 As of November 2026, code at `86d4503`. Every number comes from
 [`docs/swap/gpu-acceptance.md`](../swap/gpu-acceptance.md) and
 [`docs/GUIDE.md`](../GUIDE.md) §4.12, measured on 2× AMD Radeon AI PRO R9700 (gfx1201, TP=2),

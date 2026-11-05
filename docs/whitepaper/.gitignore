@@ -1,0 +1,9 @@
+tex/.build/
+tex/*.aux
+tex/*.log
+tex/*.fls
+tex/*.fdb_latexmk
+tex/*.out
+tex/*.toc
+tex/build.log
+tex/whitepaper.pdf

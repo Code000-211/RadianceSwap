@@ -1,0 +1,16 @@
+flowchart TB
+    C1["Client<br/>model: big"] --> R
+    C2["Client<br/>model: small"] --> R
+    C3["Client<br/>no model"] --> R
+    subgraph P ["One radiance process (--manifest)"]
+        R["ModelRouter<br/>one port, reads model first"] --> M["ModelManager<br/>queue, activation, idle timeout"]
+        M --> RA["Runtime big<br/>own scheduler, streams, KV"]
+        M --> RB["Runtime small<br/>own scheduler, streams, KV"]
+        RA <-.->|"one group-wide order"| CS["CollectiveSequencer"]
+        RB <-.-> CS
+        GP["GroupPlanner<br/>splits expert VRAM by heat"] -.-> RA
+        GP -.-> RB
+        ST[("Prepared store<br/>weights GPU-ready in RAM")] -.->|"warm activation"| M
+    end
+    RA --> G["GPU group<br/>2 cards, TP=2"]
+    RB --> G

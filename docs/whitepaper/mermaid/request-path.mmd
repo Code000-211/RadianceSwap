@@ -1,0 +1,24 @@
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant R as ModelRouter
+    participant M as ModelManager
+    participant S as Prepared store
+    participant E as Runtime (model b)
+    C->>R: POST /v1/chat/completions, model: "b"
+    R->>R: read the model field (before tokenizer and template)
+    alt b is active
+        R->>E: forward at once (0 ms activation)
+    else b is prepared or cold
+        R->>M: join b's queue (64 max, else 429)
+        M->>M: exactly one activation, even for many concurrent requests
+        alt prepared
+            S-->>E: upload weights, no parsing, no relayout
+        else cold
+            E->>E: read container or checkpoint from disk
+        end
+        M->>E: all ranks ready, state active
+        R->>E: forward the waiting requests
+    end
+    E-->>C: answer with b's tokenizer, template, grammar, context limit
+    Note over C,E: timings: activation_ms + queue_ms + prompt_ms = ttft_ms
