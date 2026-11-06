@@ -9,6 +9,9 @@ upstream Radiance; everything below only applies in manifest mode.
 
 > Status: experimental, looking for testers. Measured on 2× AMD Radeon AI PRO R9700 (gfx1201, TP=2).
 
+**Whitepaper:** [*RadianceSwap: In-Process Multi-Model LLM Serving with Dynamic VRAM Sharing*](docs/paper/RadianceSwap-Whitepaper.pdf)
+(PDF, 8 pages): design, evaluation, the defects found in acceptance, and a comparison with llama-swap.
+
 ---
 
 ## How it works
@@ -173,6 +176,7 @@ Building, Docker images and all single-model options are documented in
 
 | Document | Contents |
 |---|---|
+| [`docs/paper/RadianceSwap-Whitepaper.pdf`](docs/paper/RadianceSwap-Whitepaper.pdf) | Whitepaper: design, evaluation, defects, related work |
 | [`docs/GUIDE.md`](docs/GUIDE.md) §4.12 | Manifest reference, lifecycle, RAM/VRAM sizing, metrics |
 | [`docs/swap/gpu-acceptance.md`](docs/swap/gpu-acceptance.md) | Every GPU measurement |
 | [`docs/swap/`](docs/swap/) | Design notes: elastic slab, KV lending, static streaming, host budget, heat warm-up |
